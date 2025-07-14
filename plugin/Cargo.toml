@@ -1,0 +1,20 @@
+[package]
+name = "flwrs_plugin"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+log = { version = "0.4.27", features = ["kv", "kv_serde"] }
+tokio = { version = "1.46.1", features = ["full", "rt-multi-thread"] }
+bytes = "1.10.1"
+byteorder = "1.5.0"
+thiserror = "2.0.12"
+lazy_static = "1.5.0"
+prost = "0.14.1"
+prost-types = "0.14.1"
+
+[build-dependencies]
+prost-build = "0.14.1"

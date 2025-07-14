@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package schema.sink;
+
+import "schema/schema.proto";
+import "schema/common.proto";
+
+// sink --> runtime
+
+message SinkExitCode {
+  enum Enum {
+    OK = 0;
+    INTERRUPTED = 1;
+    ERROR = 2;
+  }
+}
+
+message SinkExit {
+  SinkExitCode.Enum code = 1;
+  string message = 2;
+}
+
+message Initialize {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  schema.SchemaDefinition schema = 3;
+}
+
+message SinkMessage {
+  oneof payload {
+    Initialize initialize = 1;
+    SinkExit exit = 2;
+    common.LogEvent log = 3;
+    common.ErrorEvent error = 4;
+  }
+}
+
+// runtime --> sink
+
+message SinkEvent {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  schema.PluginPayload payload = 3;
+}
+
+message Shutdown {}
+
+message InitializeResponse {}
+
+message RuntimeSinkMessage {
+  oneof payload {
+    InitializeResponse initialize = 1;
+    Shutdown shutdown = 2;
+    SinkEvent event = 3;
+  }
+}

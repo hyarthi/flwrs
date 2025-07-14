@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package schema.schema;
+
+import "google/protobuf/wrappers.proto";
+import "google/protobuf/timestamp.proto";
+
+message FieldType {
+  enum Enum {
+    STRING = 0;
+    I32 = 1;
+    U32 = 2;
+    F32 = 3;
+    BOOL = 4;
+    DATETIME = 5;
+    BYTES = 6;
+    ARRAY = 7;
+    MAP = 8;
+  }
+}
+
+message FieldValue {
+  oneof value {
+    google.protobuf.StringValue string = 1;
+    google.protobuf.Int32Value i32 = 2;
+    google.protobuf.UInt32Value u32 = 3;
+    google.protobuf.FloatValue f32 = 4;
+    google.protobuf.BoolValue bool = 5;
+    google.protobuf.Timestamp date_time = 6;
+    google.protobuf.BytesValue bytes = 7;
+    ArrayValue array = 8;
+    MapValue map = 9;
+  }
+}
+
+message ArrayValue {
+  repeated FieldValue value = 1;
+}
+
+message MapValue {
+  map<string, FieldValue> value = 1;
+}
+
+message Field {
+  string key = 1;
+  FieldValue value = 2;
+}
+
+message FieldDefinition {
+  string key = 1;
+  string description = 2;
+  FieldType.Enum type = 3;
+}
+
+message SchemaDefinition {
+  repeated FieldDefinition fields = 1;
+}
+
+message PluginPayload {
+  repeated Field fields = 1;
+}

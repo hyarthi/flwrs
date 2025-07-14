@@ -1,0 +1,57 @@
+syntax = "proto3";
+
+package schema.source;
+
+import "schema/schema.proto";
+import "schema/common.proto";
+
+// source --> runtime
+
+message SourceExitCode {
+  enum Enum {
+    UNDEFINED = 0;
+    OK = 1;
+    INTERRUPTED = 2;
+    ERROR = 3;
+  }
+}
+
+message SourceExit {
+  SourceExitCode.Enum code = 1;
+  string message = 2;
+}
+
+message SourceEvent {
+  string source_id = 1;
+  string source_version = 2;
+  schema.PluginPayload payload = 3;
+}
+
+message Initialize {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  schema.SchemaDefinition schema = 3;
+}
+
+message SourceMessage {
+  oneof payload {
+    Initialize initialize = 1;
+    SourceExit exit = 2;
+    SourceEvent event = 3;
+    common.LogEvent log = 4;
+    common.ErrorEvent error = 5;
+  }
+}
+
+// runtime --> source
+
+message InitializeResponse {}
+
+message Shutdown {}
+
+message RuntimeSourceMessage {
+  oneof payload {
+    InitializeResponse initialize = 1;
+    Shutdown shutdown = 2;
+  }
+}

@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package schema.common;
+
+import "schema/schema.proto";
+
+message PluginType {
+  enum Enum {
+    UNDEFINED = 0;
+    SOURCE = 1;
+    SINK = 2;
+  }
+}
+
+message ErrorEvent {
+  string plugin_id = 1;
+  PluginType.Enum plugin_type = 2;
+  string message = 3;
+  repeated schema.Field details = 4;
+}
+
+message LogLevel {
+  enum Enum {
+    UNDEFINED = 0;
+    TRACE = 1;
+    DEBUG = 2;
+    INFO = 3;
+    WARN = 4;
+    ERROR = 5;
+  }
+}
+
+message LogEvent {
+  string plugin_id = 1;
+  PluginType.Enum plugin_type = 2;
+  LogLevel.Enum log_level = 3;
+  string message = 4;
+  repeated schema.Field details = 5;
+}
