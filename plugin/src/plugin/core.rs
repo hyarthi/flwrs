@@ -3,6 +3,7 @@ use crate::schema::schema::{
     SchemaDefinition as PbSchemaDefinition,
 };
 use crate::schema::sink::Initialize;
+use prost::alloc::boxed::Box as PbBox;
 use prost::alloc::string::String;
 
 pub struct InitializeRequest {
@@ -20,17 +21,17 @@ impl InitializeRequest {
         }
     }
 
-    fn with_id(mut self, id: String) -> Self {
+    pub fn with_id(mut self, id: String) -> Self {
         self.id = id;
         self
     }
 
-    fn with_version(mut self, version: String) -> Self {
+    pub fn with_version(mut self, version: String) -> Self {
         self.version = version;
         self
     }
 
-    fn with_schema(mut self, schema: SchemaDefinition) -> Self {
+    pub fn with_schema(mut self, schema: SchemaDefinition) -> Self {
         self.schema = schema;
         self
     }
@@ -89,10 +90,13 @@ impl Into<PbSchemaDefinition> for SchemaDefinition {
     }
 }
 
+#[derive(Clone)]
 pub struct FieldDefinition {
     key: String,
     description: Option<String>,
     type_: FieldType,
+    nested_type_definition: Option<Box<FieldDefinition>>,
+    object_fields: Option<Vec<FieldDefinition>>,
 }
 
 impl FieldDefinition {
@@ -101,6 +105,8 @@ impl FieldDefinition {
             key: String::new(),
             description: None,
             type_: FieldType::String,
+            nested_type_definition: None,
+            object_fields: None,
         }
     }
 
@@ -118,6 +124,16 @@ impl FieldDefinition {
         self.type_ = type_;
         self
     }
+
+    pub fn with_nested_type_definition(mut self, definition: FieldDefinition) -> Self {
+        self.nested_type_definition = Some(Box::new(definition));
+        self
+    }
+
+    pub fn with_object_fields(mut self, fields: Vec<FieldDefinition>) -> Self {
+        self.object_fields = Some(fields);
+        self
+    }
 }
 
 impl Into<PbFieldDefinition> for FieldDefinition {
@@ -128,6 +144,35 @@ impl Into<PbFieldDefinition> for FieldDefinition {
             description: match self.description {
                 None => String::new(),
                 Some(str) => String::from(str),
+            },
+            nested_type_definition: match self.nested_type_definition {
+                None => None,
+                Some(t) => Some(PbBox::new(t.into())),
+            },
+            object_fields: match self.object_fields {
+                None => Vec::new(),
+                Some(fields) => fields.into_iter().map(|field| field.into()).collect(),
+            },
+        }
+    }
+}
+
+impl Into<PbFieldDefinition> for Box<FieldDefinition> {
+    fn into(self) -> PbFieldDefinition {
+        PbFieldDefinition {
+            key: self.key,
+            r#type: self.type_ as i32,
+            description: match self.description {
+                None => String::new(),
+                Some(str) => String::from(str),
+            },
+            nested_type_definition: match self.nested_type_definition {
+                None => None,
+                Some(t) => Some(PbBox::new(t.into())),
+            },
+            object_fields: match self.object_fields {
+                None => Vec::new(),
+                Some(fields) => fields.into_iter().map(|field| field.into()).collect(),
             },
         }
     }

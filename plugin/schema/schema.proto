@@ -16,6 +16,7 @@ message FieldType {
     BYTES = 6;
     ARRAY = 7;
     MAP = 8;
+    OBJECT = 9;
   }
 }
 
@@ -50,6 +51,8 @@ message FieldDefinition {
   string key = 1;
   string description = 2;
   FieldType.Enum type = 3;
+  FieldDefinition nested_type_definition = 4;
+  repeated FieldDefinition object_fields = 6;
 }
 
 message SchemaDefinition {

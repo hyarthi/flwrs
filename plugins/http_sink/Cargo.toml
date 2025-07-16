@@ -1,0 +1,12 @@
+[package]
+name = "flwrs_http_sink"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flwrs_plugin = { version = "0.1.0", path = "../../plugin" }
+tokio = { version = "1.46.1", features = ["full", "rt-multi-thread"] }
+clap = { version = "4.5.41", features = ["derive"] }
+log = { version = "0.4.27", features = ["kv", "kv_serde"] }
+reqwest = "0.12.22"
+bytes = "1.10.1"
