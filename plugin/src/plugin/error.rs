@@ -1,5 +1,5 @@
-use std::fmt::{Display, Formatter};
 use prost::DecodeError;
+use std::fmt::{Display, Formatter};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -82,6 +82,23 @@ impl Display for SourceError {
 }
 
 impl std::error::Error for SourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
+}
+
+#[derive(Debug)]
+pub struct TransformError {
+    pub source: Box<dyn std::error::Error>,
+}
+
+impl Display for TransformError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.source.to_string())
+    }
+}
+
+impl std::error::Error for TransformError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&*self.source)
     }

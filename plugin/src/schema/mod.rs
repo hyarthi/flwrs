@@ -13,3 +13,7 @@ pub mod sink {
 pub mod source {
     include!(concat!(env!("OUT_DIR"), "/schema.source.rs"));
 }
+
+pub mod transform {
+    include!(concat!(env!("OUT_DIR"), "/schema.transform.rs"));
+}

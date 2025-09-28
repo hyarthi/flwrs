@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package schema.transform;
+
+import "schema/schema.proto";
+import "schema/common.proto";
+
+message TransformEvent {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  schema.PluginPayload payload = 3;
+}
+
+// transform --> runtime
+
+message TransformExitCode {
+  enum Enum {
+    OK = 0;
+    INTERRUPTED = 1;
+    ERROR = 2;
+  }
+}
+
+message TransformExit {
+  TransformExitCode.Enum code = 1;
+  string message = 2;
+}
+
+message Initialize {
+  string plugin_id = 1;
+  string plugin_version = 2;
+  schema.SchemaDefinition in_schema = 3;
+  schema.SchemaDefinition out_schema = 4;
+}
+
+message TransformMessage {
+  oneof payload {
+    Initialize initialize = 1;
+    TransformExit exit = 2;
+    common.LogEvent log = 3;
+    common.ErrorEvent error = 4;
+    TransformEvent event = 5;
+  }
+}
+
+// runtime --> transform
+
+message Shutdown {}
+
+message InitializeResponse {}
+
+message RuntimeTransformMessage {
+  oneof payload {
+    InitializeResponse initialize = 1;
+    Shutdown shutdown = 2;
+    TransformEvent event = 3;
+  }
+}

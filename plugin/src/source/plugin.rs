@@ -18,5 +18,3 @@ pub trait Source<'a> {
 
     fn run(&self) -> Result<(), SourceError>;
 }
-
-pub struct SinkMessage {}

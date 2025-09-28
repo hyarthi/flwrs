@@ -3,34 +3,37 @@ use crate::plugin::error::Error;
 use crate::plugin::logger::PluginLogger;
 use crate::plugin::msg_client::MSG_CLIENT;
 use crate::schema::common::log_level::Enum as LogLevel;
-use crate::schema::sink::sink_message::Payload;
-use crate::schema::sink::{
-    runtime_sink_message::Payload as RuntimeSinkMessagePayload, RuntimeSinkMessage, SinkMessage,
+use crate::schema::transform::transform_message::Payload;
+use crate::schema::transform::{
+    runtime_transform_message::Payload as RuntimeTransformMessagePayload, RuntimeTransformMessage, TransformMessage,
 };
-use crate::sink::plugin::Sink;
+use crate::transform::plugin::Transform;
 use prost::Message;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-pub struct SinkRunnerConfig {
+pub struct TransformRunnerConfig {
     pub plugin_id: String,
     pub log_level: LogLevel,
     pub hub_connection: ConnectionConfig,
 }
 
-pub struct SinkRunner<T>
+pub struct TransformRunner<T>
 where
-    T: Sink,
+    T: for<'a> Transform<'a>,
 {
     plugin: T,
     plugin_id: String,
     log_level: LogLevel,
+    local_sink: Arc<Mutex<crate::transform::local_sink::LocalSink>>,
 }
 
-impl<T> SinkRunner<T>
+impl<T> TransformRunner<T>
 where
-    T: Sink,
+    T: for<'a> Transform<'a>,
 {
     #[allow(dead_code)]
-    pub async fn initialize(plugin: T, config: SinkRunnerConfig) -> Result<Self, Error> {
+    pub async fn initialize(plugin: T, config: TransformRunnerConfig) -> Result<Self, Error> {
         MSG_CLIENT
             .write()
             .await
@@ -49,25 +52,27 @@ where
     pub(crate) fn new(id: String, plugin: T, log_level: LogLevel) -> Self {
         Self {
             plugin,
-            plugin_id: id,
+            plugin_id: id.clone(),
             log_level,
+            local_sink: Arc::new(Mutex::new(crate::transform::local_sink::LocalSink::new(id))),
         }
     }
 
     #[allow(dead_code)]
     pub async fn run(&mut self) -> Result<(), Error> {
         // send hello to runtime
-        let payload = match self
-            .plugin
-            .initialize(self.plugin_id.clone(), self.log_level)
-        {
+        let payload = match self.plugin.initialize(
+            self.plugin_id.clone(),
+            self.log_level,
+            self.local_sink.as_ref(),
+        ) {
             Ok(result) => result,
             Err(err) => {
                 log::error!("Error initializing plugin: {}", err);
                 return Err(Error::InitError(err));
             }
         };
-        let hello_msg = SinkMessage {
+        let hello_msg = TransformMessage {
             payload: Some(Payload::Initialize(payload.into())),
         };
 
@@ -97,7 +102,7 @@ where
                     continue;
                 }
             };
-            let msg = match RuntimeSinkMessage::decode(bytes) {
+            let msg = match RuntimeTransformMessage::decode(bytes) {
                 Ok(message) => message,
                 Err(err) => {
                     log::error!("Error parsing message: {}", err);
@@ -113,20 +118,20 @@ where
             };
 
             match pyld {
-                RuntimeSinkMessagePayload::Initialize(_) => {
+                RuntimeTransformMessagePayload::Initialize(_) => {
                     // noop for sink
                     continue;
                 }
-                RuntimeSinkMessagePayload::Event(payload) => {
+                RuntimeTransformMessagePayload::Event(payload) => {
                     log::debug!("Received event: {:?}", payload.plugin_id.clone());
-                    let result = self.plugin.consume_event(payload);
+                    let result = self.plugin.process_event(payload);
                     if let Err(err) = result {
                         log::error!("Error processing event: {}", err);
                         continue;
                     }
                     continue;
                 }
-                RuntimeSinkMessagePayload::Shutdown(_) => {
+                RuntimeTransformMessagePayload::Shutdown(_) => {
                     log::debug!("Received shutdown message");
                     let result = self.plugin.shutdown();
                     if let Err(err) = result {

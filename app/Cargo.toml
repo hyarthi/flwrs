@@ -1,0 +1,22 @@
+[package]
+name = "flwrs-app"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+flwrs-core = { path = "../core" }
+flwrs-plugin = { path = "../plugin" }
+chrono = "0.4.39"
+log = { version = "0.4.22", features = ["kv", "kv_serde"] }
+tokio = { version = "1.42.0", features = ["full"] }
+tokio-util = { version = "0.7.13", features = ["full"] }
+rust-embed = { version = "8.5.0", features = ["debug-embed"] }
+lazy_static = "1.5.0"
+axum = "0.8.1"
+utoipa = { version = "5.4.0", features = ["yaml", "axum_extras", "chrono", "preserve_order", "debug"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+serde = { version = "1.0.216", features = ["derive"] }
+thiserror = "2.0.11"
+sqlx = { version = "0.8.2", features = ["runtime-tokio", "sqlite", "chrono", "derive"] }
+async-trait = "0.1.85"
+ulid = "1.2.1"

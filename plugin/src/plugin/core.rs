@@ -2,14 +2,17 @@ use crate::schema::schema::{
     field_type::Enum as FieldType, FieldDefinition as PbFieldDefinition,
     SchemaDefinition as PbSchemaDefinition,
 };
-use crate::schema::sink::Initialize;
+use crate::schema::sink::Initialize as SinkInitialize;
+use crate::schema::source::Initialize as SourceInitialize;
+use crate::schema::transform::Initialize as TransformInitialize;
 use prost::alloc::boxed::Box as PbBox;
 use prost::alloc::string::String;
 
 pub struct InitializeRequest {
     id: String,
     version: String,
-    schema: SchemaDefinition,
+    in_schema: SchemaDefinition,
+    out_schema: SchemaDefinition,
 }
 
 impl InitializeRequest {
@@ -17,7 +20,8 @@ impl InitializeRequest {
         Self {
             id: String::new(),
             version: String::new(),
-            schema: SchemaDefinition::new(),
+            in_schema: SchemaDefinition::new(),
+            out_schema: SchemaDefinition::new(),
         }
     }
 
@@ -32,27 +36,38 @@ impl InitializeRequest {
     }
 
     pub fn with_schema(mut self, schema: SchemaDefinition) -> Self {
-        self.schema = schema;
+        self.in_schema = schema;
         self
     }
 }
 
-impl Into<Initialize> for InitializeRequest {
-    fn into(self) -> Initialize {
-        Initialize {
+impl Into<SinkInitialize> for InitializeRequest {
+    fn into(self) -> SinkInitialize {
+        SinkInitialize {
             plugin_id: self.id,
             plugin_version: self.version,
-            schema: Some(self.schema.into()),
+            schema: Some(self.in_schema.into()),
         }
     }
 }
 
-impl Into<crate::schema::source::Initialize> for InitializeRequest {
-    fn into(self) -> crate::schema::source::Initialize {
-        crate::schema::source::Initialize {
+impl Into<SourceInitialize> for InitializeRequest {
+    fn into(self) -> SourceInitialize {
+        SourceInitialize {
             plugin_id: self.id,
             plugin_version: self.version,
-            schema: Some(self.schema.into()),
+            schema: Some(self.out_schema.into()),
+        }
+    }
+}
+
+impl Into<TransformInitialize> for InitializeRequest {
+    fn into(self) -> TransformInitialize {
+        TransformInitialize {
+            plugin_id: self.id,
+            plugin_version: self.version,
+            in_schema: Some(self.in_schema.into()),
+            out_schema: Some(self.out_schema.into()),
         }
     }
 }

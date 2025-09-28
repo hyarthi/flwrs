@@ -11,6 +11,7 @@ fn main() {
             Path::new("schema/common.proto"),
             Path::new("schema/sink.proto"),
             Path::new("schema/source.proto"),
+            Path::new("schema/transform.proto"),
         ],
         &[Path::new("")],
     )

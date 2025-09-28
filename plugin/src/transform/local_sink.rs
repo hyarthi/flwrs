@@ -1,4 +1,4 @@
-use crate::plugin::error::SourceError;
+use crate::plugin::error::TransformError;
 use crate::plugin::msg_client::MSG_CLIENT;
 use crate::schema::source::source_message::Payload;
 use crate::schema::source::{SourceEvent, SourceMessage};
@@ -13,7 +13,7 @@ impl LocalSink {
         Self { plugin_id }
     }
 
-    pub async fn event(&self, evt: SourceEvent) -> Result<(), SourceError> {
+    pub async fn event(&self, evt: SourceEvent) -> Result<(), TransformError> {
         let msg = SourceMessage {
             payload: Some(Payload::Event(evt)),
         };
@@ -26,7 +26,7 @@ impl LocalSink {
             Ok(_) => Ok(()),
             Err(err) => {
                 log::error!("Error sending message: {}", err);
-                Err(SourceError {
+                Err(TransformError {
                     source: Box::new(err),
                 })
             }
