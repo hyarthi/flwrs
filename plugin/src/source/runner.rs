@@ -1,6 +1,6 @@
 use crate::plugin::core::ConnectionConfig;
 use crate::plugin::error::Error;
-use crate::plugin::logger::{PluginLogger, LOGGER, LOG_WRAPPER};
+use crate::plugin::logger::{PluginLogger};
 use crate::plugin::msg_client::MSG_CLIENT;
 use crate::schema::common::log_level::Enum as LogLevel;
 use crate::schema::source::runtime_source_message::Payload;

@@ -5,12 +5,12 @@ use crate::schema::source::{SourceEvent, SourceMessage};
 use prost::Message;
 
 pub struct LocalSink {
-    plugin_id: String,
+    _plugin_id: String,
 }
 
 impl LocalSink {
     pub fn new(plugin_id: String) -> Self {
-        Self { plugin_id }
+        Self { _plugin_id: plugin_id }
     }
 
     pub async fn event(&self, evt: SourceEvent) -> Result<(), SourceError> {
