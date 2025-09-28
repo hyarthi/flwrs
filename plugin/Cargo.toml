@@ -2,6 +2,8 @@
 name = "flwrs-plugin"
 version = "0.0.1"
 edition = "2024"
+description = "Crate for building plugins for flwrs."
+license-file = "../LICENSE"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
