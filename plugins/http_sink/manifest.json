@@ -1,0 +1,12 @@
+{
+  "manifest_version": 1,
+  "id": "http-sink",
+  "name": "HTTP sink",
+  "version": "0.0.1",
+  "type": "SINK",
+  "description": "Sends an HTTP request for each event.",
+  "executable": "bin/flwrs-http-sink",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": { "in": "schema/in.json" }
+}

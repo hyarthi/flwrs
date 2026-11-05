@@ -1,3 +1,3 @@
+pub mod local_sink;
 pub mod plugin;
-mod local_sink;
-mod runner;
+pub mod runner;

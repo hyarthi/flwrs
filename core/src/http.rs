@@ -2,10 +2,10 @@ use crate::config::main_config;
 use crate::registry::RegistryError;
 use crate::{config, registry};
 use async_trait::async_trait;
+use axum::Router;
 use axum::extract::Request;
 use axum::response::IntoResponse;
 use axum::routing::{MethodRouter, Route};
-use axum::Router;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -16,19 +16,26 @@ use tokio_util::sync::CancellationToken;
 use tower_layer::Layer;
 use tower_service::Service;
 
+/// `[http]` config section. Missing fields fall back to the defaults.
 #[derive(Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     host: String,
-    port: u32,
+    port: u16,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "0.0.0.0".to_string(),
+            port: 80,
+        }
+    }
 }
 
 impl ServerConfig {
     pub fn read() -> Self {
-        let main_config = main_config();
-        config::read_struct(main_config, &["http".to_string()]).unwrap_or(Self {
-            host: "".to_string(),
-            port: 80,
-        })
+        config::read_struct(main_config(), &["http".to_string()]).unwrap_or_default()
     }
 }
 
@@ -56,11 +63,8 @@ impl HttpServer {
             server.merge_api(api);
         }
 
-        match swagger_ui {
-            None => {}
-            Some(router) => {
-                server.merge_root(router);
-            }
+        if let Some(router) = swagger_ui {
+            server.merge_root(router);
         }
 
         server
@@ -71,8 +75,7 @@ impl HttpServer {
         path: &str,
         handlers: HashMap<String, MethodRouter>,
         middleware: Option<L>,
-    ) -> ()
-    where
+    ) where
         L: Layer<Route> + Clone + Send + Sync + 'static,
         L::Service: Service<Request> + Clone + Send + Sync + 'static,
         <L::Service as Service<Request>>::Response: IntoResponse + 'static,
@@ -85,11 +88,11 @@ impl HttpServer {
             .nest(path, Self::build_router(handlers, middleware));
     }
 
-    pub fn merge_api(&mut self, router: Router) -> () {
+    pub fn merge_api(&mut self, router: Router) {
         self.api_delegate = self.api_delegate.clone().merge(router);
     }
 
-    pub fn merge_root(&mut self, router: Router) -> () {
+    pub fn merge_root(&mut self, router: Router) {
         self.root_delegate = self.root_delegate.clone().merge(router);
     }
 
@@ -107,17 +110,14 @@ impl HttpServer {
             router = router.route(path.as_str(), handler.clone());
         }
 
-        match middleware {
-            None => {}
-            Some(m) => {
-                router = router.layer(m);
-            }
-        };
+        if let Some(m) = middleware {
+            router = router.layer(m);
+        }
 
         router
     }
 
-    async fn shutdown(token: CancellationToken) -> () {
+    async fn shutdown(token: CancellationToken) {
         token.cancelled().await;
         log::debug!("HTTP server shutting down.");
     }
@@ -126,11 +126,7 @@ impl HttpServer {
 #[derive(Error, Debug)]
 pub enum HttpError {
     #[error("IO error: {0}")]
-    IoError(
-        #[from]
-        #[source]
-        io::Error,
-    ),
+    IoError(#[from] io::Error),
 }
 
 #[async_trait]
@@ -145,7 +141,7 @@ impl registry::Service for HttpServer {
         let host = self.config.host.clone();
         let port = self.config.port;
         log::debug!("Starting HTTP server.");
-        let listener = match TcpListener::bind(format!("{}:{}", host, port)).await {
+        let listener = match TcpListener::bind((host.as_str(), port)).await {
             Ok(listener) => listener,
             Err(e) => {
                 return Err(RegistryError::ServiceError {
@@ -160,7 +156,11 @@ impl registry::Service for HttpServer {
             port = port
         );
         // TODO add common middlewares
-        match axum::serve(listener, root_router.nest("/api", api_router))
+        // Connect info gives handlers the peer address (e.g. loopback checks).
+        let app = root_router
+            .nest("/api", api_router)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>();
+        match axum::serve(listener, app)
             .with_graceful_shutdown(Self::shutdown(token))
             .await
         {

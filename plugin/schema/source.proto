@@ -1,57 +1,49 @@
 syntax = "proto3";
 
+// Messages between a source plugin and the runtime.
 package schema.source;
 
 import "schema/schema.proto";
 import "schema/common.proto";
 
-// source --> runtime
+// --- source -> runtime ---
 
-message SourceExitCode {
-  enum Enum {
-    UNDEFINED = 0;
-    OK = 1;
-    INTERRUPTED = 2;
-    ERROR = 3;
-  }
-}
-
-message SourceExit {
-  SourceExitCode.Enum code = 1;
-  string message = 2;
+// First message on every connection, including after a reconnect.
+message Initialize {
+  // Instance id: the node id the plugin was started with (--id).
+  string plugin_id = 1;
+  string plugin_version = 2;
+  // Schema of the payloads this source emits.
+  schema.SchemaDefinition schema = 3;
+  // Authenticates this connection: the per-launch token for plugins the hub
+  // launched, or the node's pre-shared token for remote plugins. Read from the
+  // FLWRS_TOKEN environment variable (or a --token argument).
+  string token = 4;
 }
 
 message SourceEvent {
-  string source_id = 1;
-  string source_version = 2;
-  schema.PluginPayload payload = 3;
-}
-
-message Initialize {
   string plugin_id = 1;
   string plugin_version = 2;
-  schema.SchemaDefinition schema = 3;
+  schema.PluginPayload payload = 3;
+  // Hub-managed event metadata; see common.EventMetadata.
+  common.EventMetadata metadata = 4;
 }
 
 message SourceMessage {
   oneof payload {
     Initialize initialize = 1;
-    SourceExit exit = 2;
+    common.Exit exit = 2;
     SourceEvent event = 3;
     common.LogEvent log = 4;
     common.ErrorEvent error = 5;
   }
 }
 
-// runtime --> source
-
-message InitializeResponse {}
-
-message Shutdown {}
+// --- runtime -> source ---
 
 message RuntimeSourceMessage {
   oneof payload {
-    InitializeResponse initialize = 1;
-    Shutdown shutdown = 2;
+    common.InitializeResponse initialize = 1;
+    common.Shutdown shutdown = 2;
   }
 }

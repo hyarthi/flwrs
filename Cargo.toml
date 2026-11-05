@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+# Members are listed explicitly (no `plugins/*` glob), so folders under plugins/
+# that aren't Rust crates (non-Rust plugins, installed packages) can't break the
+# workspace. Add each new Rust plugin here.
+members = ["core", "app", "plugin", "plugins/http_sink", "xtask"]
+
+# Shared package metadata; crates opt in with `<field>.workspace = true`.
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/hyarthi/flwrs"
+
+# Single place for dependency versions. Crates use `<dep>.workspace = true`
+# and may add extra `features` on top of the ones listed here.
+[workspace.dependencies]
+# internal crates
+flwrs-core = { path = "core" }
+flwrs-plugin = { path = "plugin" }
+
+# async runtime
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["full"] }
+async-trait = "0.1.92"
+
+# logging and errors
+log = { version = "0.4.35", features = ["kv", "kv_serde"] }
+flexi_logger = "0.31.10"
+syslog = "7.0.0"
+thiserror = "2.0.21"
+
+# config and CLI
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.0"
+
+# serialization and validation
+serde_json = "1.0.154"
+# No remote or file $ref resolution: plugin-supplied schemas must not make the
+# server fetch URLs or read local files.
+jsonschema = { version = "0.60.2", default-features = false, features = ["idna"] }
+zip = { version = "9.3.0", default-features = false, features = ["deflate"] }
+
+# storage
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "chrono", "derive"] }
+rust-embed = { version = "8.13.0", features = ["debug-embed"] }
+sha256 = "1.6.0"
+chrono = "0.4.45"
+ulid = "3.0.0"
+
+# HTTP
+axum = { version = "0.8.9", features = ["multipart"] }
+tower-service = "0.3.3"
+tower-layer = "0.3.3"
+utoipa = { version = "6.0.0", features = ["yaml", "axum_extras", "chrono", "preserve_order", "debug"] }
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
+reqwest = "0.13.5"
+
+# plugin protocol
+prost = "0.14.4"
+pbjson = "0.9.0"
+pbjson-types = "0.9.0"
+pbjson-build = "0.9.0"
+prost-types = "0.14.4"
+prost-build = "0.14.4"
+protoc-bin-vendored = "3.3.0"
+bytes = "1.12.1"
+
+# testing
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

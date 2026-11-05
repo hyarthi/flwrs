@@ -1,9 +1,8 @@
-use std::fmt::{Display, Formatter};
 use crate::config;
-use lazy_static::lazy_static;
-use std::sync::Arc;
 use flexi_logger::FlexiLoggerError;
 use serde::Deserialize;
+use std::fmt::{Display, Formatter};
+use std::sync::LazyLock;
 use thiserror::Error;
 
 mod loglog;
@@ -35,16 +34,6 @@ impl Display for LogLevel {
     }
 }
 
-lazy_static! {
-    static ref ordered_log_levels: Vec<LogLevel> = vec![
-        LogLevel::ERROR,
-        LogLevel::WARN,
-        LogLevel::INFO,
-        LogLevel::DEBUG,
-        LogLevel::TRACE,
-    ];
-}
-
 impl LogLevel {
     fn stringify(&self) -> String {
         match self {
@@ -69,15 +58,17 @@ pub enum FieldType {
 
 #[derive(Deserialize)]
 pub struct LoggerConfig {
+    /// Used as the syslog process name and the log file prefix.
     #[serde(default = "default_id")]
     id: String,
+    #[allow(dead_code)] // only PLAIN exists so far
     format: FormatType,
     level: LogLevel,
     sinks: Vec<SinkConfig>,
 }
 
 fn default_id() -> String {
-    "actor".to_string()
+    "flwrs".to_string()
 }
 
 #[derive(Deserialize)]
@@ -92,35 +83,48 @@ pub struct SinkConfig {
 pub enum LogError {
     #[error("failed to read logging config struct")]
     ConfigReadError,
-    #[error("log level not found: {0}")]
-    LogLevelNotFoundError(LogLevel),
     #[error("syslog error: {0}")]
-    SyslogError(#[from] #[source] syslog::Error),
+    SyslogError(
+        #[from]
+        #[source]
+        syslog::Error,
+    ),
     #[error(transparent)]
-    FlexiLoggerError(#[from] FlexiLoggerError)
+    FlexiLoggerError(#[from] FlexiLoggerError),
 }
 
-lazy_static! {
-    static ref DEFAULT_LOGGER: Arc<dyn log::Log> = Arc::new(loglog::LogLogger::default());
-}
+static DEFAULT_LOGGER: LazyLock<loglog::LogLogger> = LazyLock::new(loglog::LogLogger::default);
 
+/// Console logger at INFO level.
 pub fn default_logger() -> &'static dyn log::Log {
-    DEFAULT_LOGGER.as_ref()
+    &*DEFAULT_LOGGER
 }
 
-lazy_static! {
-    static ref MAIN_LOGGER: Arc<dyn log::Log> = build_main_logger();
-}
+static MAIN_LOGGER: LazyLock<loglog::LogLogger> = LazyLock::new(build_main_logger);
 
-fn build_main_logger() -> Arc<dyn log::Log> {
+fn build_main_logger() -> loglog::LogLogger {
     let main_config = config::main_config();
-
-    let mut config = config::read_struct::<LoggerConfig>(main_config, &["logging".to_string()])
-        .ok_or(LogError::ConfigReadError).unwrap();
-    config.id = "actor".to_string();
-    Arc::new(loglog::LogLogger::new(config).unwrap())
+    match config::read_struct::<LoggerConfig>(main_config, &["logging".to_string()]) {
+        Some(config) => loglog::LogLogger::new(config).unwrap_or_else(|e| {
+            eprintln!("Failed to build logger from [logging] config ({e}); using console logger");
+            loglog::LogLogger::default()
+        }),
+        None => {
+            eprintln!("No valid [logging] config; using console logger at INFO");
+            loglog::LogLogger::default()
+        }
+    }
 }
 
+/// Logger built from the `[logging]` config section.
 pub fn main_logger() -> &'static dyn log::Log {
-    MAIN_LOGGER.as_ref()
+    &*MAIN_LOGGER
+}
+
+/// Installs [`main_logger`] as the global `log` logger and sets the max level.
+pub fn init_main_logger() -> Result<(), log::SetLoggerError> {
+    let logger = &*MAIN_LOGGER;
+    log::set_logger(logger)?;
+    log::set_max_level(logger.level().to_level_filter());
+    Ok(())
 }

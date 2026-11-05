@@ -1,0 +1,29 @@
+# Dev configuration. Run from the repo root:
+#   cargo run -p flwrs-app -- --config config.dev.toml
+# Everything the server writes at run time goes under ./.data/ (gitignored),
+# so it never mixes with the source tree (e.g. installed plugins vs. plugins/ sources).
+
+[http]
+host = "127.0.0.1"
+port = 8080
+
+[logging]
+format = "PLAIN"
+level = "DEBUG"
+
+[[logging.sinks]]
+sink_type = "CONSOLE"
+
+[db.main]
+filename = ".data/main.db"
+
+[plugins]
+dir = ".data/plugins"
+# Uploads run code on this machine; in dev they're allowed from loopback only
+# (no admin_token set, and the server listens on 127.0.0.1).
+allow_upload = true
+
+# Not read yet; used once the director exists (see DIRECTOR_PLAN.tmp.md).
+
+[director]
+spool_dir = ".data/scenes"

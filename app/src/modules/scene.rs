@@ -1,18 +1,30 @@
-use std::sync::Arc;
-use tokio::sync::OnceCell;
-use crate::db::main_db;
-use crate::modules::scene::service::Service;
+//! Scenes: workflow definitions (a graph of plugin-instance nodes and
+//! data-handover edges), managed at config time.
 
-pub(crate) mod service;
 pub(crate) mod api;
+pub(crate) mod api_graph;
+pub(crate) mod graph;
+pub(crate) mod service;
 
-static SERVICE: OnceCell<Arc<Service>> = OnceCell::const_new();
+use crate::db::main_db;
+use crate::modules::director::DirectorHandle;
+use crate::modules::plugin;
+use service::Service;
+use tokio::sync::OnceCell;
 
-pub(crate) async fn service() -> &'static Service {
+static SERVICE: OnceCell<Service> = OnceCell::const_new();
+
+/// Creates the scene service. Called once at start-up, after the plugin
+/// registry and the director handle exist.
+pub(crate) async fn init(director: DirectorHandle) -> &'static Service {
     SERVICE
-        .get_or_init(|| async {
-            let db = main_db().await;
-            Arc::new(Service::new(db))
-        })
+        .get_or_init(|| async { Service::new(main_db().await, plugin::service(), director) })
         .await
+}
+
+/// The scene service. Panics if [`init`] hasn't run.
+pub(crate) fn service() -> &'static Service {
+    SERVICE
+        .get()
+        .expect("scene service is initialised at start-up")
 }

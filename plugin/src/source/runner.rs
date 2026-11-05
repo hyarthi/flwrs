@@ -1,15 +1,18 @@
 use crate::plugin::core::ConnectionConfig;
 use crate::plugin::error::Error;
-use crate::plugin::logger::{PluginLogger};
-use crate::plugin::msg_client::MSG_CLIENT;
-use crate::schema::common::log_level::Enum as LogLevel;
-use crate::schema::source::runtime_source_message::Payload;
-use crate::schema::source::{RuntimeSourceMessage, SourceMessage};
+use crate::plugin::logger::PluginLogger;
+use crate::plugin::msg_client::{HubClient, Session, Stage};
+use crate::plugin::runtime::{
+    Backoff, RESTART_BACKOFF, SessionEnd, accept, error_event, finish, open_session,
+};
+use crate::schema::common::{log_level::Enum as LogLevel, plugin_type::Enum as PluginType};
+use crate::schema::source::{
+    Initialize, RuntimeSourceMessage, SourceMessage,
+    runtime_source_message::Payload as RuntimePayload, source_message::Payload,
+};
 use crate::source::local_sink::LocalSink;
 use crate::source::plugin::Source;
-use prost::Message;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
 
 pub struct SourceRunnerConfig {
     pub plugin_id: String,
@@ -17,150 +20,212 @@ pub struct SourceRunnerConfig {
     pub hub_connection: ConnectionConfig,
 }
 
-pub struct SourceRunner<T>
-where
-    T: for<'a> Source<'a>,
-{
-    plugin: RwLock<T>,
+pub struct SourceRunner<T: Source> {
+    plugin: T,
     plugin_id: String,
     log_level: LogLevel,
-    local_sink: Arc<Mutex<LocalSink>>,
+    connection: ConnectionConfig,
+    client: Arc<HubClient>,
 }
 
-impl<T> SourceRunner<T>
-where
-    T: for<'a> Source<'a>,
-{
-    #[allow(dead_code)]
+/// What a control message means for the session.
+enum Control {
+    Continue,
+    End(SessionEnd),
+}
+
+impl<T: Source> SourceRunner<T> {
+    /// Installs the plugin logger. Connecting happens in [`SourceRunner::run`].
     pub async fn initialize(plugin: T, config: SourceRunnerConfig) -> Result<Self, Error> {
-        MSG_CLIENT
-            .write()
-            .await
-            .connect(
-                format!(
-                    "{}:{}",
-                    config.hub_connection.host, config.hub_connection.port
-                )
-                .as_str(),
-            )
-            .await?;
-        PluginLogger::initialize(config.plugin_id.as_str(), config.log_level.into())?;
-        Ok(Self::new(config.plugin_id, plugin, config.log_level))
+        let client = HubClient::new(config.hub_connection.addr());
+        PluginLogger::initialize(
+            &config.plugin_id,
+            PluginType::Source,
+            config.log_level.into(),
+            client.clone(),
+        )?;
+        Ok(Self {
+            plugin,
+            plugin_id: config.plugin_id,
+            log_level: config.log_level,
+            connection: config.hub_connection,
+            client,
+        })
     }
 
-    pub(crate) fn new(id: String, plugin: T, log_level: LogLevel) -> Self {
-        Self {
-            plugin: RwLock::new(plugin),
-            log_level,
-            plugin_id: id.clone(),
-            local_sink: Arc::new(Mutex::new(LocalSink::new(id))),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub async fn run(&self) -> Result<(), Error> {
-        // send hello to runtime
-        let payload = match self.plugin.write().await.initialize(
+    /// Connects to the hub and sends `Initialize`. Once the hub accepts the
+    /// plugin (`InitializeResponse`), runs the source until the hub sends
+    /// `Shutdown`. A failing `run` is restarted after a short delay.
+    ///
+    /// If the connection is lost, `run` is cancelled; the runner reconnects
+    /// with backoff, re-sends the same `Initialize` and restarts `run` once
+    /// accepted again. A `run` that already finished isn't restarted.
+    ///
+    /// Returns [`Error::Rejected`] if the hub answers `Initialize` with
+    /// `Shutdown` (unknown instance id or wrong token).
+    pub async fn run(&mut self) -> Result<(), Error> {
+        let sink = LocalSink::new(
             self.plugin_id.clone(),
-            self.log_level,
-            self.local_sink.as_ref(),
-        ) {
-            Ok(result) => result,
-            Err(err) => {
-                log::error!("Error initializing plugin: {}", err);
-                return Err(Error::InitError(err));
-            }
-        };
-        let hello_msg = SourceMessage {
-            payload: Some(crate::schema::source::source_message::Payload::Initialize(
-                payload.into(),
-            )),
+            self.plugin.version(),
+            self.client.clone(),
+        );
+        let mut init: Initialize = self
+            .plugin
+            .initialize(self.plugin_id.clone(), self.log_level, sink)
+            .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?
+            .into();
+        init.token = self.connection.resolved_token();
+        let init = SourceMessage {
+            payload: Some(Payload::Initialize(init)),
         };
 
-        match MSG_CLIENT
-            .read()
-            .await
-            .send(hello_msg.encode_to_vec().as_slice())
-            .await
-        {
-            Ok(_) => {}
-            Err(err) => {
-                log::error!("Error sending hello message: {}", err);
-                return Err(Error::IOError(err));
+        let mut backoff = Backoff::new(self.connection.reconnect);
+        let mut finished = false;
+        let end = loop {
+            let mut session = open_session(&self.client, &init, &mut backoff).await;
+            let mut end = await_accept(&self.client, &mut session, &mut backoff).await;
+            if end.is_none() {
+                end = Some(
+                    run_source(
+                        &self.plugin,
+                        &self.plugin_id,
+                        &self.client,
+                        &mut session,
+                        &mut finished,
+                    )
+                    .await,
+                );
+            }
+            match end {
+                Some(SessionEnd::Disconnected) | None => {
+                    self.client.disconnect(Some(session.id)).await;
+                    log::warn!("Lost the connection to the hub; reconnecting");
+                }
+                Some(end) => break end,
             }
         };
 
-        loop {
-            let join_result = tokio::try_join!(self.consume_loop(), self.run_plugin());
-            match join_result {
-                Ok(_) => {
-                    // both exited cleanly
-                    break Ok(());
-                }
-                Err(err) => {
-                    // if plugin crashed - try again
-                    if let Error::SourceError(_) = err {
-                        log::error!("Plugin crashed: {}", err.to_string());
-                        continue;
-                    }
-                    // consume loop crashed - exit
-                    let result = self.plugin.write().await.shutdown();
-                    if let Err(err) = result {
-                        log::error!("Error shutting down: {}", err);
-                        return Err(Error::ShutdownError(err));
-                    }
-                    break Err(err);
-                }
+        let shutdown = self.plugin.shutdown();
+        finish(&self.client, &self.plugin_id, end, shutdown, |exit| {
+            SourceMessage {
+                payload: Some(Payload::Exit(exit)),
+            }
+        })
+        .await
+    }
+}
+
+/// Waits for `InitializeResponse`. Returns `None` once accepted, or how the
+/// session ended before that.
+async fn await_accept(
+    client: &HubClient,
+    session: &mut Session<RuntimeSourceMessage>,
+    backoff: &mut Backoff,
+) -> Option<SessionEnd> {
+    loop {
+        let Some(msg) = session.next().await else {
+            return Some(SessionEnd::Disconnected);
+        };
+        match msg.payload {
+            None => log::error!("Message payload is missing"),
+            Some(RuntimePayload::Initialize(_)) => {
+                accept(client, session, backoff).await;
+                return None;
+            }
+            Some(RuntimePayload::Shutdown(_)) => {
+                log::debug!("Received shutdown message");
+                return Some(SessionEnd::Shutdown { accepted: false });
             }
         }
     }
+}
 
-    async fn consume_loop(&self) -> Result<(), Error> {
-        loop {
-            let bytes = match MSG_CLIENT.read().await.receive().await {
-                Ok(bytes) => match bytes {
-                    None => {
-                        continue;
-                    }
-                    Some(bytes) => bytes,
-                },
-                Err(err) => {
-                    log::error!("Error receiving message: {}", err);
-                    continue;
-                }
-            };
-            let msg_result = RuntimeSourceMessage::decode(bytes);
-            if let Err(err) = msg_result {
-                log::error!("Error parsing message: {}", err);
-                continue;
-            }
-            let msg = msg_result.expect("Message should be valid");
-
-            if msg.payload.is_none() {
-                log::error!("Message payload is missing");
-                continue;
-            }
-
-            match msg.payload.unwrap() {
-                Payload::Initialize(_) => {}
-                Payload::Shutdown(_) => {
-                    log::debug!("Received shutdown message");
-                    let result = self.plugin.write().await.shutdown();
-                    if let Err(err) = result {
-                        log::error!("Error shutting down: {}", err);
-                        return Err(Error::ShutdownError(err));
-                    }
-                    log::info!("Plugin shutdown: {}", self.plugin_id);
-                    return Ok(());
-                }
-            }
+fn control(msg: RuntimeSourceMessage) -> Control {
+    match msg.payload {
+        None => {
+            log::error!("Message payload is missing");
+            Control::Continue
+        }
+        Some(RuntimePayload::Initialize(_)) => Control::Continue,
+        Some(RuntimePayload::Shutdown(_)) => {
+            log::debug!("Received shutdown message");
+            Control::End(SessionEnd::Shutdown { accepted: true })
         }
     }
+}
 
-    async fn run_plugin(&self) -> Result<(), Error> {
-        if let Err(err) = self.plugin.read().await.run() {
-            return Err(Error::SourceError(err));
+/// Runs the source (restarting it on failure) while handling control
+/// messages, until `Shutdown` or a disconnect.
+async fn run_source<T: Source>(
+    plugin: &T,
+    plugin_id: &str,
+    client: &HubClient,
+    session: &mut Session<RuntimeSourceMessage>,
+    finished: &mut bool,
+) -> SessionEnd {
+    loop {
+        if *finished {
+            // Nothing left to run: just wait for Shutdown or a disconnect.
+            loop {
+                match session.next().await {
+                    None => return SessionEnd::Disconnected,
+                    Some(msg) => {
+                        if let Control::End(end) = control(msg) {
+                            return end;
+                        }
+                    }
+                }
+            }
         }
-        Ok(())
+
+        let result = {
+            let run = plugin.run();
+            tokio::pin!(run);
+            loop {
+                tokio::select! {
+                    result = &mut run => break result,
+                    msg = session.next() => match msg {
+                        None => return SessionEnd::Disconnected,
+                        Some(msg) => if let Control::End(end) = control(msg) {
+                            return end;
+                        },
+                    },
+                }
+            }
+        };
+
+        match result {
+            Ok(()) => {
+                log::info!("Source finished, waiting for shutdown");
+                *finished = true;
+            }
+            Err(_) if client.stage() == Stage::Down => return SessionEnd::Disconnected,
+            Err(err) => {
+                log::error!("Plugin crashed: {err}");
+                let msg = SourceMessage {
+                    payload: Some(Payload::Error(error_event(
+                        plugin_id,
+                        PluginType::Source,
+                        err.to_string(),
+                    ))),
+                };
+                if client.send(&msg, Stage::Initializing).await.is_err() {
+                    return SessionEnd::Disconnected;
+                }
+                let sleep = tokio::time::sleep(RESTART_BACKOFF);
+                tokio::pin!(sleep);
+                loop {
+                    tokio::select! {
+                        _ = &mut sleep => break,
+                        msg = session.next() => match msg {
+                            None => return SessionEnd::Disconnected,
+                            Some(msg) => if let Control::End(end) = control(msg) {
+                                return end;
+                            },
+                        },
+                    }
+                }
+            }
+        }
     }
 }

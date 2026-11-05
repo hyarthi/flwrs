@@ -1,6 +1,9 @@
 use prost::DecodeError;
 use std::fmt::{Display, Formatter};
 
+/// Boxed error that can cross task boundaries.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("I/O error: {0}")]
@@ -13,93 +16,64 @@ pub enum Error {
     SinkError(#[from] SinkError),
     #[error("Source error: {0}")]
     SourceError(#[from] SourceError),
+    #[error("Transform error: {0}")]
+    TransformError(#[from] TransformError),
     #[error("Failed to set logger: {0}")]
     SetLoggerError(#[from] log::SetLoggerError),
     #[error("Invalid message: {0}")]
     InvalidMessage(#[from] DecodeError),
+    #[error("Hub closed the connection")]
+    Disconnected,
+    #[error("The hub rejected the plugin (Shutdown before InitializeResponse)")]
+    Rejected,
 }
 
-#[derive(Debug)]
-pub struct InitializeError {
-    pub source: Box<dyn std::error::Error>,
+macro_rules! plugin_error {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Debug)]
+        pub struct $name {
+            pub source: BoxError,
+        }
+
+        impl $name {
+            /// Wraps any error, or a message (`&str` / `String`).
+            pub fn new(source: impl Into<BoxError>) -> Self {
+                Self { source: source.into() }
+            }
+        }
+
+        impl Display for $name {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                Display::fmt(&self.source, f)
+            }
+        }
+
+        impl std::error::Error for $name {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&*self.source)
+            }
+        }
+    };
 }
 
-impl Display for InitializeError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.source.to_string())
-    }
-}
-
-impl std::error::Error for InitializeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.source)
-    }
-}
-
-#[derive(Debug)]
-pub struct ShutdownError {
-    pub source: Box<dyn std::error::Error>,
-}
-
-impl Display for ShutdownError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.source.to_string())
-    }
-}
-
-impl std::error::Error for ShutdownError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.source)
-    }
-}
-
-#[derive(Debug)]
-pub struct SinkError {
-    pub source: Box<dyn std::error::Error>,
-}
-
-impl Display for SinkError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.source.to_string())
-    }
-}
-
-impl std::error::Error for SinkError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.source)
-    }
-}
-
-#[derive(Debug)]
-pub struct SourceError {
-    pub source: Box<dyn std::error::Error>,
-}
-
-impl Display for SourceError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.source.to_string())
-    }
-}
-
-impl std::error::Error for SourceError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.source)
-    }
-}
-
-#[derive(Debug)]
-pub struct TransformError {
-    pub source: Box<dyn std::error::Error>,
-}
-
-impl Display for TransformError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.source.to_string())
-    }
-}
-
-impl std::error::Error for TransformError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.source)
-    }
-}
+plugin_error!(
+    /// Plugin failed to initialize.
+    InitializeError
+);
+plugin_error!(
+    /// Plugin failed to shut down cleanly.
+    ShutdownError
+);
+plugin_error!(
+    /// Sink failed to consume an event.
+    SinkError
+);
+plugin_error!(
+    /// Source failed while producing events.
+    SourceError
+);
+plugin_error!(
+    /// Transform failed to process an event.
+    TransformError
+);

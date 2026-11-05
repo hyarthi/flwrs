@@ -1,36 +1,49 @@
 syntax = "proto3";
 
+// Typed payload data model shared by all plugin types.
 package schema.schema;
 
-import "google/protobuf/wrappers.proto";
 import "google/protobuf/timestamp.proto";
 
 message FieldType {
   enum Enum {
-    STRING = 0;
-    I32 = 1;
-    U32 = 2;
-    F32 = 3;
-    BOOL = 4;
-    DATETIME = 5;
-    BYTES = 6;
-    ARRAY = 7;
-    MAP = 8;
-    OBJECT = 9;
+    UNDEFINED = 0;
+    STRING = 1;
+    I32 = 2;
+    U32 = 3;
+    F32 = 4;
+    BOOL = 5;
+    DATETIME = 6;
+    BYTES = 7;
+    ARRAY = 8;
+    MAP = 9;
+    // Named fields with their own types; see FieldDefinition.object_fields.
+    // Values are sent as `object`.
+    OBJECT = 10;
+    I64 = 11;
+    U64 = 12;
+    F64 = 13;
   }
 }
 
+// One value. Exactly one variant is set; none set means "no value" (null).
 message FieldValue {
   oneof value {
-    google.protobuf.StringValue string = 1;
-    google.protobuf.Int32Value i32 = 2;
-    google.protobuf.UInt32Value u32 = 3;
-    google.protobuf.FloatValue f32 = 4;
-    google.protobuf.BoolValue bool = 5;
+    string string = 1;
+    int32 i32 = 2;
+    uint32 u32 = 3;
+    float f32 = 4;
+    bool bool = 5;
     google.protobuf.Timestamp date_time = 6;
-    google.protobuf.BytesValue bytes = 7;
+    bytes bytes = 7;
     ArrayValue array = 8;
+    // Homogeneous map: all values share FieldDefinition.nested_type_definition.
     MapValue map = 9;
+    // Heterogeneous record: keys and types given by FieldDefinition.object_fields.
+    MapValue object = 10;
+    int64 i64 = 11;
+    uint64 u64 = 12;
+    double f64 = 13;
   }
 }
 
@@ -51,7 +64,11 @@ message FieldDefinition {
   string key = 1;
   string description = 2;
   FieldType.Enum type = 3;
+  // Element type for ARRAY, value type for MAP.
   FieldDefinition nested_type_definition = 4;
+  // Field number 5 was skipped in the original schema; keep it unused.
+  reserved 5;
+  // Fields of an OBJECT.
   repeated FieldDefinition object_fields = 6;
 }
 

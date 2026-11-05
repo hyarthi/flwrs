@@ -1,28 +1,36 @@
 use crate::config;
 use crate::config::main_config;
-use crate::db::migrations::{MigrationDef, Version};
 use crate::db::DbError;
+use crate::db::migrations::{MigrationDef, Version};
 use chrono::{DateTime, Local};
 use rust_embed::Embed;
 use serde::Deserialize;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions};
-use sqlx::{Executor, FromRow, Sqlite, SqlitePool, Type};
+use sqlx::{AssertSqlSafe, Connection, Executor, FromRow, Sqlite, SqlitePool, Type};
 use std::str;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct DbConfig {
-    #[serde(alias = "filename")]
     filename: Option<String>,
 }
 
 impl DbConfig {
+    /// A config for a database file at `filename`, bypassing the main config.
+    pub(crate) fn at(filename: &str) -> Self {
+        Self {
+            filename: Some(filename.to_string()),
+        }
+    }
+
+    /// Reads `[db.<name>]` from the main config. The file defaults to `<name>.db`.
     pub fn read(name: &str) -> Self {
-        let main_config = main_config();
-        config::read_struct(main_config, &["db".to_string(), name.to_string()])
-            .unwrap_or(DbConfig {
-                filename: Some(format!("{}.db", name).to_string())
-            })
+        let config: DbConfig =
+            config::read_struct(main_config(), &["db".to_string(), name.to_string()])
+                .unwrap_or_default();
+        Self {
+            filename: Some(config.filename.unwrap_or_else(|| format!("{name}.db"))),
+        }
     }
 }
 
@@ -38,16 +46,24 @@ impl Database {
     }
 }
 
-pub async fn build_main_db(config: DbConfig) -> Result<Database, DbError> {
+pub async fn build_db(name: &str, config: DbConfig) -> Result<Database, DbError> {
+    let filename = config.filename.unwrap_or_else(|| format!("{name}.db"));
+    // SQLite creates the file but not its folder (e.g. `.data/main.db` on a fresh checkout).
+    if let Some(parent) = std::path::Path::new(&filename).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(DbError::CreateDir)?;
+    }
     let db = SqlitePool::connect_with(
         SqliteConnectOptions::new()
-            .filename(config.filename.unwrap())
+            .filename(filename)
             .create_if_missing(true)
-            .auto_vacuum(SqliteAutoVacuum::Incremental)
-    ).await?;
+            .auto_vacuum(SqliteAutoVacuum::Incremental),
+    )
+    .await?;
 
     Ok(Database {
-        id: "main".to_string(),
+        id: name.to_string(),
         delegate: db,
     })
 }
@@ -56,7 +72,7 @@ pub async fn build_main_db(config: DbConfig) -> Result<Database, DbError> {
 #[folder = "resources/migrations/sqlite/"]
 struct MigrationDefs;
 
-#[derive(Type, Eq, PartialEq)]
+#[derive(Type, Eq, PartialEq, Debug)]
 #[repr(u32)]
 enum MigrationState {
     None = 0,
@@ -66,7 +82,9 @@ enum MigrationState {
     Rollback = 4,
 }
 
+/// Row of the `migrations` tracking table.
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)] // full row mapping; not every column is read yet
 struct Migration {
     id: u32,
     version_major: u32,
@@ -80,8 +98,15 @@ struct Migration {
     state: MigrationState,
 }
 
+/// Applies versioned migrations and records them in the `migrations` table.
+///
+/// Each migration runs in its own transaction, so a failed migration leaves no
+/// partial changes. If an upgrade fails, the migrations already applied in that
+/// run are rolled back with their `down` scripts.
 pub(crate) struct Migrator {
+    /// Sorted ascending by version.
     up_migrations: Vec<MigrationDef>,
+    /// Sorted descending by version.
     down_migrations: Vec<MigrationDef>,
     max_version: Version,
 }
@@ -89,68 +114,44 @@ pub(crate) struct Migrator {
 impl Migrator {
     pub(crate) async fn new(
         db: &Database,
-        up: Vec<MigrationDef>,
-        down: Vec<MigrationDef>,
+        mut up_migrations: Vec<MigrationDef>,
+        mut down_migrations: Vec<MigrationDef>,
     ) -> Result<Self, DbError> {
-        log::debug!("Creating new database migrator for [{database}].", database = db.id.clone());
+        let database = &db.id;
+        log::debug!("Creating new database migrator for [{database}].");
 
-        log::trace!("Migrator [{database}]: getting migrator base DB structure file.", database = db.id.clone());
-        let migrations_file = match MigrationDefs::get("migrator.sql") {
-            Some(f) => f,
-            None => return Err(DbError::MigratorNoFile),
-        };
-        log::trace!("Migrator [{database}]: establishing base migrator tables.", database = db.id.clone());
-        db.get_connection().await?.execute(sqlx::raw_sql(str::from_utf8(migrations_file.data.as_ref())?)).await?;
+        let migrations_file = MigrationDefs::get("migrator.sql").ok_or(DbError::MigratorNoFile)?;
+        log::trace!("Migrator [{database}]: establishing base migrator tables.");
+        db.get_connection()
+            .await?
+            // Embedded at compile time, so trusted.
+            .execute(sqlx::raw_sql(AssertSqlSafe(
+                str::from_utf8(migrations_file.data.as_ref())?.to_string(),
+            )))
+            .await?;
 
-        log::trace!("Migrator [{database}]: pre-sorting migrations.", database = db.id.clone());
-        let mut up_migrations = up.clone();
-        up_migrations.sort_by(|one, two| {
-            if one.version_major != two.version_major {
-                one.version_major.cmp(&two.version_major)
-            } else if one.version_minor != two.version_minor {
-                one.version_minor.cmp(&two.version_minor)
-            } else if one.version_patch != two.version_patch {
-                one.version_patch.cmp(&two.version_patch)
-            } else {
-                one.build_number.cmp(&two.build_number)
+        up_migrations.sort_by_key(MigrationDef::version);
+        down_migrations.sort_by_key(|m| std::cmp::Reverse(m.version()));
+        if log::log_enabled!(log::Level::Trace) {
+            for migration in &up_migrations {
+                log::trace!(
+                    "Migrator [{database}]: UP migration found {}",
+                    migration.version()
+                );
             }
-        });
-        log::trace!("Migrator [{database}]: sorted list of UP migrations:", database = db.id.clone());
-        // TODO make this loop optional based on log level
-        up_migrations.iter().for_each(|migration| {
-            log::trace!(
-                "Migrator [{database}]: schema version found {migration_version}", 
-                database = db.id.clone(), 
-                migration_version = migration.version()
-            );
-        });
-        let mut down_migrations = down.clone();
-        down_migrations.sort_by(|one, two| {
-            if one.version_major != two.version_major {
-                two.version_major.cmp(&one.version_major)
-            } else if one.version_minor != two.version_minor {
-                two.version_minor.cmp(&one.version_minor)
-            } else if one.version_patch != two.version_patch {
-                two.version_patch.cmp(&one.version_patch)
-            } else {
-                two.build_number.cmp(&one.build_number)
+            for migration in &down_migrations {
+                log::trace!(
+                    "Migrator [{database}]: DOWN migration found {}",
+                    migration.version()
+                );
             }
-        });
-        log::trace!("Migrator [{database}]: sorted list of DOWN migrations:", database = db.id.clone());
-        // TODO make this loop optional based on log level
-        down_migrations.iter().for_each(|migration| {
-            log::trace!(
-                "Migrator [{database}]: schema version found {migration_version}", 
-                database = db.id.clone(), 
-                migration_version = migration.version()
-            );
-        });
+        }
 
-        log::debug!("Migrator for database [{database}] created.", database = db.id.clone());
         let max_version = up_migrations
             .last()
-            .map(|migration| { migration.version() })
-            .unwrap_or(Version::new(0, 0, 0, 0));
+            .map(MigrationDef::version)
+            .unwrap_or_default();
+        log::debug!("Migrator for database [{database}] created.");
 
         Ok(Self {
             up_migrations,
@@ -159,265 +160,187 @@ impl Migrator {
         })
     }
 
-    pub(crate) async fn migrate_up(&self, db: &Database, target_version: Option<Version>) -> Result<(), DbError> {
-        log::debug!("Migrator [{database}]: migrating UP.", database = db.id.clone());
+    /// Highest version whose migration completed successfully, or `0.0.0-0`.
+    async fn current_version(&self, db: &Database) -> Result<Version, DbError> {
         let mut conn = db.get_connection().await?;
+        let row = conn
+            .fetch_optional(
+                sqlx::query_as::<_, Migration>(
+                    "SELECT * FROM migrations \
+                     WHERE state = $1 \
+                     ORDER BY version_major DESC, version_minor DESC, version_patch DESC, build_number DESC \
+                     LIMIT 1",
+                )
+                .bind(MigrationState::Done),
+            )
+            .await?;
+        Ok(match row {
+            Some(row) => Version::from(&Migration::from_row(&row)?),
+            None => Version::default(),
+        })
+    }
 
-        // We don't need worry about locking the DB just yet, 
-        // because initially only one process will work with
-        // one SQLite DB.
+    /// Migrates up to `target_version` (default: the latest available).
+    pub(crate) async fn migrate_up(
+        &self,
+        db: &Database,
+        target_version: Option<Version>,
+    ) -> Result<(), DbError> {
+        let database = &db.id;
+        let target = target_version.unwrap_or(self.max_version);
+        log::debug!("Migrator [{database}]: migrating UP to [{target}].");
 
-        log::trace!("Migrator [{database}]: grabbing current DB schema version.", database = db.id.clone());
-        let current_level = match conn.fetch_optional(
-            sqlx::query_as::<_, Migration>(
-                "SELECT * FROM migrations \
-                    WHERE state = $1 \
-                    ORDER BY version_major DESC, version_minor DESC, version_patch DESC, build_number DESC \
-                    LIMIT 1"
-            ).bind(MigrationState::Done)
-        )
-            .await? {
-            Some(row) => Migration::from_row(&row)?,
-            None => Migration {
-                id: 0,
-                file_name: "".to_string(),
-                file_hash: "".to_string(),
-                version_major: 0,
-                version_minor: 0,
-                version_patch: 0,
-                build_number: 0,
-                start_time: DateTime::default(),
-                finish_time: None,
-                state: MigrationState::None,
-            }
-        };
-        let base_version = Version::from(&current_level);
-        log::trace!(
-            "Migrator [{database}]: current schema version: [{version}]", 
-            database = db.id.clone(),
-            version = base_version.clone(),
-        );
+        // No locking needed yet: one process owns one SQLite DB.
+        let base_version = self.current_version(db).await?;
+        log::trace!("Migrator [{database}]: current schema version: [{base_version}]");
 
-        let migrations: Vec<MigrationDef> = self.up_migrations
+        let pending: Vec<&MigrationDef> = self
+            .up_migrations
             .iter()
-            .filter(|&migration| { Version::from(migration).is_after(&base_version) })
-            .filter(|&migration| {
-                let version = Version::from(migration);
-                version.is_before(&target_version.unwrap_or(self.max_version)) || version == target_version.unwrap_or(self.max_version)
-            })
-            .map(|migration| { migration.clone() })
+            .filter(|m| m.version() > base_version && m.version() <= target)
             .collect();
-
-        if migrations.is_empty() {
-            log::debug!("Migrator [{database}]: DB schema is up to date.", database = db.id.clone());
+        if pending.is_empty() {
+            log::debug!("Migrator [{database}]: DB schema is up to date.");
             return Ok(());
         }
 
-        for migration in migrations.iter() {
-            log::trace!(
-                "Migrator [{database}]: migrating UP to [{version}].",
-                database = db.id.clone(),
-                version = migration.version()
-            );
-            match self.run_migration(db, migration, MigrationState::Done).await {
-                Ok(_) => {
-                    log::trace!(
-                        "Migrator [{database}]: migration UP to [{version}]: success.",
-                        database = db.id.clone(),
-                        version = migration.version()
-                    );
+        for migration in pending {
+            let version = migration.version();
+            log::trace!("Migrator [{database}]: migrating UP to [{version}].");
+            if let Err(e) = self
+                .run_migration(db, migration, MigrationState::Done)
+                .await
+            {
+                log::error!("Migrator [{database}]: failed to migrate to version [{version}]: {e}");
+                log::warn!(
+                    "Migrator [{database}]: rolling back to initial version: [{base_version}]."
+                );
+                if let Err(rollback_err) = self.migrate_down(db, base_version).await {
+                    log::error!("Migrator [{database}]: rollback failed: {rollback_err}");
                 }
-                Err(e) => {
-                    log::error!(
-                        "Migrator [{database}]: failed to migrate database [{database}] to version [{version}]: {e}",
-                        database = db.id.clone(), 
-                        version = target_version.unwrap_or(self.max_version)
-                    );
-                    log::warn!(
-                        "Migrator [{database}]: rolling back to initial version: [{version}].",
-                        database = db.id.clone(),
-                        version = base_version.clone(),
-                    );
-                    self.migrate_down(db, base_version.clone()).await?
-                }
+                return Err(e);
             }
+            log::trace!("Migrator [{database}]: migration UP to [{version}]: success.");
         }
 
         Ok(())
     }
 
+    /// Rolls back completed migrations newer than `target_version`, newest first.
+    pub(crate) async fn migrate_down(
+        &self,
+        db: &Database,
+        target_version: Version,
+    ) -> Result<(), DbError> {
+        let database = &db.id;
+        log::debug!("Migrator [{database}]: migrating DOWN to [{target_version}].");
+
+        let current = self.current_version(db).await?;
+        log::trace!("Migrator [{database}]: current schema version: [{current}]");
+
+        let pending: Vec<&MigrationDef> = self
+            .down_migrations
+            .iter()
+            .filter(|m| m.version() > target_version && m.version() <= current)
+            .collect();
+        if pending.is_empty() {
+            log::debug!("Migrator [{database}]: nothing to roll back.");
+            return Ok(());
+        }
+
+        for migration in pending {
+            let version = migration.version();
+            log::trace!("Migrator [{database}]: migrating DOWN from [{version}].");
+            if let Err(e) = self
+                .run_migration(db, migration, MigrationState::Rollback)
+                .await
+            {
+                log::error!(
+                    "Migrator [{database}]: failed to roll back version [{version}]: {e}. \
+                     Cancelling rollback; the database stays at [{version}]."
+                );
+                return Err(e);
+            }
+            log::trace!("Migrator [{database}]: migration DOWN from [{version}]: success.");
+        }
+
+        Ok(())
+    }
+
+    /// Runs one script in a transaction and records the outcome.
     async fn run_migration(
         &self,
         db: &Database,
         migration_def: &MigrationDef,
         new_state: MigrationState,
     ) -> Result<(), DbError> {
-        let action = match new_state {
-            MigrationState::Done => "migrating",
-            MigrationState::Rollback => "rolling back",
-            _ => "<undefined operation>"
-        };
-
-        log::trace!(
-            "Migrator [{database}]: {action} to [{version}]: grabbing connection.",
-            database = db.id.clone(),
-            version = migration_def.version(),
-        );
+        let database = &db.id;
+        let version = migration_def.version();
         let mut conn = db.get_connection().await?;
 
-        log::trace!(
-            "Migrator [{database}]: {action} to [{version}]: initialising migration.",
-            database = db.id.clone(),
-            version = migration_def.version(),
-        );
-        let row = conn.fetch_one(
-            sqlx::query::<Sqlite>("INSERT INTO migrations (\
-            version_major, \
-            version_minor, \
-            version_patch, \
-            build_number, \
-            file_name, \
-            file_hash, \
-            start_time, \
-            state) \
-        VALUES ( $1, $2, $3, $4, $5, $6, $7, $8 ) \
-        ON CONFLICT (version_major, version_minor, version_patch, build_number) \
-        DO UPDATE \
-        SET file_name = $5, file_hash = $6, start_time = $7, state = $8 \
-        RETURNING *")
-                .bind(migration_def.version_major)
-                .bind(migration_def.version_minor)
-                .bind(migration_def.version_patch)
-                .bind(migration_def.build_number)
+        log::trace!("Migrator [{database}]: [{version}]: recording start.");
+        let row = conn
+            .fetch_one(
+                sqlx::query::<Sqlite>(
+                    "INSERT INTO migrations (\
+                        version_major, version_minor, version_patch, build_number, \
+                        file_name, file_hash, start_time, state) \
+                     VALUES ( $1, $2, $3, $4, $5, $6, $7, $8 ) \
+                     ON CONFLICT (version_major, version_minor, version_patch, build_number) \
+                     DO UPDATE SET file_name = $5, file_hash = $6, start_time = $7, finish_time = NULL, state = $8 \
+                     RETURNING *",
+                )
+                .bind(version.major)
+                .bind(version.minor)
+                .bind(version.patch)
+                .bind(version.build_number)
                 .bind(migration_def.file_name.clone())
                 .bind(migration_def.file_hash.clone())
                 .bind(Local::now())
-                .bind(MigrationState::Started)
-        ).await?;
-
+                .bind(MigrationState::Started),
+            )
+            .await?;
         let migration = Migration::from_row(&row)?;
-        log::trace!(
-            "Migrator [{database}]: {action} to [{version}]: running migration.",
-            database = db.id.clone(),
-            version = migration_def.version(),
-        );
-        match conn.execute(sqlx::raw_sql(str::from_utf8(migration_def.file.data.as_ref())?)).await {
-            Ok(_) => (),
-            Err(e) => {
-                conn.execute(
-                    sqlx::query::<Sqlite>("UPDATE migrations \
-                    SET state = $1, finish_time = $2 \
-                    WHERE id = $3")
-                        .bind(MigrationState::Error)
-                        .bind(Local::now())
-                        .bind(migration.id)
-                ).await?;
+        let script = str::from_utf8(migration_def.data.as_ref())?;
 
-                return Err(DbError::from(e));
-            }
-        }
-
-        log::trace!(
-            "Migrator [{database}]: {action} to [{version}]: updating migration metadata.",
-            database = db.id.clone(),
-            version = migration_def.version(),
-        );
-        conn.execute(
-            sqlx::query::<Sqlite>("UPDATE migrations \
-            SET state = $1, finish_time = $2 \
-            WHERE id = $3")
+        log::trace!("Migrator [{database}]: [{version}]: running script.");
+        let mut tx = conn.begin().await?;
+        let applied = async {
+            // Migration scripts are embedded in the binary, so they're trusted.
+            tx.execute(sqlx::raw_sql(AssertSqlSafe(script.to_string())))
+                .await?;
+            tx.execute(
+                sqlx::query::<Sqlite>(
+                    "UPDATE migrations SET state = $1, finish_time = $2 WHERE id = $3",
+                )
                 .bind(new_state)
                 .bind(Local::now())
-                .bind(migration.id)
-        ).await?;
-
-        Ok(())
-    }
-
-    pub(crate) async fn migrate_down(&self, db: &Database, target_version: Version) -> Result<(), DbError> {
-        log::debug!("Migrator [{database}]: migrating DOWN.", database = db.id.clone());
-        let mut conn = db.get_connection().await?;
-
-        log::trace!("Migrator [{database}]: grabbing current DB schema version.", database = db.id.clone());
-        let current_level = match conn.fetch_optional(
-            sqlx::query_as::<_, Migration>(
-                "SELECT * FROM migrations \
-                    WHERE state IN ($1, $2, $3) \
-                    ORDER BY version_major ASC, version_minor ASC, version_patch ASC, build_number ASC \
-                    LIMIT 1"
-            ).bind(MigrationState::Started)
-                .bind(MigrationState::Done)
-                .bind(MigrationState::Error)
-        )
-            .await? {
-            Some(row) => Migration::from_row(&row)?,
-            None => Migration {
-                id: 0,
-                file_name: "".to_string(),
-                file_hash: "".to_string(),
-                version_major: 0,
-                version_minor: 0,
-                version_patch: 0,
-                build_number: 0,
-                start_time: DateTime::default(),
-                finish_time: None,
-                state: MigrationState::None,
-            }
-        };
-        let base_version = Version::from(&current_level);
-        log::trace!(
-            "Migrator [{database}]: current schema version: [{version}]", 
-            database = db.id.clone(),
-            version = base_version.clone(),
-        );
-
-        // grab migration files
-        let migrations: Vec<MigrationDef> = self.down_migrations
-            .iter()
-            .filter(|&migration| {
-                Version::from(migration).is_before(&base_version) || current_level.state == MigrationState::Error
-            })
-            .filter(|&migration| {
-                let version = Version::from(migration);
-                version.is_after(&target_version)
-            })
-            .map(|migration| { migration.clone() })
-            .collect();
-
-        if migrations.is_empty() {
-            log::debug!("Migrator [{database}]: DB schema is up to date.", database = db.id.clone());
-            return Ok(());
+                .bind(migration.id),
+            )
+            .await?;
+            Ok::<_, sqlx::Error>(())
         }
+        .await;
 
-        for migration in migrations.iter() {
-            log::trace!(
-                "Migrator [{database}]: migrating DOWN to [{version}].",
-                database = db.id.clone(),
-                version = migration.version()
-            );
-            match self.run_migration(db, migration, MigrationState::Rollback).await {
-                Ok(_) => {
-                    log::trace!(
-                        "Migrator [{database}]: migration DOWN to [{version}]: success.",
-                        database = db.id.clone(),
-                        version = migration.version()
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "Migrator [{database}]: failed to roll back database [{database}] to version [{version}]: {e}",
-                        database = db.id.clone(), 
-                        version = target_version.clone()
-                    );
-                    log::warn!(
-                        "Migrator [{database}]: Cancelling rollback. This may leave database in inconsistent state.", 
-                        database = db.id.clone()
+        match applied {
+            Ok(()) => {
+                tx.commit().await?;
+                Ok(())
+            }
+            Err(e) => {
+                tx.rollback().await?;
+                conn.execute(
+                    sqlx::query::<Sqlite>(
+                        "UPDATE migrations SET state = $1, finish_time = $2 WHERE id = $3",
                     )
-                }
+                    .bind(MigrationState::Error)
+                    .bind(Local::now())
+                    .bind(migration.id),
+                )
+                .await?;
+                Err(DbError::from(e))
             }
         }
-
-        Ok(())
     }
 }
 
@@ -429,5 +352,162 @@ impl From<&Migration> for Version {
             patch: value.version_patch,
             build_number: value.build_number,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn def(name: &str, sql: &'static str) -> MigrationDef {
+        MigrationDef::from_bytes(name.to_string(), sql.as_bytes()).unwrap()
+    }
+
+    async fn temp_db(dir: &tempfile::TempDir) -> Database {
+        let path = dir.path().join("test.db");
+        build_db(
+            "test",
+            DbConfig {
+                filename: Some(path.to_string_lossy().into_owned()),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn tables(db: &Database) -> Vec<String> {
+        let mut conn = db.get_connection().await.unwrap();
+        sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master WHERE type = 'table' \
+             AND name NOT IN ('migrations', 'sqlite_sequence') ORDER BY name",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+    }
+
+    fn ups() -> Vec<MigrationDef> {
+        // Deliberately unsorted, and 0.10 vs 0.9 exercises version ordering:
+        // b is created from a, so it fails if run first.
+        vec![
+            def("0.10.0-1.up.sql", "CREATE TABLE b AS SELECT * FROM a;"),
+            def("0.9.0-1.up.sql", "CREATE TABLE a (id INTEGER);"),
+        ]
+    }
+
+    fn downs() -> Vec<MigrationDef> {
+        vec![
+            def("0.9.0-1.down.sql", "DROP TABLE a;"),
+            def("0.10.0-1.down.sql", "DROP TABLE b;"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn creates_missing_parent_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/deeper/test.db");
+        build_db(
+            "test",
+            DbConfig {
+                filename: Some(path.to_string_lossy().into_owned()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn migrates_up_in_version_order_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir).await;
+        let migrator = Migrator::new(&db, ups(), downs()).await.unwrap();
+        migrator.migrate_up(&db, None).await.unwrap();
+        assert_eq!(tables(&db).await, vec!["a", "b"]);
+        assert_eq!(
+            migrator.current_version(&db).await.unwrap(),
+            Version::new(0, 10, 0, 1)
+        );
+
+        // running again is a no-op
+        migrator.migrate_up(&db, None).await.unwrap();
+        assert_eq!(tables(&db).await, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn migrates_up_to_target_then_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir).await;
+        let migrator = Migrator::new(&db, ups(), downs()).await.unwrap();
+
+        migrator
+            .migrate_up(&db, Some(Version::new(0, 9, 0, 1)))
+            .await
+            .unwrap();
+        assert_eq!(tables(&db).await, vec!["a"]);
+
+        migrator.migrate_up(&db, None).await.unwrap();
+        assert_eq!(tables(&db).await, vec!["a", "b"]);
+
+        migrator
+            .migrate_down(&db, Version::new(0, 9, 0, 1))
+            .await
+            .unwrap();
+        assert_eq!(tables(&db).await, vec!["a"]);
+        assert_eq!(
+            migrator.current_version(&db).await.unwrap(),
+            Version::new(0, 9, 0, 1)
+        );
+
+        migrator
+            .migrate_down(&db, Version::default())
+            .await
+            .unwrap();
+        assert!(tables(&db).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_migration_rolls_back_the_whole_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir).await;
+        let mut up = ups();
+        up.push(def(
+            "1.0.0-1.up.sql",
+            "CREATE TABLE c (id INTEGER); THIS IS NOT SQL;",
+        ));
+        let mut down = downs();
+        down.push(def("1.0.0-1.down.sql", "DROP TABLE c;"));
+
+        let migrator = Migrator::new(&db, up, down).await.unwrap();
+        assert!(migrator.migrate_up(&db, None).await.is_err());
+        // c never committed (transaction); a and b were rolled back by their downs
+        assert!(tables(&db).await.is_empty());
+        assert_eq!(
+            migrator.current_version(&db).await.unwrap(),
+            Version::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_migration_keeps_earlier_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = temp_db(&dir).await;
+        Migrator::new(&db, ups(), downs())
+            .await
+            .unwrap()
+            .migrate_up(&db, None)
+            .await
+            .unwrap();
+
+        let mut up = ups();
+        up.push(def("1.0.0-1.up.sql", "NOT SQL;"));
+        let migrator = Migrator::new(&db, up, downs()).await.unwrap();
+        assert!(migrator.migrate_up(&db, None).await.is_err());
+        // only this run is rolled back; the schema from the earlier run stays
+        assert_eq!(tables(&db).await, vec!["a", "b"]);
+        assert_eq!(
+            migrator.current_version(&db).await.unwrap(),
+            Version::new(0, 10, 0, 1)
+        );
     }
 }

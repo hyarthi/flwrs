@@ -1,14 +1,15 @@
 use crate::plugin::core::ConnectionConfig;
 use crate::plugin::error::Error;
 use crate::plugin::logger::PluginLogger;
-use crate::plugin::msg_client::MSG_CLIENT;
-use crate::schema::common::log_level::Enum as LogLevel;
-use crate::schema::sink::sink_message::Payload;
+use crate::plugin::msg_client::{HubClient, Session, Stage};
+use crate::plugin::runtime::{Backoff, SessionEnd, accept, error_event, finish, open_session};
+use crate::schema::common::{log_level::Enum as LogLevel, plugin_type::Enum as PluginType};
 use crate::schema::sink::{
-    runtime_sink_message::Payload as RuntimeSinkMessagePayload, RuntimeSinkMessage, SinkMessage,
+    Initialize, RuntimeSinkMessage, SinkMessage, runtime_sink_message::Payload as RuntimePayload,
+    sink_message::Payload,
 };
 use crate::sink::plugin::Sink;
-use prost::Message;
+use std::sync::Arc;
 
 pub struct SinkRunnerConfig {
     pub plugin_id: String,
@@ -16,125 +17,107 @@ pub struct SinkRunnerConfig {
     pub hub_connection: ConnectionConfig,
 }
 
-pub struct SinkRunner<T>
-where
-    T: Sink,
-{
+pub struct SinkRunner<T: Sink> {
     plugin: T,
     plugin_id: String,
     log_level: LogLevel,
+    connection: ConnectionConfig,
+    client: Arc<HubClient>,
 }
 
-impl<T> SinkRunner<T>
-where
-    T: Sink,
-{
-    #[allow(dead_code)]
+impl<T: Sink> SinkRunner<T> {
+    /// Installs the plugin logger. Connecting happens in [`SinkRunner::run`].
     pub async fn initialize(plugin: T, config: SinkRunnerConfig) -> Result<Self, Error> {
-        MSG_CLIENT
-            .write()
-            .await
-            .connect(
-                format!(
-                    "{}:{}",
-                    config.hub_connection.host, config.hub_connection.port
-                )
-                .as_str(),
-            )
-            .await?;
-        PluginLogger::initialize(config.plugin_id.as_str(), config.log_level.into())?;
-        Ok(Self::new(config.plugin_id, plugin, config.log_level))
-    }
-
-    pub(crate) fn new(id: String, plugin: T, log_level: LogLevel) -> Self {
-        Self {
+        let client = HubClient::new(config.hub_connection.addr());
+        PluginLogger::initialize(
+            &config.plugin_id,
+            PluginType::Sink,
+            config.log_level.into(),
+            client.clone(),
+        )?;
+        Ok(Self {
             plugin,
-            plugin_id: id,
-            log_level,
-        }
+            plugin_id: config.plugin_id,
+            log_level: config.log_level,
+            connection: config.hub_connection,
+            client,
+        })
     }
 
-    #[allow(dead_code)]
+    /// Connects to the hub, sends `Initialize` and handles events until the
+    /// hub sends `Shutdown`. If the connection is lost, it reconnects with
+    /// backoff and re-sends the same `Initialize`.
+    ///
+    /// Returns [`Error::Rejected`] if the hub answers `Initialize` with
+    /// `Shutdown` (unknown instance id or wrong token).
     pub async fn run(&mut self) -> Result<(), Error> {
-        // send hello to runtime
-        let payload = match self
+        let mut init: Initialize = self
             .plugin
             .initialize(self.plugin_id.clone(), self.log_level)
-        {
-            Ok(result) => result,
-            Err(err) => {
-                log::error!("Error initializing plugin: {}", err);
-                return Err(Error::InitError(err));
-            }
-        };
-        let hello_msg = SinkMessage {
-            payload: Some(Payload::Initialize(payload.into())),
+            .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?
+            .into();
+        init.token = self.connection.resolved_token();
+        let init = SinkMessage {
+            payload: Some(Payload::Initialize(init)),
         };
 
-        match MSG_CLIENT
-            .read()
-            .await
-            .send(hello_msg.encode_to_vec().as_slice())
-            .await
-        {
-            Ok(_) => {}
-            Err(err) => {
-                log::error!("Error sending hello message: {}", err);
-                return Err(Error::IOError(err));
+        let mut backoff = Backoff::new(self.connection.reconnect);
+        let end = loop {
+            let mut session = open_session(&self.client, &init, &mut backoff).await;
+            match self.serve(&mut session, &mut backoff).await {
+                SessionEnd::Disconnected => {
+                    self.client.disconnect(Some(session.id)).await;
+                    log::warn!("Lost the connection to the hub; reconnecting");
+                }
+                end => break end,
             }
         };
 
+        let shutdown = self.plugin.shutdown();
+        finish(&self.client, &self.plugin_id, end, shutdown, |exit| {
+            SinkMessage {
+                payload: Some(Payload::Exit(exit)),
+            }
+        })
+        .await
+    }
+
+    async fn serve(
+        &mut self,
+        session: &mut Session<RuntimeSinkMessage>,
+        backoff: &mut Backoff,
+    ) -> SessionEnd {
         loop {
-            let bytes = match MSG_CLIENT.read().await.receive().await {
-                Ok(bytes) => match bytes {
-                    None => {
-                        continue;
+            let Some(msg) = session.next().await else {
+                return SessionEnd::Disconnected;
+            };
+            let Some(payload) = msg.payload else {
+                log::error!("Message payload is missing");
+                continue;
+            };
+            match payload {
+                RuntimePayload::Initialize(_) => accept(&self.client, session, backoff).await,
+                RuntimePayload::Event(event) => {
+                    log::debug!("Received event for: {}", event.plugin_id);
+                    if let Err(err) = self.plugin.consume_event(event) {
+                        log::error!("Error processing event: {err}");
+                        let msg = SinkMessage {
+                            payload: Some(Payload::Error(error_event(
+                                &self.plugin_id,
+                                PluginType::Sink,
+                                err.to_string(),
+                            ))),
+                        };
+                        if self.client.send(&msg, Stage::Initializing).await.is_err() {
+                            return SessionEnd::Disconnected;
+                        }
                     }
-                    Some(bytes) => bytes,
-                },
-                Err(err) => {
-                    log::error!("Error receiving message: {}", err);
-                    continue;
                 }
-            };
-            let msg = match RuntimeSinkMessage::decode(bytes) {
-                Ok(message) => message,
-                Err(err) => {
-                    log::error!("Error parsing message: {}", err);
-                    continue;
-                }
-            };
-            let pyld = match msg.payload {
-                Some(payload) => payload,
-                None => {
-                    log::error!("Message payload is missing");
-                    continue;
-                }
-            };
-
-            match pyld {
-                RuntimeSinkMessagePayload::Initialize(_) => {
-                    // noop for sink
-                    continue;
-                }
-                RuntimeSinkMessagePayload::Event(payload) => {
-                    log::debug!("Received event: {:?}", payload.plugin_id.clone());
-                    let result = self.plugin.consume_event(payload);
-                    if let Err(err) = result {
-                        log::error!("Error processing event: {}", err);
-                        continue;
-                    }
-                    continue;
-                }
-                RuntimeSinkMessagePayload::Shutdown(_) => {
+                RuntimePayload::Shutdown(_) => {
                     log::debug!("Received shutdown message");
-                    let result = self.plugin.shutdown();
-                    if let Err(err) = result {
-                        log::error!("Error shutting down: {}", err);
-                        break Err(Error::ShutdownError(err));
-                    }
-                    log::info!("Plugin shutdown: {}", self.plugin_id);
-                    break Ok(());
+                    return SessionEnd::Shutdown {
+                        accepted: session.accepted,
+                    };
                 }
             }
         }

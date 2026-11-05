@@ -1,0 +1,16 @@
+{
+  "fields": [
+    { "key": "url", "description": "HTTP URL", "type": "STRING" },
+    { "key": "method", "description": "HTTP method", "type": "STRING" },
+    {
+      "key": "headers",
+      "description": "HTTP headers",
+      "type": "MAP",
+      "nested_type_definition": {
+        "type": "ARRAY",
+        "nested_type_definition": { "type": "STRING" }
+      }
+    },
+    { "key": "body", "description": "HTTP body", "type": "BYTES" }
+  ]
+}

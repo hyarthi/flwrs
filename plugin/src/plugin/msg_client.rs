@@ -1,141 +1,209 @@
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use bytes::Bytes;
-use lazy_static::lazy_static;
+//! Reconnectable connection from a plugin to the hub.
+//!
+//! The writer half is shared (runner, `LocalSink`, logger); the reader half
+//! belongs to the runner's current session. Every connection goes through
+//! three stages, and each kind of message needs a minimum stage:
+//!
+//! - `Down`: no connection, or one on which `Initialize` hasn't been sent.
+//!   Nothing else may be sent (`Initialize` must be the first frame).
+//! - `Initializing`: `Initialize` sent. System messages (logs, errors, `Exit`)
+//!   may be sent.
+//! - `Ready`: the hub answered with `InitializeResponse`. Data events may be
+//!   sent.
+//!
+//! Sends below their required stage fail fast with `NotConnected`.
+
+use crate::plugin::frame::{FrameError, WireMessage, read_frame, write_message};
 use std::io;
-use std::io::Cursor;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{Mutex, mpsc, watch};
+use tokio::task::JoinHandle;
 
-lazy_static! {
-    pub(crate) static ref MSG_CLIENT: Arc<RwLock<MessagingClient>> =
-        Arc::new(RwLock::new(MessagingClient::default()));
-    pub(crate) static ref PROTOCOL_VERSION: Bytes = Bytes::from("1.0.0");
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Stage {
+    Down,
+    Initializing,
+    Ready,
 }
 
-pub(crate) struct MessagingClient {
-    socket_in: Option<Mutex<ReadHalf<TcpStream>>>,
-    socket_out: Option<Mutex<WriteHalf<TcpStream>>>,
+struct Conn {
+    id: u64,
+    writer: OwnedWriteHalf,
 }
 
-impl MessagingClient {
-    pub(crate) fn new(socket: Option<TcpStream>) -> Self {
-        let (socket_in, socket_out) = match socket {
-            Some(socket) => {
-                let (socket_in, socket_out) = tokio::io::split(socket);
-                (Some(Mutex::new(socket_in)), Some(Mutex::new(socket_out)))
+pub(crate) struct HubClient {
+    addr: String,
+    // Stage changes happen only while this lock is held, so a send that
+    // checks the stage under the lock can't write to a newer connection
+    // before its `Initialize`.
+    conn: Mutex<Option<Conn>>,
+    stage: watch::Sender<Stage>,
+    next_id: AtomicU64,
+}
+
+impl HubClient {
+    pub(crate) fn new(addr: String) -> Arc<Self> {
+        Arc::new(Self {
+            addr,
+            conn: Mutex::new(None),
+            stage: watch::Sender::new(Stage::Down),
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    pub(crate) fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    pub(crate) fn stage(&self) -> Stage {
+        *self.stage.borrow()
+    }
+
+    /// Opens a new connection (replacing any old one). Its stage is `Down`
+    /// until [`HubClient::send_initialize`] succeeds.
+    pub(crate) async fn connect(&self) -> io::Result<(u64, OwnedReadHalf)> {
+        let stream = TcpStream::connect(&self.addr).await?;
+        stream.set_nodelay(true)?;
+        let (reader, writer) = stream.into_split();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut conn = self.conn.lock().await;
+        *conn = Some(Conn { id, writer });
+        self.stage.send_replace(Stage::Down);
+        Ok((id, reader))
+    }
+
+    /// Sends `Initialize` as the first frame of the current connection.
+    pub(crate) async fn send_initialize<M: WireMessage>(&self, msg: &M) -> io::Result<()> {
+        let mut guard = self.conn.lock().await;
+        let conn = guard.as_mut().ok_or_else(not_connected)?;
+        match write_message(&mut conn.writer, msg).await {
+            Ok(()) => {
+                self.stage.send_replace(Stage::Initializing);
+                Ok(())
             }
-            None => (None, None),
-        };
+            Err(err) => {
+                *guard = None;
+                self.stage.send_replace(Stage::Down);
+                Err(err)
+            }
+        }
+    }
+
+    /// Sends a message if the connection has reached `min`. A failed write
+    /// drops the connection.
+    pub(crate) async fn send<M: WireMessage>(&self, msg: &M, min: Stage) -> io::Result<()> {
+        let mut guard = self.conn.lock().await;
+        if self.stage() < min {
+            return Err(not_connected());
+        }
+        let conn = guard.as_mut().ok_or_else(not_connected)?;
+        let result = write_message(&mut conn.writer, msg).await;
+        if result.is_err() {
+            *guard = None;
+            self.stage.send_replace(Stage::Down);
+        }
+        result
+    }
+
+    /// Marks connection `id` as accepted by the hub.
+    pub(crate) async fn set_ready(&self, id: u64) {
+        let guard = self.conn.lock().await;
+        if guard.as_ref().is_some_and(|c| c.id == id) && self.stage() == Stage::Initializing {
+            self.stage.send_replace(Stage::Ready);
+        }
+    }
+
+    /// Drops connection `id` (or whatever connection is open, for `None`).
+    pub(crate) async fn disconnect(&self, id: Option<u64>) {
+        let mut guard = self.conn.lock().await;
+        if guard.as_ref().is_some_and(|c| id.is_none_or(|id| c.id == id)) {
+            *guard = None;
+            self.stage.send_replace(Stage::Down);
+        }
+    }
+
+    /// Waits until the stage is at least `min`.
+    pub(crate) async fn wait_for(&self, min: Stage) {
+        let mut rx = self.stage.subscribe();
+        let _ = rx.wait_for(|stage| *stage >= min).await;
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Stage> {
+        self.stage.subscribe()
+    }
+}
+
+fn not_connected() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "not connected to the hub")
+}
+
+/// One connection's receiving side. Messages are read on their own task, so
+/// waiting for the next one is cancel-safe (a half-read frame is never lost).
+/// Dropping the session stops the reader.
+pub(crate) struct Session<M> {
+    pub(crate) id: u64,
+    rx: mpsc::Receiver<M>,
+    stage: watch::Receiver<Stage>,
+    reader: JoinHandle<()>,
+    pub(crate) accepted: bool,
+}
+
+impl<M: WireMessage + Send + 'static> Session<M> {
+    pub(crate) fn new(client: &HubClient, id: u64, reader: OwnedReadHalf) -> Self {
+        let (tx, rx) = mpsc::channel(16);
         Self {
-            socket_in,
-            socket_out,
+            id,
+            rx,
+            stage: client.subscribe(),
+            reader: tokio::spawn(read_messages(reader, tx)),
+            accepted: false,
         }
     }
 
-    pub(crate) async fn send(&self, msg: &[u8]) -> io::Result<()> {
-        match &self.socket_out {
-            None => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "MessagingClient not connected",
-            )),
-            Some(socket) => {
-                let mut header = vec![];
-                WriteBytesExt::write_u32::<LittleEndian>(
-                    &mut header,
-                    PROTOCOL_VERSION.len() as u32,
-                )?;
-                std::io::Write::write(&mut header, &PROTOCOL_VERSION)?;
-
-                let total_len = header.len() + msg.len();
-
-                let mut packet_len = vec![];
-                WriteBytesExt::write_u32::<LittleEndian>(&mut packet_len, total_len as u32)?;
-
-                let packet = [&packet_len, &header, msg].concat();
-
-                let mut sock = socket.lock().await;
-                match sock.write(packet.as_slice()).await {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e),
-                }
-            }
+    /// The next message from the hub, or `None` once the connection is gone
+    /// (closed by the hub, a read error, a protocol violation, or a failed
+    /// write on our side).
+    pub(crate) async fn next(&mut self) -> Option<M> {
+        tokio::select! {
+            msg = self.rx.recv() => msg,
+            _ = self.stage.wait_for(|stage| *stage == Stage::Down) => None,
         }
-    }
-
-    pub(crate) async fn receive(&self) -> io::Result<Option<Bytes>> {
-        match &self.socket_in {
-            None => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "MessagingClient not connected",
-            )),
-            Some(socket) => {
-                let mut sock = socket.lock().await;
-                let mut packet_len_bytes = vec![0u8; 4];
-                let bytes_read = sock.read(&mut packet_len_bytes).await?;
-                if bytes_read < 4 {
-                    return Ok(None);
-                }
-                let mut packet_len_reader = Cursor::new(&packet_len_bytes);
-                let packet_len =
-                    match ReadBytesExt::read_u32::<LittleEndian>(&mut packet_len_reader) {
-                        Ok(len) => Ok(len),
-                        Err(e) => Err(e),
-                    }?;
-
-                let mut buf = vec![0; packet_len as usize];
-                sock.read_exact(&mut buf).await?;
-                let buf_bytes = Bytes::from(buf);
-
-                let mut reader = Cursor::new(&buf_bytes);
-                let header_len = ReadBytesExt::read_u32::<LittleEndian>(&mut reader)?;
-                // will support more protocol versions/headers if necessary in the future
-                let mut header_buf = vec![0u8; header_len as usize];
-                let bytes_read = std::io::Read::read(&mut reader, &mut header_buf)?;
-                if bytes_read < header_len as usize {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Header length mismatch",
-                    ));
-                }
-                let header = Bytes::from(header_buf);
-                if PROTOCOL_VERSION.ne(&header) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Protocol version mismatch",
-                    ));
-                }
-
-                let msg_len = packet_len - header_len - 4;
-                let mut msg_buf = vec![0u8; msg_len as usize];
-                let bytes_read = std::io::Read::read(&mut reader, &mut msg_buf)?;
-                if bytes_read < msg_len as usize {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "Message length mismatch",
-                    ));
-                }
-
-                Ok(Some(Bytes::from(msg_buf)))
-            }
-        }
-    }
-
-    pub(crate) async fn connect(&mut self, addr: &str) -> io::Result<()> {
-        if self.socket_in.is_some() && self.socket_out.is_some() {
-            return Ok(());
-        }
-        let socket = TcpStream::connect(addr).await?;
-        let (socket_in, socket_out) = tokio::io::split(socket);
-        self.socket_in = Some(Mutex::new(socket_in));
-        self.socket_out = Some(Mutex::new(socket_out));
-        Ok(())
     }
 }
 
-impl Default for MessagingClient {
-    fn default() -> Self {
-        Self::new(None)
+impl<M> Drop for Session<M> {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+async fn read_messages<M: WireMessage>(mut reader: OwnedReadHalf, tx: mpsc::Sender<M>) {
+    loop {
+        let frame = match read_frame(&mut reader).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
+                log::warn!("The hub closed the connection");
+                return;
+            }
+            Err(err) => {
+                log::error!("Error reading from the hub: {err}");
+                return;
+            }
+        };
+        match frame.decode::<M>() {
+            Ok(msg) => {
+                if tx.send(msg).await.is_err() {
+                    return;
+                }
+            }
+            Err(err @ FrameError::UnexpectedCode { .. }) => {
+                log::error!("Protocol violation by the hub: {err}; closing the connection");
+                return;
+            }
+            Err(err) => log::error!("Skipping a message from the hub: {err}"),
+        }
     }
 }

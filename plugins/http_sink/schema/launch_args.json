@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HTTP sink launch arguments",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "http_timeout_seconds": {
+      "description": "Total HTTP request timeout, in seconds.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 60
+    },
+    "http_read_timeout_seconds": {
+      "description": "HTTP read timeout, in seconds.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 30
+    },
+    "http_connect_timeout_seconds": {
+      "description": "HTTP connect timeout, in seconds.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 30
+    },
+    "http_verbose_logging": {
+      "description": "Log HTTP connection details.",
+      "type": "boolean",
+      "default": false
+    }
+  }
+}

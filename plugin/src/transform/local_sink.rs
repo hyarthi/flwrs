@@ -1,35 +1,33 @@
 use crate::plugin::error::TransformError;
-use crate::plugin::msg_client::MSG_CLIENT;
-use crate::schema::source::source_message::Payload;
-use crate::schema::source::{SourceEvent, SourceMessage};
-use prost::Message;
+use crate::plugin::msg_client::{HubClient, Stage};
+use crate::schema::transform::{TransformEvent, TransformMessage, transform_message::Payload};
+use std::sync::Arc;
 
+/// Handle a transform can use to emit extra events (beyond the one returned
+/// from `process_event`), e.g. to fan out. Cheap to clone.
+///
+/// Events sent here start a new trace unless you set `metadata` yourself
+/// (for example, a copy of the input event's metadata).
+#[derive(Clone)]
 pub struct LocalSink {
-    _plugin_id: String,
+    client: Arc<HubClient>,
 }
 
 impl LocalSink {
-    pub fn new(plugin_id: String) -> Self {
-        Self { _plugin_id: plugin_id }
+    pub(crate) fn new(client: Arc<HubClient>) -> Self {
+        Self { client }
     }
 
-    pub async fn event(&self, evt: SourceEvent) -> Result<(), TransformError> {
-        let msg = SourceMessage {
+    /// Sends an event. Fails fast while the plugin isn't connected to the hub
+    /// (or the hub hasn't accepted it yet). May wait while the hub applies
+    /// backpressure.
+    pub async fn event(&self, evt: TransformEvent) -> Result<(), TransformError> {
+        let msg = TransformMessage {
             payload: Some(Payload::Event(evt)),
         };
-        match MSG_CLIENT
-            .read()
+        self.client
+            .send(&msg, Stage::Ready)
             .await
-            .send(msg.encode_to_vec().as_slice())
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                log::error!("Error sending message: {}", err);
-                Err(TransformError {
-                    source: Box::new(err),
-                })
-            }
-        }
+            .map_err(TransformError::new)
     }
 }

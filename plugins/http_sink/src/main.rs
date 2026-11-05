@@ -16,32 +16,37 @@ pub(crate) struct Args {
     #[arg(short, long, required = true)]
     id: String,
 
-    /// Hostname/IP of the hub. Can be empty for localhost
-    #[arg(short, long, required = true, default_value = "")]
+    /// Hostname/IP of the hub
+    #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
     /// Port of the hub
-    #[arg(short, long, required = true)]
+    #[arg(short, long)]
     port: u16,
 
-    /// Log level
-    #[arg(short, long, required = true, default_value = "info")]
+    /// Connection token for the hub. Defaults to the FLWRS_TOKEN environment
+    /// variable, which is preferred: command-line arguments are visible in `ps`.
+    #[arg(long)]
+    token: Option<String>,
+
+    /// Log level (trace, debug, info, warn, error)
+    #[arg(short, long, default_value = "info")]
     log_level: String,
 
     /// HTTP client timeout (seconds)
-    #[arg(short, long, required = false, default_value = "60")]
-    http_timeout_seconds: usize,
+    #[arg(long, default_value = "60")]
+    http_timeout_seconds: u64,
 
     /// HTTP client read timeout (seconds)
-    #[arg(short, long, required = false, default_value = "30")]
-    http_read_timeout_seconds: usize,
+    #[arg(long, default_value = "30")]
+    http_read_timeout_seconds: u64,
 
     /// HTTP client connect timeout (seconds)
-    #[arg(short, long, required = false, default_value = "30")]
-    http_connect_timeout_seconds: usize,
+    #[arg(long, default_value = "30")]
+    http_connect_timeout_seconds: u64,
 
     /// HTTP client enable verbose logging
-    #[arg(short, long, required = false, default_value = "false")]
+    #[arg(long)]
     http_verbose_logging: bool,
 }
 
@@ -51,9 +56,9 @@ async fn main() {
     let args = Args::parse();
 
     let settings = PluginSettings {
-        connect_timeout: Duration::from_secs(args.http_connect_timeout_seconds as u64),
-        read_timeout: Duration::from_secs(args.http_read_timeout_seconds as u64),
-        timeout: Duration::from_secs(args.http_timeout_seconds as u64),
+        connect_timeout: Duration::from_secs(args.http_connect_timeout_seconds),
+        read_timeout: Duration::from_secs(args.http_read_timeout_seconds),
+        timeout: Duration::from_secs(args.http_timeout_seconds),
         verbose_logging: args.http_verbose_logging,
     };
     let plugin = match plugin::Plugin::new(args.id.as_str(), settings) {
@@ -74,10 +79,7 @@ async fn main() {
     let cfg = SinkRunnerConfig {
         plugin_id: args.id,
         log_level,
-        hub_connection: ConnectionConfig {
-            host: args.host,
-            port: args.port,
-        },
+        hub_connection: ConnectionConfig::new(args.host, args.port).with_token(args.token),
     };
     let mut runner = match SinkRunner::initialize(plugin, cfg).await {
         Ok(runner) => runner,
@@ -95,4 +97,66 @@ async fn main() {
     };
 
     log::debug!("Plugin stopped");
+}
+
+/// Keeps the package files (`manifest.json`, `schema/*.json`) in sync with the code.
+#[cfg(test)]
+mod package_tests {
+    use super::Args;
+    use clap::CommandFactory;
+    use flwrs_plugin::schema::rules;
+    use std::collections::BTreeSet;
+
+    fn read(path: &str) -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/").to_string() + path)
+            .unwrap()
+    }
+
+    fn json(path: &str) -> serde_json::Value {
+        serde_json::from_str(&read(path)).unwrap()
+    }
+
+    #[test]
+    fn manifest_matches_the_crate() {
+        let manifest = json("manifest.json");
+        assert_eq!(
+            manifest["version"],
+            env!("CARGO_PKG_VERSION"),
+            "bump manifest.json with Cargo.toml"
+        );
+        assert_eq!(manifest["type"], "SINK");
+        assert_eq!(
+            manifest["executable"],
+            format!("bin/{}", env!("CARGO_PKG_NAME"))
+        );
+    }
+
+    #[test]
+    fn in_schema_matches_the_code() {
+        let declared = rules::parse_json(&read("schema/in.json")).unwrap();
+        assert!(rules::check_well_formed(&declared).is_empty());
+        let code = crate::schema::build_schema().into();
+        assert_eq!(rules::diff(&declared, &code), Vec::<String>::new());
+    }
+
+    #[test]
+    fn launch_args_schema_matches_the_cli() {
+        const BOOTSTRAP: [&str; 5] = ["id", "host", "port", "log-level", "token"];
+        let schema = json("schema/launch_args.json");
+        let from_schema: BTreeSet<String> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.replace('_', "-"))
+            .collect();
+        let from_cli: BTreeSet<String> = Args::command()
+            .get_arguments()
+            .filter_map(|a| a.get_long().map(str::to_string))
+            .filter(|l| !BOOTSTRAP.contains(&l.as_str()))
+            .collect();
+        assert_eq!(
+            from_schema, from_cli,
+            "every non-bootstrap CLI flag must be in the schema and vice versa"
+        );
+    }
 }

@@ -39,9 +39,7 @@ impl Plugin {
         {
             Ok(client) => client,
             Err(e) => {
-                return Err(SinkError {
-                    source: Box::new(e),
-                });
+                return Err(SinkError::new(e));
             }
         };
         Ok(Self {
@@ -89,24 +87,12 @@ impl Sink for Plugin {
 
     fn consume_event(&mut self, event: SinkEvent) -> Result<(), SinkError> {
         if event.plugin_id != self.id {
-            return Err(SinkError {
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other, // TODO this should not be io
-                    "Wrong plugin ID",
-                )),
-            });
+            return Err(SinkError::new("Wrong plugin ID"));
         }
         if event.plugin_version != VERSION {
-            return Err(SinkError {
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other, // TODO this should not be io
-                    "Wrong plugin version",
-                )),
-            });
+            return Err(SinkError::new("Wrong plugin version"));
         }
-        let payload = event.payload.ok_or(SinkError {
-            source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "No payload")), // TODO this should not be io
-        })?;
+        let payload = event.payload.ok_or_else(|| SinkError::new("No payload"))?;
 
         log::trace!("Received event: {:?}", payload);
         let request = self.build_request(payload)?;
@@ -184,12 +170,7 @@ impl ParsedPayload {
                 None => Ok("".to_string()),
                 Some(value) => match value {
                     Value::String(uri) => Ok(uri.clone()),
-                    _ => Err(SinkError {
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "Unsupported URL value type",
-                        )),
-                    }),
+                    _ => Err(SinkError::new("Unsupported URL value type")),
                 },
             },
         }
@@ -199,7 +180,7 @@ impl ParsedPayload {
         match &field.value {
             None => Ok(Method::GET),
             Some(value) => match &value.value {
-                None => Ok((Method::GET)),
+                None => Ok(Method::GET),
                 Some(value) => match value {
                     Value::String(m) => match m.as_str() {
                         "GET" => Ok(Method::GET),
@@ -211,19 +192,9 @@ impl ParsedPayload {
                         "OPTIONS" => Ok(Method::OPTIONS),
                         "CONNECT" => Ok(Method::CONNECT),
                         "TRACE" => Ok(Method::TRACE),
-                        _ => Err(SinkError {
-                            source: Box::new(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "Unsupported method value",
-                            )),
-                        }),
+                        _ => Err(SinkError::new("Unsupported method value")),
                     },
-                    _ => Err(SinkError {
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "Unsupported method value type",
-                        )),
-                    }),
+                    _ => Err(SinkError::new("Unsupported method value type")),
                 },
             },
         }
@@ -251,27 +222,18 @@ impl ParsedPayload {
                                                     array.push(s.clone());
                                                     Ok(())
                                                 }
-                                                _ => Err(SinkError {
-                                                    source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Unsupported headers value value type")),
-                                                })
+                                                _ => Err(SinkError::new("Unsupported headers value value type"))
                                             }
                                         })?;
                                         headers.insert(key.clone(), array);
                                         Ok(())
                                     }
-                                    _ => Err(SinkError {
-                                        source: Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Unsupported headers value value type")),
-                                    })
+                                    _ => Err(SinkError::new("Unsupported headers value value type"))
                                 }
                             })?;
                             Ok(headers)
                         }
-                        _ => Err(SinkError {
-                            source: Box::new(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "Unsupported headers value type",
-                            )),
-                        }),
+                        _ => Err(SinkError::new("Unsupported headers value type")),
                     },
                 }
             }
@@ -285,14 +247,86 @@ impl ParsedPayload {
                 None => Ok(Bytes::new()),
                 Some(value) => match value {
                     Value::String(s) => Ok(Bytes::from(s.clone().into_bytes())),
-                    _ => Err(SinkError {
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "Unsupported body value type",
-                        )),
-                    }),
+                    Value::Bytes(b) => Ok(Bytes::from(b.clone())),
+                    _ => Err(SinkError::new("Unsupported body value type")),
                 },
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flwrs_plugin::schema::schema::{ArrayValue, FieldValue, MapValue};
+
+    fn field(key: &str, value: Value) -> Field {
+        Field {
+            key: key.into(),
+            value: Some(FieldValue { value: Some(value) }),
+        }
+    }
+
+    fn string(s: &str) -> Value {
+        Value::String(s.into())
+    }
+
+    #[test]
+    fn parses_full_payload() {
+        let headers = MapValue {
+            value: [(
+                "accept".to_string(),
+                FieldValue {
+                    value: Some(Value::Array(ArrayValue {
+                        value: vec![
+                            FieldValue {
+                                value: Some(string("text/plain")),
+                            },
+                            FieldValue {
+                                value: Some(string("application/json")),
+                            },
+                        ],
+                    })),
+                },
+            )]
+            .into(),
+        };
+        let parsed = ParsedPayload::parse(PluginPayload {
+            fields: vec![
+                field(URL_KEY, string("http://example.com/x")),
+                field(METHOD_KEY, string("POST")),
+                field(HEADERS_KEY, Value::Map(headers)),
+                field(BODY_KEY, Value::Bytes(b"raw".to_vec())),
+                field("ignored", string("whatever")),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(parsed.url, "http://example.com/x");
+        assert_eq!(parsed.method, Method::POST);
+        assert_eq!(
+            parsed.headers["accept"],
+            vec!["text/plain", "application/json"]
+        );
+        assert_eq!(parsed.body, Bytes::from_static(b"raw"));
+    }
+
+    #[test]
+    fn defaults_to_get_with_empty_body() {
+        let parsed = ParsedPayload::parse(PluginPayload {
+            fields: vec![field(URL_KEY, string("http://example.com"))],
+        })
+        .unwrap();
+        assert_eq!(parsed.method, Method::GET);
+        assert!(parsed.body.is_empty());
+        assert!(parsed.headers.is_empty());
+    }
+
+    #[test]
+    fn rejects_bad_values() {
+        let bad = |f: Field| ParsedPayload::parse(PluginPayload { fields: vec![f] }).is_err();
+        assert!(bad(field(METHOD_KEY, string("FETCH"))));
+        assert!(bad(field(URL_KEY, Value::Bool(true))));
+        assert!(bad(field(HEADERS_KEY, string("nope"))));
     }
 }

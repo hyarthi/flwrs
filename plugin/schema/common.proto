@@ -1,17 +1,37 @@
 syntax = "proto3";
 
+// Types shared by all plugin types.
 package schema.common;
 
+import "google/protobuf/timestamp.proto";
 import "schema/schema.proto";
+
+// Value of the `Msg-Code` frame header: which top-level message type the
+// frame body holds. Codes name message types, not oneof payloads, so adding
+// a payload variant needs no new code. New codes come with a new protocol
+// version.
+message MsgCode {
+  enum Enum {
+    UNDEFINED = 0;                  // never valid on the wire
+    SOURCE_MESSAGE = 1;             // source    -> runtime
+    RUNTIME_SOURCE_MESSAGE = 2;     // runtime   -> source
+    SINK_MESSAGE = 3;               // sink      -> runtime
+    RUNTIME_SINK_MESSAGE = 4;       // runtime   -> sink
+    TRANSFORM_MESSAGE = 5;          // transform -> runtime
+    RUNTIME_TRANSFORM_MESSAGE = 6;  // runtime   -> transform
+  }
+}
 
 message PluginType {
   enum Enum {
     UNDEFINED = 0;
     SOURCE = 1;
     SINK = 2;
+    TRANSFORM = 3;
   }
 }
 
+// Plugin -> runtime: something went wrong; the plugin keeps running.
 message ErrorEvent {
   string plugin_id = 1;
   PluginType.Enum plugin_type = 2;
@@ -30,10 +50,54 @@ message LogLevel {
   }
 }
 
+// Plugin -> runtime: a log record.
 message LogEvent {
   string plugin_id = 1;
   PluginType.Enum plugin_type = 2;
   LogLevel.Enum log_level = 3;
   string message = 4;
+  // Structured key-values attached to the record.
   repeated schema.Field details = 5;
+}
+
+// Reason a plugin exits; sent in Exit.
+message ExitCode {
+  enum Enum {
+    UNDEFINED = 0;
+    OK = 1;
+    INTERRUPTED = 2;
+    ERROR = 3;
+  }
+}
+
+// Plugin -> runtime: final message before the plugin exits.
+message Exit {
+  ExitCode.Enum code = 1;
+  string message = 2;
+}
+
+// Runtime -> plugin: stop processing, clean up, send Exit and exit.
+message Shutdown {}
+
+// Runtime -> plugin: acknowledges Initialize.
+message InitializeResponse {}
+
+// Hub-managed metadata of a data event (SourceEvent, SinkEvent, TransformEvent).
+//
+// The hub is the authority: it fills in or overwrites these fields when it
+// routes an event. Sources leave it unset. A transform copies the metadata of
+// the input event onto every output event produced from it, so trace_id and
+// hops survive the transform (the Rust SDK does this automatically).
+message EventMetadata {
+  // Unique id of this event (assigned by the hub per routed event).
+  string event_id = 1;
+  // Shared by every event derived from the same original source event.
+  string trace_id = 2;
+  // Number of hub routing steps since the original source event; the hub
+  // drops events that exceed its hop limit (protects against cycles).
+  uint32 hops = 3;
+  // Node (plugin instance) that produced the original event of the trace.
+  string origin_node_id = 4;
+  // When the original event of the trace entered the hub.
+  google.protobuf.Timestamp create_time = 5;
 }

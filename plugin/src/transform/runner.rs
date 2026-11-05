@@ -1,16 +1,16 @@
 use crate::plugin::core::ConnectionConfig;
 use crate::plugin::error::Error;
 use crate::plugin::logger::PluginLogger;
-use crate::plugin::msg_client::MSG_CLIENT;
-use crate::schema::common::log_level::Enum as LogLevel;
-use crate::schema::transform::transform_message::Payload;
+use crate::plugin::msg_client::{HubClient, Session, Stage};
+use crate::plugin::runtime::{Backoff, SessionEnd, accept, error_event, finish, open_session};
+use crate::schema::common::{log_level::Enum as LogLevel, plugin_type::Enum as PluginType};
 use crate::schema::transform::{
-    runtime_transform_message::Payload as RuntimeTransformMessagePayload, RuntimeTransformMessage, TransformMessage,
+    Initialize, RuntimeTransformMessage, TransformMessage,
+    runtime_transform_message::Payload as RuntimePayload, transform_message::Payload,
 };
+use crate::transform::local_sink::LocalSink;
 use crate::transform::plugin::Transform;
-use prost::Message;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 pub struct TransformRunnerConfig {
     pub plugin_id: String,
@@ -18,128 +18,119 @@ pub struct TransformRunnerConfig {
     pub hub_connection: ConnectionConfig,
 }
 
-pub struct TransformRunner<T>
-where
-    T: for<'a> Transform<'a>,
-{
+pub struct TransformRunner<T: Transform> {
     plugin: T,
     plugin_id: String,
     log_level: LogLevel,
-    local_sink: Arc<Mutex<crate::transform::local_sink::LocalSink>>,
+    connection: ConnectionConfig,
+    client: Arc<HubClient>,
 }
 
-impl<T> TransformRunner<T>
-where
-    T: for<'a> Transform<'a>,
-{
-    #[allow(dead_code)]
+impl<T: Transform> TransformRunner<T> {
+    /// Installs the plugin logger. Connecting happens in [`TransformRunner::run`].
     pub async fn initialize(plugin: T, config: TransformRunnerConfig) -> Result<Self, Error> {
-        MSG_CLIENT
-            .write()
-            .await
-            .connect(
-                format!(
-                    "{}:{}",
-                    config.hub_connection.host, config.hub_connection.port
-                )
-                .as_str(),
-            )
-            .await?;
-        PluginLogger::initialize(config.plugin_id.as_str(), config.log_level.into())?;
-        Ok(Self::new(config.plugin_id, plugin, config.log_level))
-    }
-
-    pub(crate) fn new(id: String, plugin: T, log_level: LogLevel) -> Self {
-        Self {
+        let client = HubClient::new(config.hub_connection.addr());
+        PluginLogger::initialize(
+            &config.plugin_id,
+            PluginType::Transform,
+            config.log_level.into(),
+            client.clone(),
+        )?;
+        Ok(Self {
             plugin,
-            plugin_id: id.clone(),
-            log_level,
-            local_sink: Arc::new(Mutex::new(crate::transform::local_sink::LocalSink::new(id))),
-        }
+            plugin_id: config.plugin_id,
+            log_level: config.log_level,
+            connection: config.hub_connection,
+            client,
+        })
     }
 
-    #[allow(dead_code)]
+    /// Connects to the hub, sends `Initialize` and processes events until the
+    /// hub sends `Shutdown`. If the connection is lost, it reconnects with
+    /// backoff and re-sends the same `Initialize`.
+    ///
+    /// Each output event gets the input event's `metadata` unless the plugin
+    /// set its own (protocol rule: transforms propagate metadata).
+    ///
+    /// Returns [`Error::Rejected`] if the hub answers `Initialize` with
+    /// `Shutdown` (unknown instance id or wrong token).
     pub async fn run(&mut self) -> Result<(), Error> {
-        // send hello to runtime
-        let payload = match self.plugin.initialize(
-            self.plugin_id.clone(),
-            self.log_level,
-            self.local_sink.as_ref(),
-        ) {
-            Ok(result) => result,
-            Err(err) => {
-                log::error!("Error initializing plugin: {}", err);
-                return Err(Error::InitError(err));
-            }
-        };
-        let hello_msg = TransformMessage {
-            payload: Some(Payload::Initialize(payload.into())),
+        let sink = LocalSink::new(self.client.clone());
+        let mut init: Initialize = self
+            .plugin
+            .initialize(self.plugin_id.clone(), self.log_level, sink)
+            .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?
+            .into();
+        init.token = self.connection.resolved_token();
+        let init = TransformMessage {
+            payload: Some(Payload::Initialize(init)),
         };
 
-        match MSG_CLIENT
-            .read()
-            .await
-            .send(hello_msg.encode_to_vec().as_slice())
-            .await
-        {
-            Ok(_) => {}
-            Err(err) => {
-                log::error!("Error sending hello message: {}", err);
-                return Err(Error::IOError(err));
+        let mut backoff = Backoff::new(self.connection.reconnect);
+        let end = loop {
+            let mut session = open_session(&self.client, &init, &mut backoff).await;
+            match self.serve(&mut session, &mut backoff).await {
+                SessionEnd::Disconnected => {
+                    self.client.disconnect(Some(session.id)).await;
+                    log::warn!("Lost the connection to the hub; reconnecting");
+                }
+                end => break end,
             }
         };
 
+        let shutdown = self.plugin.shutdown();
+        finish(&self.client, &self.plugin_id, end, shutdown, |exit| {
+            TransformMessage {
+                payload: Some(Payload::Exit(exit)),
+            }
+        })
+        .await
+    }
+
+    async fn serve(
+        &mut self,
+        session: &mut Session<RuntimeTransformMessage>,
+        backoff: &mut Backoff,
+    ) -> SessionEnd {
         loop {
-            let bytes = match MSG_CLIENT.read().await.receive().await {
-                Ok(bytes) => match bytes {
-                    None => {
-                        continue;
+            let Some(msg) = session.next().await else {
+                return SessionEnd::Disconnected;
+            };
+            let Some(payload) = msg.payload else {
+                log::error!("Message payload is missing");
+                continue;
+            };
+            match payload {
+                RuntimePayload::Initialize(_) => accept(&self.client, session, backoff).await,
+                RuntimePayload::Event(event) => {
+                    log::debug!("Received event for: {}", event.plugin_id);
+                    let metadata = event.metadata.clone();
+                    let (reply, stage) = match self.plugin.process_event(event) {
+                        Ok(mut out) => {
+                            if out.metadata.is_none() {
+                                out.metadata = metadata;
+                            }
+                            (Payload::Event(out), Stage::Ready)
+                        }
+                        Err(err) => {
+                            log::error!("Error processing event: {err}");
+                            let error =
+                                error_event(&self.plugin_id, PluginType::Transform, err.to_string());
+                            (Payload::Error(error), Stage::Initializing)
+                        }
+                    };
+                    let msg = TransformMessage {
+                        payload: Some(reply),
+                    };
+                    if self.client.send(&msg, stage).await.is_err() {
+                        return SessionEnd::Disconnected;
                     }
-                    Some(bytes) => bytes,
-                },
-                Err(err) => {
-                    log::error!("Error receiving message: {}", err);
-                    continue;
                 }
-            };
-            let msg = match RuntimeTransformMessage::decode(bytes) {
-                Ok(message) => message,
-                Err(err) => {
-                    log::error!("Error parsing message: {}", err);
-                    continue;
-                }
-            };
-            let pyld = match msg.payload {
-                Some(payload) => payload,
-                None => {
-                    log::error!("Message payload is missing");
-                    continue;
-                }
-            };
-
-            match pyld {
-                RuntimeTransformMessagePayload::Initialize(_) => {
-                    // noop for sink
-                    continue;
-                }
-                RuntimeTransformMessagePayload::Event(payload) => {
-                    log::debug!("Received event: {:?}", payload.plugin_id.clone());
-                    let result = self.plugin.process_event(payload);
-                    if let Err(err) = result {
-                        log::error!("Error processing event: {}", err);
-                        continue;
-                    }
-                    continue;
-                }
-                RuntimeTransformMessagePayload::Shutdown(_) => {
+                RuntimePayload::Shutdown(_) => {
                     log::debug!("Received shutdown message");
-                    let result = self.plugin.shutdown();
-                    if let Err(err) = result {
-                        log::error!("Error shutting down: {}", err);
-                        break Err(Error::ShutdownError(err));
-                    }
-                    log::info!("Plugin shutdown: {}", self.plugin_id);
-                    break Ok(());
+                    return SessionEnd::Shutdown {
+                        accepted: session.accepted,
+                    };
                 }
             }
         }

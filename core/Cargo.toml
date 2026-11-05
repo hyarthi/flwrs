@@ -1,24 +1,33 @@
 [package]
 name = "flwrs-core"
-version = "0.0.1"
-edition = "2024"
+description = "Shared library for the flwrs server: config, logging, DB, HTTP, service registry."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-toml = "0.8.19"
-serde = { version = "1.0.216", features = ["derive"] }
-chrono = "0.4.39"
-log = { version = "0.4.25", features = ["kv", "kv_serde"] }
-flexi_logger = "0.29.7"
-syslog = "7.0.0"
-lazy_static = "1.5.0"
-clap = { version = "4.5.23", features = ["derive"] }
-tokio = { version = "1.42.0", features = ["full", "rt-multi-thread"] }
-tokio-util = { version = "0.7.13", features = ["full"] }
-sqlx = { version = "0.8.2", features = ["runtime-tokio", "sqlite", "chrono", "derive"] }
-rust-embed = { version = "8.5.0", features = ["debug-embed"] }
-sha256 = "1.5.0"
-thiserror = "2.0.9"
-axum = "0.8.1"
-tower-service = "0.3.3"
-tower-layer = "0.3.3"
-async-trait = "0.1.85"
+toml.workspace = true
+serde.workspace = true
+chrono.workspace = true
+log.workspace = true
+flexi_logger.workspace = true
+syslog.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+sqlx.workspace = true
+rust-embed.workspace = true
+sha256.workspace = true
+thiserror.workspace = true
+axum.workspace = true
+tower-service.workspace = true
+tower-layer.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

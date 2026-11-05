@@ -1,58 +1,53 @@
 syntax = "proto3";
 
+// Messages between a transform plugin and the runtime.
 package schema.transform;
 
 import "schema/schema.proto";
 import "schema/common.proto";
 
+// Sent in both directions: input from the runtime, output from the transform.
 message TransformEvent {
   string plugin_id = 1;
   string plugin_version = 2;
   schema.PluginPayload payload = 3;
+  // Hub-managed event metadata; see common.EventMetadata.
+  common.EventMetadata metadata = 4;
 }
 
-// transform --> runtime
+// --- transform -> runtime ---
 
-message TransformExitCode {
-  enum Enum {
-    OK = 0;
-    INTERRUPTED = 1;
-    ERROR = 2;
-  }
-}
-
-message TransformExit {
-  TransformExitCode.Enum code = 1;
-  string message = 2;
-}
-
+// First message on every connection, including after a reconnect.
 message Initialize {
+  // Instance id: the node id the plugin was started with (--id).
   string plugin_id = 1;
   string plugin_version = 2;
+  // Schema of the payloads this transform accepts.
   schema.SchemaDefinition in_schema = 3;
+  // Schema of the payloads this transform emits.
   schema.SchemaDefinition out_schema = 4;
+  // Authenticates this connection: the per-launch token for plugins the hub
+  // launched, or the node's pre-shared token for remote plugins. Read from the
+  // FLWRS_TOKEN environment variable (or a --token argument).
+  string token = 5;
 }
 
 message TransformMessage {
   oneof payload {
     Initialize initialize = 1;
-    TransformExit exit = 2;
+    common.Exit exit = 2;
     common.LogEvent log = 3;
     common.ErrorEvent error = 4;
     TransformEvent event = 5;
   }
 }
 
-// runtime --> transform
-
-message Shutdown {}
-
-message InitializeResponse {}
+// --- runtime -> transform ---
 
 message RuntimeTransformMessage {
   oneof payload {
-    InitializeResponse initialize = 1;
-    Shutdown shutdown = 2;
+    common.InitializeResponse initialize = 1;
+    common.Shutdown shutdown = 2;
     TransformEvent event = 3;
   }
 }
