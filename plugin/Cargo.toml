@@ -1,7 +1,12 @@
 [package]
 name = "flwrs-plugin"
-description = "Crate for building plugins for flwrs."
-version.workspace = true
+description = "Plugin protocol and Rust SDK for flwrs, a lightweight server for pluggable workflows"
+readme = "README.md"
+homepage = "https://github.com/hyarthi/flwrs"
+documentation = "https://docs.rs/flwrs-plugin"
+keywords = ["flwrs", "workflow", "plugin", "dataflow", "protobuf"]
+categories = ["network-programming", "development-tools"]
+version = "0.0.2" # published on its own; the other crates follow the workspace version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
