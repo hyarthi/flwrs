@@ -357,6 +357,7 @@ impl Service {
                 return Err(e.into());
             }
         };
+        query_sqlite::set_nodes_plugin_version(&mut conn, &plugin.id, &plugin.version).await?;
         if had_folder && let Err(e) = tokio::fs::remove_dir_all(&parked).await {
             log::warn!(
                 "Plugin registry: couldn't remove old package [{}]: {e}",
@@ -383,18 +384,20 @@ impl Service {
         let _guard = self.lock.lock().await;
         let plugin = self.get(id).await?;
         let mut conn = self.conn().await?;
-        let nodes = query_sqlite::nodes_using(&mut conn, id).await?;
+        // Nodes don't reference plugins with a foreign key (imported scenes
+        // may name plugins this server lacks), so the check and the delete
+        // share one write transaction: no node can be added in between.
+        let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+        let nodes = query_sqlite::nodes_using(&mut tx, id).await?;
         if !nodes.is_empty() {
             return Err(ServiceError::InUse(
                 nodes.into_iter().map(|(node, _)| node).collect(),
             ));
         }
-        match query_sqlite::delete(&mut conn, id).await {
-            Ok(0) => return Err(ServiceError::NotFound),
-            Ok(_) => {}
-            // A node was added between the check and the delete: the FK caught it.
-            Err(e) => return Err(e.into()),
+        if query_sqlite::delete(&mut tx, id).await? == 0 {
+            return Err(ServiceError::NotFound);
         }
+        tx.commit().await?;
         let folder = PathBuf::from(&plugin.install_path);
         if folder.exists() {
             let parked = self.trash_dir().join(format!("{id}-{}", Ulid::generate()));

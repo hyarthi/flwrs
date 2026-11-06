@@ -1,0 +1,7 @@
+{
+  "fields": [
+    { "key": "url", "description": "Where to send the request", "type": "STRING" },
+    { "key": "method", "description": "HTTP method (default POST)", "type": "STRING" },
+    { "key": "body", "description": "Request body", "type": "STRING" }
+  ]
+}

@@ -119,7 +119,10 @@ impl HubClient {
     /// Drops connection `id` (or whatever connection is open, for `None`).
     pub(crate) async fn disconnect(&self, id: Option<u64>) {
         let mut guard = self.conn.lock().await;
-        if guard.as_ref().is_some_and(|c| id.is_none_or(|id| c.id == id)) {
+        if guard
+            .as_ref()
+            .is_some_and(|c| id.is_none_or(|id| c.id == id))
+        {
             *guard = None;
             self.stage.send_replace(Stage::Down);
         }

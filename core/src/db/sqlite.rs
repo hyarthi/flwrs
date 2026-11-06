@@ -6,7 +6,7 @@ use chrono::{DateTime, Local};
 use rust_embed::Embed;
 use serde::Deserialize;
 use sqlx::pool::PoolConnection;
-use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions};
+use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{AssertSqlSafe, Connection, Executor, FromRow, Sqlite, SqlitePool, Type};
 use std::str;
 
@@ -58,7 +58,11 @@ pub async fn build_db(name: &str, config: DbConfig) -> Result<Database, DbError>
         SqliteConnectOptions::new()
             .filename(filename)
             .create_if_missing(true)
-            .auto_vacuum(SqliteAutoVacuum::Incremental),
+            .auto_vacuum(SqliteAutoVacuum::Incremental)
+            // WAL: readers (e.g. the director loading a scene) don't block a
+            // writer, and a writer doesn't block readers.
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5)),
     )
     .await?;
 

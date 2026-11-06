@@ -15,23 +15,29 @@ pub(super) async fn create_scene(
     conn: &mut SqliteConnection,
     id: &str,
     name: &str,
+    max_hops: Option<u32>,
 ) -> Result<Scene, sqlx::Error> {
-    sqlx::query_as::<Sqlite, Scene>("INSERT INTO scenes (id, name) VALUES ($1, $2) RETURNING *")
-        .bind(id)
-        .bind(name)
-        .fetch_one(conn)
-        .await
+    sqlx::query_as::<Sqlite, Scene>(
+        "INSERT INTO scenes (id, name, max_hops) VALUES ($1, $2, $3) RETURNING *",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(max_hops)
+    .fetch_one(conn)
+    .await
 }
 
 pub(super) async fn update_scene(
     conn: &mut SqliteConnection,
     id: &str,
     name: &str,
+    max_hops: Option<u32>,
 ) -> Result<Scene, sqlx::Error> {
     sqlx::query_as::<Sqlite, Scene>(
-        "UPDATE scenes SET name = $1, update_time = $2 WHERE id = $3 RETURNING *",
+        "UPDATE scenes SET name = $1, max_hops = $2, update_time = $3 WHERE id = $4 RETURNING *",
     )
     .bind(name)
+    .bind(max_hops)
     .bind(Local::now())
     .bind(id)
     .fetch_one(conn)
@@ -77,6 +83,16 @@ pub(super) async fn list_scenes(
     .await
 }
 
+pub(super) async fn enabled_scene_ids(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<Sqlite, String>(
+        "SELECT id FROM scenes WHERE enabled = TRUE ORDER BY create_time, id",
+    )
+    .fetch_all(conn)
+    .await
+}
+
 // --- nodes ---
 
 pub(super) async fn list_nodes(
@@ -107,6 +123,7 @@ pub(super) struct NodeValues<'a> {
     pub name: Option<&'a str>,
     pub node_type: &'a str,
     pub plugin_id: &'a str,
+    pub plugin_version: Option<&'a str>,
     pub config: &'a str,
 }
 
@@ -117,14 +134,15 @@ pub(super) async fn insert_node(
     v: &NodeValues<'_>,
 ) -> Result<NodeRow, sqlx::Error> {
     sqlx::query_as::<Sqlite, NodeRow>(
-        "INSERT INTO scene_nodes (id, name, scene_id, \"type\", plugin_id, config) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+        "INSERT INTO scene_nodes (id, name, scene_id, \"type\", plugin_id, plugin_version, config) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
     )
     .bind(id)
     .bind(v.name)
     .bind(scene_id)
     .bind(v.node_type)
     .bind(v.plugin_id)
+    .bind(v.plugin_version)
     .bind(v.config)
     .fetch_one(conn)
     .await
@@ -137,12 +155,13 @@ pub(super) async fn update_node(
     v: &NodeValues<'_>,
 ) -> Result<NodeRow, sqlx::Error> {
     sqlx::query_as::<Sqlite, NodeRow>(
-        "UPDATE scene_nodes SET name = $1, \"type\" = $2, plugin_id = $3, config = $4, update_time = $5 \
-         WHERE scene_id = $6 AND id = $7 RETURNING *",
+        "UPDATE scene_nodes SET name = $1, \"type\" = $2, plugin_id = $3, plugin_version = $4, config = $5, update_time = $6 \
+         WHERE scene_id = $7 AND id = $8 RETURNING *",
     )
     .bind(v.name)
     .bind(v.node_type)
     .bind(v.plugin_id)
+    .bind(v.plugin_version)
     .bind(v.config)
     .bind(Local::now())
     .bind(scene_id)

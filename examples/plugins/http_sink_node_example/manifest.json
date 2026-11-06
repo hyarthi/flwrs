@@ -1,0 +1,10 @@
+{
+  "manifest_version": 1,
+  "id": "http-sink-node-example",
+  "name": "HTTP sink (Node.js / TypeScript example)",
+  "version": "0.0.1",
+  "type": "SINK",
+  "description": "Demo only: sends an HTTP request for each event.",
+  "executable": "plugin.ts",
+  "payload_schemas": { "in": "schema/in.json" }
+}

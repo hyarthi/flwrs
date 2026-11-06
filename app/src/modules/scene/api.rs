@@ -1,6 +1,6 @@
 use crate::modules::api_error::{ApiError, ErrorBody, api_error, internal};
-use crate::modules::scene::api_graph;
 use crate::modules::scene::service::{self, ListFilters, Service, ServiceError};
+use crate::modules::scene::{api_graph, api_status, api_transfer};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -22,6 +22,9 @@ impl From<ServiceError> for ApiError {
             ServiceError::Conflict(message, details) => {
                 api_error(StatusCode::CONFLICT, message, details)
             }
+            ServiceError::Unavailable(message) => {
+                api_error(StatusCode::SERVICE_UNAVAILABLE, message, vec![])
+            }
             e @ (ServiceError::Query(_)
             | ServiceError::Connection(_)
             | ServiceError::Unknown(_)) => internal("Scenes API", e),
@@ -35,6 +38,9 @@ pub(crate) struct Scene {
     pub name: String,
     /// Whether the scene's workflow runs (true) or is dormant (false).
     pub enabled: bool,
+    /// Events are dropped after this many handovers (stops runaway loops in
+    /// cycles). `null` = the server default (`[director] max_hops`, 32).
+    pub max_hops: Option<u32>,
     pub create_time: i64,
     pub update_time: i64,
 }
@@ -45,6 +51,7 @@ impl From<service::Scene> for Scene {
             id: value.id,
             name: value.name,
             enabled: value.enabled,
+            max_hops: value.max_hops,
             create_time: value.create_time.timestamp_millis(),
             update_time: value.update_time.timestamp_millis(),
         }
@@ -52,8 +59,22 @@ impl From<service::Scene> for Scene {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SceneRequest {
     pub name: String,
+    /// Hop limit for this scene, 1 to 10 000. Omitted or `null` = the
+    /// server default. Changing it on an enabled scene restarts the scene.
+    #[serde(default)]
+    pub max_hops: Option<u32>,
+}
+
+impl From<SceneRequest> for service::SceneInput {
+    fn from(req: SceneRequest) -> Self {
+        Self {
+            name: req.name,
+            max_hops: req.max_hops,
+        }
+    }
 }
 
 const DEFAULT_LIMIT: u32 = 50;
@@ -104,14 +125,14 @@ async fn create_scene(
     State(service): State<Svc>,
     Json(req): Json<SceneRequest>,
 ) -> Result<Json<Scene>, ApiError> {
-    Ok(Json(service.create_scene(&req.name).await?.into()))
+    Ok(Json(service.create_scene(&req.into()).await?.into()))
 }
 
 #[utoipa::path(
     put,
     path = "/by-id/{id}",
     operation_id = "update-scene",
-    summary = "Rename a scene",
+    summary = "Replace a scene's settings (name, hop limit)",
     request_body(content = SceneRequest, content_type = "application/json"),
     params(("id" = String, Path, description = "ID of the scene to update")),
     responses(
@@ -125,7 +146,7 @@ async fn update_scene(
     Path(id): Path<String>,
     Json(req): Json<SceneRequest>,
 ) -> Result<Json<Scene>, ApiError> {
-    Ok(Json(service.update_scene(&id, &req.name).await?.into()))
+    Ok(Json(service.update_scene(&id, &req.into()).await?.into()))
 }
 
 #[utoipa::path(
@@ -213,7 +234,7 @@ async fn disable_scene(
 #[openapi(
     info(
         title = "Scenes",
-        description = "Scenes API: scenes, their nodes and edges"
+        description = "Scenes API: scenes, their nodes and edges, export and import"
     ),
     paths(
         list_scenes,
@@ -223,6 +244,10 @@ async fn disable_scene(
         delete_scene,
         enable_scene,
         disable_scene,
+        api_transfer::export_scene,
+        api_transfer::import_scene,
+        api_transfer::check_scene,
+        api_status::scene_status,
         api_graph::list_nodes,
         api_graph::create_node,
         api_graph::get_node,
@@ -243,6 +268,10 @@ async fn disable_scene(
         api_graph::NodeRequest,
         api_graph::Edge,
         api_graph::EdgeRequest,
+        api_transfer::SceneCheckResponse,
+        api_transfer::ImportResponse,
+        api_transfer::SceneUpload,
+        api_status::SceneStatusResponse,
     ))
 )]
 pub(crate) struct Api;
@@ -258,6 +287,8 @@ impl Api {
             .route("/scenes/by-id/{id}/enable", post(enable_scene))
             .route("/scenes/by-id/{id}/disable", post(disable_scene))
             .merge(api_graph::routes())
+            .merge(api_transfer::routes())
+            .merge(api_status::routes())
             .with_state(service)
     }
 }

@@ -1,5 +1,6 @@
 use crate::modules::plugin::service::{NewPlugin, Plugin, ServiceError};
 use chrono::Local;
+use sqlx::SqliteConnection;
 use sqlx::error::ErrorKind;
 use sqlx::pool::PoolConnection;
 use sqlx::{Executor, FromRow, Sqlite};
@@ -92,27 +93,40 @@ pub(super) async fn update_package(
     Plugin::from_row(&row)
 }
 
-pub(super) async fn delete(
-    conn: &mut PoolConnection<Sqlite>,
-    id: &str,
-) -> Result<u64, sqlx::Error> {
-    let result = conn
-        .execute(sqlx::query("DELETE FROM plugins WHERE id = $1").bind(id))
+pub(super) async fn delete(conn: &mut SqliteConnection, id: &str) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM plugins WHERE id = $1")
+        .bind(id)
+        .execute(conn)
         .await?;
     Ok(result.rows_affected())
 }
 
 /// `(node id, node config JSON)` of every scene node that uses the plugin.
 pub(super) async fn nodes_using(
-    conn: &mut PoolConnection<Sqlite>,
+    conn: &mut SqliteConnection,
     plugin_id: &str,
 ) -> Result<Vec<(String, String)>, sqlx::Error> {
     sqlx::query_as::<Sqlite, (String, String)>(
         "SELECT id, config FROM scene_nodes WHERE plugin_id = $1 ORDER BY id",
     )
     .bind(plugin_id)
-    .fetch_all(&mut **conn)
+    .fetch_all(conn)
     .await
+}
+
+/// After an upgrade (which re-validated them): the nodes using the plugin are
+/// now configured for the new version.
+pub(super) async fn set_nodes_plugin_version(
+    conn: &mut SqliteConnection,
+    plugin_id: &str,
+    version: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE scene_nodes SET plugin_version = $1 WHERE plugin_id = $2")
+        .bind(version)
+        .bind(plugin_id)
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// Ids of enabled scenes with at least one node using the plugin.

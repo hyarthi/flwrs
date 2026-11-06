@@ -1,10 +1,10 @@
 # Idea: credit-based flow control
 
-Status: idea, not scheduled. Candidate follow-up to the v1 director.
+Status: idea, not scheduled. Candidate follow-up to the director's TCP-level backpressure.
 
 ## Problem
 
-In v1, backpressure works at the TCP level. When a target's queue is full, the hub stops reading the producing plugin's socket, the TCP window fills, and the plugin's next send blocks. It's universal (any language gets it from plain blocking writes) and needs no protocol support, but it has costs:
+Today, backpressure works at the TCP level. When a target's queue is full, the hub stops reading the producing plugin's socket, the TCP window fills, and the plugin's next send blocks. It's universal (any language gets it from plain blocking writes) and needs no protocol support, but it has costs:
 
 - **System messages wait behind data.** While the hub isn't reading a socket, that plugin's `LogEvent`, `ErrorEvent` and `Exit` are stuck behind queued data events. Logs arrive late, and `Exit` is noticed late (for local plugins, process exit is still detected from the OS).
 - **Backpressure is implicit.** A plugin can't tell "hub is busy" from "network is slow". It can't adapt: batch, sample, coalesce, or drop on its own terms.
@@ -62,7 +62,7 @@ The same mechanism could work in reverse. A sink or transform grants the **hub**
 ## Effort and dependencies
 
 - **Hub:** credit accounting per producer, derived from queue room; the grant scheduler; violation handling.
-- **Rust SDK:** a credit balance in `MessagingClient`; `LocalSink::emit` and transform output wait for credit; `supports_credit = true` set automatically.
+- **Rust SDK:** a credit balance in `HubClient`; `LocalSink::emit` and transform output wait for credit; `supports_credit = true` set automatically.
 - **Docs:** the README protocol section (an optional capability, how to implement it in other languages).
 - **Tests:** a credit-aware fake hub; a mixed scene with credit-aware and TCP-only plugins; reconnect resets the balance; a violation leads to drop then disconnect; system messages flow while the balance is zero.
-- **Depends on:** the v1 director queues (section 4.5) and the protocol `token` / `Initialize` alignment work (phase 3).
+- **Builds on:** the director's inbound queues and the `Initialize` handshake (both in place).

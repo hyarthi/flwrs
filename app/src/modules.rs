@@ -1,6 +1,11 @@
 pub(crate) mod api_error;
 pub(crate) mod director;
+pub(crate) mod hub;
 pub(crate) mod mapping;
 pub(crate) mod node_config;
 pub(crate) mod plugin;
+pub(crate) mod rate_limit;
 pub(crate) mod scene;
+pub(crate) mod status_api;
+pub(crate) mod supervisor;
+pub(crate) mod telemetry;

@@ -4,8 +4,7 @@ use common::{FakeHub, TOKEN, connection, listen};
 use flwrs_plugin::plugin::core::InitializeRequest;
 use flwrs_plugin::plugin::error::{Error, InitializeError, ShutdownError, SinkError};
 use flwrs_plugin::schema::common::{
-    InitializeResponse, Shutdown, exit_code, log_level::Enum as LogLevel,
-    msg_code::Enum as MsgCode,
+    InitializeResponse, Shutdown, exit_code, log_level::Enum as LogLevel, msg_code::Enum as MsgCode,
 };
 use flwrs_plugin::schema::sink::{
     RuntimeSinkMessage, SinkEvent, SinkMessage, runtime_sink_message, sink_message::Payload,

@@ -12,6 +12,8 @@ pub(crate) const PLUGIN_MAX_RECONNECT_BACKOFF_MS: u64 =
     flwrs_plugin::plugin::core::MAX_RECONNECT_DELAY.as_millis() as u64;
 /// Minimum length of a remote node's pre-shared token.
 pub(crate) const MIN_TOKEN_LEN: usize = 16;
+/// Maximum length of a remote node's `remote_id`.
+pub(crate) const MAX_REMOTE_ID_LEN: usize = 128;
 
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +35,13 @@ pub(crate) struct NodeConfig {
     /// Pre-shared token (remote nodes only). Write-only in the API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Remote nodes only: the id the remote plugin is started with (`--id`)
+    /// and sends in `Initialize`. Unlike the node id it survives export and
+    /// import, so a remote plugin keeps working after its scene moves to
+    /// another server. Not unique: the token tells nodes with the same
+    /// `remote_id` apart. Defaults to the node id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<String>,
     /// Free-form launch arguments, shaped by the plugin's manifest (local nodes only).
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub launch_args: Value,
@@ -213,6 +222,28 @@ impl NodeConfig {
 
     /// Validates the config against the hub's rules and the plugin's manifest.
     pub(crate) fn validate(&self, plugin: &PluginRules) -> Vec<String> {
+        let mut errors = self.validate_own();
+        if let Some(missing) = self.missing_token() {
+            errors.push(missing);
+        }
+        if self.launch == LaunchMode::Local {
+            errors.extend(
+                manifest::validate_launch_args(
+                    plugin.launch_args_schema,
+                    plugin.launch_args_style,
+                    &self.launch_args,
+                )
+                .into_iter()
+                .map(|e| format!("config.{e}")),
+            );
+        }
+        errors
+    }
+
+    /// The checks that don't need the plugin, and allow a remote node's token
+    /// to be missing: what a scene import requires (the plugin may not be
+    /// installed, and exports leave tokens out by default).
+    pub(crate) fn validate_own(&self) -> Vec<String> {
         let mut errors = self.runtime.validate("config.runtime");
         match self.launch {
             LaunchMode::Local => {
@@ -221,23 +252,26 @@ impl NodeConfig {
                         "config.token is only for remote nodes; local plugins get a fresh token per launch".into(),
                     );
                 }
-                errors.extend(
-                    manifest::validate_launch_args(
-                        plugin.launch_args_schema,
-                        plugin.launch_args_style,
-                        &self.launch_args,
-                    )
-                    .into_iter()
-                    .map(|e| format!("config.{e}")),
-                );
+                if self.remote_id.is_some() {
+                    errors.push(
+                        "config.remote_id is only for remote nodes; a local plugin is started with its node id".into(),
+                    );
+                }
             }
             LaunchMode::Remote => {
-                match &self.token {
-                    None => errors.push("config.token is required for remote nodes".into()),
-                    Some(t) if t.chars().count() < MIN_TOKEN_LEN => errors.push(format!(
+                if let Some(t) = &self.token
+                    && t.chars().count() < MIN_TOKEN_LEN
+                {
+                    errors.push(format!(
                         "config.token must be at least {MIN_TOKEN_LEN} characters"
-                    )),
-                    Some(_) => {}
+                    ));
+                }
+                if let Some(id) = &self.remote_id
+                    && !is_valid_remote_id(id)
+                {
+                    errors.push(format!(
+                        "config.remote_id must be 1 to {MAX_REMOTE_ID_LEN} characters of letters, digits, '.', '_', ':' and '-'"
+                    ));
                 }
                 if !self.launch_args.is_null() {
                     errors.push(
@@ -249,12 +283,34 @@ impl NodeConfig {
         errors
     }
 
+    /// The problem if this is a remote node without a token.
+    pub(crate) fn missing_token(&self) -> Option<String> {
+        (self.launch == LaunchMode::Remote && self.token.is_none())
+            .then(|| "config.token is required for remote nodes".to_string())
+    }
+
+    /// The id the node's plugin sends in `Initialize`: the `remote_id` of a
+    /// remote node, else the node id.
+    pub(crate) fn instance_id<'a>(&'a self, node_id: &'a str) -> &'a str {
+        match (self.launch, &self.remote_id) {
+            (LaunchMode::Remote, Some(remote_id)) => remote_id,
+            _ => node_id,
+        }
+    }
+
     /// The config as JSON, without the token (for API responses).
     pub(crate) fn redacted(&self) -> Value {
         let mut copy = self.clone();
         copy.token = None;
         serde_json::to_value(copy).expect("config serializes")
     }
+}
+
+fn is_valid_remote_id(id: &str) -> bool {
+    (1..=MAX_REMOTE_ID_LEN).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
 #[cfg(test)]
@@ -291,6 +347,49 @@ mod tests {
         assert_eq!(
             NodeConfig::parse(&Value::Null).unwrap(),
             NodeConfig::default()
+        );
+    }
+
+    #[test]
+    fn remote_id_rules_and_the_instance_id() {
+        let remote = |extra: serde_json::Value| {
+            let mut config = json!({"launch": "remote", "token": "a-long-enough-shared-secret"});
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            NodeConfig::parse(&config).unwrap()
+        };
+        let cfg = remote(json!({"remote_id": "plant-7:sensor_gw.1"}));
+        assert!(cfg.validate(&no_schema()).is_empty());
+        assert_eq!(cfg.instance_id("node-1"), "plant-7:sensor_gw.1");
+        assert_eq!(
+            remote(json!({})).instance_id("node-1"),
+            "node-1",
+            "defaults to the node id"
+        );
+        for bad in [
+            "",
+            "has space",
+            "ünïcode",
+            &"x".repeat(MAX_REMOTE_ID_LEN + 1),
+        ] {
+            let errors = remote(json!({"remote_id": bad})).validate(&no_schema());
+            assert!(
+                errors[0].contains("config.remote_id must be"),
+                "{bad:?}: {errors:?}"
+            );
+        }
+        let local = NodeConfig::parse(&json!({"remote_id": "x"})).unwrap();
+        assert!(local.validate(&no_schema())[0].contains("only for remote nodes"));
+        assert_eq!(local.instance_id("node-1"), "node-1");
+
+        // An import accepts a remote node without its token; enabling doesn't.
+        let tokenless = NodeConfig::parse(&json!({"launch": "remote"})).unwrap();
+        assert!(tokenless.validate_own().is_empty());
+        assert_eq!(
+            tokenless.validate(&no_schema()),
+            ["config.token is required for remote nodes"]
         );
     }
 

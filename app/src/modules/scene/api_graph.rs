@@ -22,6 +22,8 @@ pub(crate) struct Node {
     pub node_type: String,
     /// The plugin (registry id) this node runs.
     pub plugin_id: String,
+    /// The plugin version the node was configured with, if known.
+    pub plugin_version: Option<String>,
     /// Node config (`launch`, `runtime`, `launch_args`). The token is never returned.
     #[schema(value_type = Object)]
     pub config: Value,
@@ -41,6 +43,7 @@ impl From<service::Node> for Node {
             name: n.name,
             node_type: n.node_type,
             plugin_id: n.plugin_id,
+            plugin_version: n.plugin_version,
             create_time: n.create_time.timestamp_millis(),
             update_time: n.update_time.timestamp_millis(),
         }
@@ -401,7 +404,24 @@ mod tests {
         let svc = f.service;
         let (status, scene) = call(svc, "POST", "/scenes", Some(json!({"name": "demo"}))).await;
         assert_eq!((status, &scene["enabled"]), (StatusCode::OK, &json!(false)));
+        assert_eq!(scene["max_hops"], Value::Null, "server default");
         let sid = scene["id"].as_str().unwrap();
+        let (status, updated) = call(
+            svc,
+            "PUT",
+            &format!("/scenes/by-id/{sid}"),
+            Some(json!({"name": "demo", "max_hops": 64})),
+        )
+        .await;
+        assert_eq!((status, &updated["max_hops"]), (StatusCode::OK, &json!(64)));
+        let (status, err) = call(
+            svc,
+            "PUT",
+            &format!("/scenes/by-id/{sid}"),
+            Some(json!({"name": "demo", "max_hops": 0})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{err}");
 
         let (status, src) = call(
             svc,

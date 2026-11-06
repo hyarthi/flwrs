@@ -1,0 +1,11 @@
+{
+  "name": "http-sink-node-example",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Demo flwrs sink plugin. Not for real use.",
+  "engines": { "node": ">=23.6" },
+  "scripts": { "check": "tsc --noEmit" },
+  "dependencies": { "protobufjs": "^8.8.1" },
+  "devDependencies": { "@types/node": "^26.6.6", "typescript": "^7.0.2" }
+}

@@ -1,5 +1,16 @@
-//! Edge mappings (`scene_edges.mapping`). For now: the JSON shape and its
-//! validation. Evaluation (dot notation, Lua) comes with the mapping phases.
+//! Edge mappings (`scene_edges.mapping`): the JSON shape and its validation
+//! (here), the typed value model ([`value`]), dot paths ([`path`]) and
+//! compiling and applying a mapping ([`compile`]): dot-notation rules always,
+//! and Lua (`lua` rules, `script`, `filter`) with the `mapping-lua` feature
+//! ([`lua`], on by default).
+
+pub(crate) mod compile;
+#[cfg(feature = "mapping-lua")]
+pub(crate) mod lua;
+pub(crate) mod path;
+pub(crate) mod value;
+
+pub(crate) use compile::{Mapping, Schemas, compile};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,7 +59,27 @@ pub(crate) struct MappingSpec {
     pub rules: Option<Vec<Rule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<LuaChunk>,
+    /// Limits for this mapping's Lua code (defaults: 1 000 000 instructions,
+    /// 50 ms, 16 MiB per call / state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lua: Option<LuaLimits>,
 }
+
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LuaLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_instructions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_bytes: Option<u64>,
+}
+
+pub(crate) const MAX_LUA_INSTRUCTIONS: u64 = 1_000_000_000;
+pub(crate) const MAX_LUA_TIMEOUT_MS: u64 = 10_000;
+pub(crate) const MIN_LUA_MEMORY_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_LUA_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
 
 impl MappingSpec {
     /// Parses and checks a mapping. `null` means pass-through (`Ok(None)`).
@@ -69,6 +100,13 @@ impl MappingSpec {
         }
     }
 
+    /// Whether any part of the mapping is Lua (filter, script or a rule).
+    pub(crate) fn uses_lua(&self) -> bool {
+        self.filter.is_some()
+            || self.script.is_some()
+            || self.rules.iter().flatten().any(|r| r.lua.is_some())
+    }
+
     fn validate(&self) -> Vec<String> {
         let mut errors = vec![];
         let mut lua = |label: &str, code: &str| {
@@ -83,6 +121,30 @@ impl MappingSpec {
         }
         if let Some(script) = &self.script {
             lua("mapping.script", &script.lua);
+        }
+        if let Some(limits) = &self.lua {
+            let mut range = |name: &str, value: Option<u64>, min: u64, max: u64| {
+                if let Some(v) = value
+                    && !(min..=max).contains(&v)
+                {
+                    errors.push(format!(
+                        "mapping.lua.{name} must be between {min} and {max}"
+                    ));
+                }
+            };
+            range(
+                "max_instructions",
+                limits.max_instructions,
+                1,
+                MAX_LUA_INSTRUCTIONS,
+            );
+            range("timeout_ms", limits.timeout_ms, 1, MAX_LUA_TIMEOUT_MS);
+            range(
+                "max_memory_bytes",
+                limits.max_memory_bytes,
+                MIN_LUA_MEMORY_BYTES,
+                MAX_LUA_MEMORY_BYTES,
+            );
         }
         match (&self.rules, &self.script) {
             (Some(_), Some(_)) => {
@@ -102,6 +164,14 @@ impl MappingSpec {
                 let label = format!("mapping.rules[{i}]");
                 if rule.target.trim().is_empty() {
                     errors.push(format!("{label}.target is empty"));
+                } else if let Err(e) = path::Path::parse(&rule.target) {
+                    errors.push(format!("{label}.target: {e}"));
+                }
+                if let Some(source) = &rule.source
+                    && !source.trim().is_empty()
+                    && let Err(e) = path::Path::parse(source)
+                {
+                    errors.push(format!("{label}.source: {e}"));
                 }
                 let ops = [
                     rule.source.is_some(),

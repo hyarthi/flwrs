@@ -1,0 +1,10 @@
+{
+  "manifest_version": 1,
+  "id": "http-sink-java-example",
+  "name": "HTTP sink (Java example)",
+  "version": "0.0.1",
+  "type": "SINK",
+  "description": "Demo only: sends an HTTP request for each event.",
+  "executable": "bin/http-sink-java-example",
+  "payload_schemas": { "in": "schema/in.json" }
+}

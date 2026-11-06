@@ -315,7 +315,11 @@ impl log::Log for LogWrapper {
     }
 
     fn log(&self, record: &Record) {
-        if let Some(logger) = LOGGER.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        if let Some(logger) = LOGGER
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
             logger.log(record);
         }
     }

@@ -23,7 +23,25 @@ dir = ".data/plugins"
 # (no admin_token set, and the server listens on 127.0.0.1).
 allow_upload = true
 
-# Not read yet; used once the director exists (see DIRECTOR_PLAN.tmp.md).
+# Where plugins connect. A fixed port so remote/manually started plugins can
+# find it (the default, 0, picks a free port; local plugins are told which).
+[hub]
+host = "127.0.0.1"
+port = 7400
 
+# The director runs the enabled scenes; spill-to-disk files go here.
 [director]
 spool_dir = ".data/scenes"
+
+# Export stats to a local OpenTelemetry collector (e.g. `otelcol` with an
+# OTLP/HTTP receiver on 4318). Uncomment to try it.
+# [telemetry.otlp]
+# endpoint = "http://localhost:4318/v1/metrics"
+# interval_ms = 10000
+
+# Write stats to local files (one entry per format: otlp-json, sqlite, influx,
+# openmetrics). Uncomment to try it.
+# [[telemetry.file]]
+# format = "sqlite"
+# dir = ".data/telemetry"
+# partition = "1h"

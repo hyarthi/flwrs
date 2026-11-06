@@ -128,6 +128,33 @@ pub async fn write_message<W: AsyncWrite + Unpin, M: WireMessage>(
 /// A malformed frame is an `InvalidData` error; the connection should then be
 /// closed, since the stream position can't be trusted.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Frame>> {
+    match read_frame_limited(reader, MAX_PACKET_LEN).await? {
+        None => Ok(None),
+        Some(LimitedFrame::Frame(frame)) => Ok(Some(frame)),
+        // A body can't exceed MAX_PACKET_LEN, which the length check enforces.
+        Some(LimitedFrame::Oversized { .. }) => unreachable!("body within the packet cap"),
+    }
+}
+
+/// Result of [`read_frame_limited`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum LimitedFrame {
+    Frame(Frame),
+    /// The body was larger than the limit. It was read and discarded without
+    /// being buffered, so the stream stays in sync.
+    Oversized {
+        code: MsgCode,
+        body_len: usize,
+    },
+}
+
+/// Reads one frame, but skips bodies larger than `max_body` bytes instead of
+/// buffering them. Use it where the peer isn't trusted with large
+/// allocations, e.g. on the hub. Errors are as for [`read_frame`].
+pub async fn read_frame_limited<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_body: usize,
+) -> io::Result<Option<LimitedFrame>> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -139,25 +166,38 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Opti
         return Err(invalid_data(format!("invalid packet length {packet_len}")));
     }
 
-    let mut packet = vec![0u8; packet_len];
-    reader.read_exact(&mut packet).await?;
-
-    let header_len = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]) as usize;
+    reader.read_exact(&mut len_buf).await?;
+    let header_len = u32::from_le_bytes(len_buf) as usize;
     if header_len > MAX_HEADER_LEN {
         return Err(invalid_data(format!(
             "header too long ({header_len} bytes, max {MAX_HEADER_LEN})"
         )));
     }
-    let body_start = 4 + header_len;
-    if body_start > packet_len {
+    if 4 + header_len > packet_len {
         return Err(invalid_data("header length exceeds packet length"));
     }
-    let code = parse_header(&packet[4..body_start]).map_err(invalid_data)?;
+    let mut header = vec![0u8; header_len];
+    reader.read_exact(&mut header).await?;
+    let code = parse_header(&header).map_err(invalid_data)?;
 
-    Ok(Some(Frame {
+    let body_len = packet_len - 4 - header_len;
+    if body_len > max_body {
+        let skipped = tokio::io::copy(
+            &mut (&mut *reader).take(body_len as u64),
+            &mut tokio::io::sink(),
+        )
+        .await?;
+        if skipped < body_len as u64 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        return Ok(Some(LimitedFrame::Oversized { code, body_len }));
+    }
+    let mut body = vec![0u8; body_len];
+    reader.read_exact(&mut body).await?;
+    Ok(Some(LimitedFrame::Frame(Frame {
         code,
-        body: Bytes::from(packet).slice(body_start..),
-    }))
+        body: Bytes::from(body),
+    })))
 }
 
 /// Parses the header block and returns its `Msg-Code`.
@@ -179,7 +219,10 @@ fn parse_header(header: &[u8]) -> Result<MsgCode, String> {
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| format!("invalid header line {line:?}"))?;
-        if name.is_empty() || name.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        if name.is_empty()
+            || name
+                .bytes()
+                .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
         {
             return Err(format!("invalid header name {name:?}"));
         }
@@ -322,22 +365,40 @@ mod tests {
         let cases: &[(&[u8], &str)] = &[
             (b"Version: 1.0.0\r\n", "missing Msg-Code"),
             (b"Msg-Code: 1\r\n", "missing Version"),
-            (b"Version: 2.0.0\r\nMsg-Code: 1\r\n", "unsupported protocol version"),
+            (
+                b"Version: 2.0.0\r\nMsg-Code: 1\r\n",
+                "unsupported protocol version",
+            ),
             (b"1.0.0", "header must end with a line break"),
             (b"Version: 1.0.0\r\nMsg-Code: 1", "header must end"),
-            (b"Version: 1.0.0\r\nMsg-Code: 1\r\nMsg-Code: 1\r\n", "duplicate"),
-            (b"Version: 1.0.0\r\nversion: 1.0.0\r\nMsg-Code: 1\r\n", "duplicate"),
+            (
+                b"Version: 1.0.0\r\nMsg-Code: 1\r\nMsg-Code: 1\r\n",
+                "duplicate",
+            ),
+            (
+                b"Version: 1.0.0\r\nversion: 1.0.0\r\nMsg-Code: 1\r\n",
+                "duplicate",
+            ),
             (b"Version: 1.0.0\r\nMsg-Code: 0\r\n", "unknown Msg-Code"),
             (b"Version: 1.0.0\r\nMsg-Code: 99\r\n", "unknown Msg-Code"),
             (b"Version: 1.0.0\r\nMsg-Code: -1\r\n", "invalid Msg-Code"),
             (b"Version: 1.0.0\r\nMsg-Code: one\r\n", "invalid Msg-Code"),
             (b"Version: 1.0.0\r\nMsg-Code: \r\n", "invalid Msg-Code"),
-            (b"Version: 1.0.0\r\nMsg-Code: 99999999999\r\n", "unknown Msg-Code"),
-            (b"Version: 1.0.0\r\n\r\nMsg-Code: 1\r\n", "invalid header line"),
+            (
+                b"Version: 1.0.0\r\nMsg-Code: 99999999999\r\n",
+                "unknown Msg-Code",
+            ),
+            (
+                b"Version: 1.0.0\r\n\r\nMsg-Code: 1\r\n",
+                "invalid header line",
+            ),
             (b"Version 1.0.0\r\nMsg-Code: 1\r\n", "invalid header line"),
             (b"Msg Code: 1\r\nVersion: 1.0.0\r\n", "invalid header name"),
             (b": 1\r\nVersion: 1.0.0\r\n", "invalid header name"),
-            ("Version: 1.0.0\r\nMsg-Code: 1\r\nX: \u{e9}\r\n".as_bytes(), "non-ASCII"),
+            (
+                "Version: 1.0.0\r\nMsg-Code: 1\r\nX: \u{e9}\r\n".as_bytes(),
+                "non-ASCII",
+            ),
             (b"", "missing Version"),
         ];
         for (header, expected) in cases {
@@ -355,6 +416,25 @@ mod tests {
         let mut header = b"Version: 1.0.0\r\nMsg-Code: 1\r\n".to_vec();
         header.extend_from_slice(format!("X-Pad: {}\r\n", "a".repeat(MAX_HEADER_LEN)).as_bytes());
         assert!(rejected(&header).await.contains("header too long"));
+    }
+
+    #[tokio::test]
+    async fn limited_read_skips_oversized_bodies_and_stays_in_sync() {
+        let mut bytes = encode_frame(MsgCode::SinkMessage, &[7u8; 100]);
+        bytes.extend(encode_frame(MsgCode::SinkMessage, b"small"));
+        let mut reader = bytes.as_slice();
+        assert_eq!(
+            read_frame_limited(&mut reader, 10).await.unwrap(),
+            Some(LimitedFrame::Oversized {
+                code: MsgCode::SinkMessage,
+                body_len: 100
+            })
+        );
+        match read_frame_limited(&mut reader, 10).await.unwrap() {
+            Some(LimitedFrame::Frame(frame)) => assert_eq!(&frame.body[..], b"small"),
+            other => panic!("expected a frame, got {other:?}"),
+        }
+        assert_eq!(read_frame_limited(&mut reader, 10).await.unwrap(), None);
     }
 
     #[tokio::test]

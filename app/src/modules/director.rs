@@ -1,8 +1,15 @@
 //! The director: runs scene workflows. Other services talk to it through
 //! [`DirectorHandle`].
 
+mod config;
+mod engine;
 pub(crate) mod handle;
+pub(crate) mod queue;
+pub(crate) mod running;
 mod service;
+// The tests run real plugin processes through shell scripts.
+#[cfg(all(test, unix))]
+mod tests;
 
 pub(crate) use handle::DirectorHandle;
 use std::sync::OnceLock;

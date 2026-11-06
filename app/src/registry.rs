@@ -8,6 +8,11 @@ pub async fn build_registry() -> ServiceRegistry {
     log::debug!("Registering director service");
     registry.register_service(crate::modules::director::service());
 
+    if let Some(telemetry) = crate::modules::telemetry::service() {
+        log::debug!("Registering telemetry service");
+        registry.register_service(telemetry);
+    }
+
     // HTTP
     log::debug!("Registering HTTP service");
     registry.register_service(http::server());

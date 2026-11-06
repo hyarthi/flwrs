@@ -6,6 +6,7 @@ use clap::Parser;
 use flwrs_plugin::plugin::core::ConnectionConfig;
 use flwrs_plugin::schema::common::log_level::Enum as LogLevel;
 use flwrs_plugin::sink::runner::{SinkRunner, SinkRunnerConfig};
+use std::process::ExitCode;
 use std::time::Duration;
 
 /// flwrs sink plugin to send an HTTP request
@@ -51,7 +52,7 @@ pub(crate) struct Args {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     println!("Starting plugin...");
     let args = Args::parse();
 
@@ -65,7 +66,7 @@ async fn main() {
         Ok(plugin) => plugin,
         Err(err) => {
             eprintln!("Failed to initialize plugin: {}", err);
-            return;
+            return ExitCode::FAILURE;
         }
     };
     let log_level = match args.log_level.as_str() {
@@ -85,18 +86,21 @@ async fn main() {
         Ok(runner) => runner,
         Err(err) => {
             eprintln!("Failed to initialize sink runner: {}", err);
-            return;
+            return ExitCode::FAILURE;
         }
     };
 
-    match runner.run().await {
-        Ok(_) => (),
+    // Non-zero when the run failed or the hub rejected the plugin, so a
+    // supervisor or operator can tell.
+    let code = match runner.run().await {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            log::error!("Plugin crashed: {}", err);
+            log::error!("Plugin stopped with an error: {}", err);
+            ExitCode::FAILURE
         }
     };
-
     log::debug!("Plugin stopped");
+    code
 }
 
 /// Keeps the package files (`manifest.json`, `schema/*.json`) in sync with the code.

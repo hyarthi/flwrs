@@ -114,8 +114,11 @@ impl<T: Transform> TransformRunner<T> {
                         }
                         Err(err) => {
                             log::error!("Error processing event: {err}");
-                            let error =
-                                error_event(&self.plugin_id, PluginType::Transform, err.to_string());
+                            let error = error_event(
+                                &self.plugin_id,
+                                PluginType::Transform,
+                                err.to_string(),
+                            );
                             (Payload::Error(error), Stage::Initializing)
                         }
                     };

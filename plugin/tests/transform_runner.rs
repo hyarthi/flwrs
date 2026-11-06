@@ -3,7 +3,9 @@ mod common;
 use common::{FakeHub, connection, listen};
 use flwrs_plugin::plugin::core::InitializeRequest;
 use flwrs_plugin::plugin::error::{InitializeError, ShutdownError, TransformError};
-use flwrs_plugin::schema::common::{EventMetadata, InitializeResponse, log_level::Enum as LogLevel};
+use flwrs_plugin::schema::common::{
+    EventMetadata, InitializeResponse, log_level::Enum as LogLevel,
+};
 use flwrs_plugin::schema::schema::{Field, FieldValue, PluginPayload, field_value::Value};
 use flwrs_plugin::schema::transform::{
     RuntimeTransformMessage, TransformEvent, TransformMessage, runtime_transform_message,

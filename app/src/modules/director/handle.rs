@@ -1,6 +1,8 @@
 //! In-process interface to the director: how the scene and plugin services
 //! ask it to (re)load or stop a scene's workflow.
 
+use super::running::NodeReport;
+use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
@@ -12,14 +14,67 @@ pub(crate) enum DirectorError {
     #[error("the director isn't running")]
     Unavailable,
     #[error("{0}")]
-    #[allow(dead_code)] // reported by the real director (later phase)
     Failed(String),
 }
 
 /// Run-time state of a scene, as reported by the director.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
 pub(crate) struct SceneStatus {
-    pub running: bool,
+    pub state: SceneState,
+    /// Why the scene couldn't start (state `FAILED`).
+    pub errors: Vec<String>,
+    /// The hop limit in effect while running (the scene's or the default).
+    pub max_hops: Option<u32>,
+    pub nodes: Vec<NodeReport>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum SceneState {
+    Running,
+    Stopped,
+    /// The scene failed its load-time checks; nothing of it runs.
+    Failed,
+}
+
+/// The whole server's run-time picture.
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+pub(crate) struct Overview {
+    /// Where plugins connect.
+    pub hub_address: String,
+    /// The hub-wide budget for queued events (`[hub] max_inflight_bytes`).
+    pub queued_memory: Usage,
+    /// Spilling queues' memory (`[director] memory_soft_inflight_bytes`, a soft limit).
+    pub spill_memory: Usage,
+    /// All spool files (`[director] spill_max_bytes`).
+    pub spill_disk: Usage,
+    /// Scenes the director has handled since it started.
+    pub scenes: Vec<SceneSummary>,
+}
+
+/// Everything the director knows right now, for telemetry sinks.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StatsSnapshot {
+    pub overview: Overview,
+    /// `(scene id, status)`, sorted by id.
+    pub scenes: Vec<(String, SceneStatus)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+pub(crate) struct Usage {
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+pub(crate) struct SceneSummary {
+    pub scene_id: String,
+    pub state: SceneState,
+    pub nodes: usize,
+    /// Nodes whose plugin is connected and accepted.
+    pub running_nodes: usize,
+    /// Why it couldn't start, if it failed.
+    pub errors: usize,
 }
 
 #[derive(Debug)]
@@ -37,6 +92,14 @@ pub(crate) enum DirectorCommand {
     Status {
         scene_id: String,
         reply: oneshot::Sender<Option<SceneStatus>>,
+    },
+    Overview {
+        reply: oneshot::Sender<Overview>,
+    },
+    /// The overview plus every scene's full status (for telemetry sinks).
+    #[cfg_attr(not(feature = "otel"), allow(dead_code))]
+    Snapshot {
+        reply: oneshot::Sender<StatsSnapshot>,
     },
 }
 
@@ -69,7 +132,7 @@ impl DirectorHandle {
     }
 
     /// Reloads the scene and waits until the director is done.
-    #[allow(dead_code)] // used by later phases (e.g. a synchronous reload endpoint)
+    #[allow(dead_code)] // used by tests; kept for a synchronous reload endpoint
     pub(crate) async fn reload(&self, scene_id: &str) -> Result<(), DirectorError> {
         let (done, wait) = oneshot::channel();
         self.tx
@@ -82,7 +145,6 @@ impl DirectorHandle {
         wait.await.map_err(|_| DirectorError::Unavailable)?
     }
 
-    #[allow(dead_code)] // used by the status endpoint (later phase)
     pub(crate) async fn status(
         &self,
         scene_id: &str,
@@ -93,6 +155,27 @@ impl DirectorHandle {
                 scene_id: scene_id.to_string(),
                 reply,
             })
+            .await
+            .map_err(|_| DirectorError::Unavailable)?;
+        wait.await.map_err(|_| DirectorError::Unavailable)
+    }
+
+    /// Every scene's state, plus hub-wide memory and disk use.
+    pub(crate) async fn overview(&self) -> Result<Overview, DirectorError> {
+        let (reply, wait) = oneshot::channel();
+        self.tx
+            .send(DirectorCommand::Overview { reply })
+            .await
+            .map_err(|_| DirectorError::Unavailable)?;
+        wait.await.map_err(|_| DirectorError::Unavailable)
+    }
+
+    /// The overview and every scene's status, in one round.
+    #[cfg_attr(not(feature = "otel"), allow(dead_code))]
+    pub(crate) async fn snapshot(&self) -> Result<StatsSnapshot, DirectorError> {
+        let (reply, wait) = oneshot::channel();
+        self.tx
+            .send(DirectorCommand::Snapshot { reply })
             .await
             .map_err(|_| DirectorError::Unavailable)?;
         wait.await.map_err(|_| DirectorError::Unavailable)

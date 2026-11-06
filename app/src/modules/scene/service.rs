@@ -1,7 +1,9 @@
 mod query_sqlite;
+mod transfer;
 
 use crate::modules::director::DirectorHandle;
-use crate::modules::mapping::MappingSpec;
+use crate::modules::director::handle::{SceneState, SceneStatus};
+use crate::modules::mapping::{self, MappingSpec};
 use crate::modules::node_config::{NodeConfig, PluginRules, WhenFull};
 use crate::modules::plugin::service::{
     Plugin, Service as PluginService, ServiceError as PluginError,
@@ -9,10 +11,13 @@ use crate::modules::plugin::service::{
 use crate::modules::scene::graph;
 use chrono::Local;
 use flwrs_core::db::{Database, DbError};
+use flwrs_plugin::schema::rules;
+use flwrs_plugin::schema::schema::SchemaDefinition;
 use query_sqlite::{EdgeValues, NodeValues};
 use serde_json::Value;
 use sqlx::Connection;
 use sqlx::error::ErrorKind;
+use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use ulid::Ulid;
@@ -24,6 +29,8 @@ pub(crate) struct Scene {
     pub id: String,
     pub name: String,
     pub enabled: bool,
+    /// Hop limit for this scene; `None` = the server default.
+    pub max_hops: Option<u32>,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
 }
@@ -36,6 +43,7 @@ pub(crate) struct NodeRow {
     #[sqlx(rename = "type")]
     pub node_type: String,
     pub plugin_id: String,
+    pub plugin_version: Option<String>,
     pub config: String,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
@@ -47,9 +55,15 @@ pub(crate) struct Node {
     pub id: String,
     pub name: Option<String>,
     pub scene_id: String,
-    /// SOURCE, SINK or TRANSFORM (always the plugin's type).
+    /// SOURCE, SINK or TRANSFORM. Created through the API it's the plugin's
+    /// type; an imported node keeps its type even if this server's plugin
+    /// differs (then the scene has a problem).
     pub node_type: String,
+    /// Registry id of the plugin. Not a foreign key: an imported scene may
+    /// name a plugin this server doesn't have.
     pub plugin_id: String,
+    /// The plugin version the node was configured with, if known.
+    pub plugin_version: Option<String>,
     pub config: NodeConfig,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
@@ -71,6 +85,7 @@ impl TryFrom<NodeRow> for Node {
             scene_id: row.scene_id,
             node_type: row.node_type,
             plugin_id: row.plugin_id,
+            plugin_version: row.plugin_version,
             config,
             create_time: row.create_time,
             update_time: row.update_time,
@@ -102,6 +117,16 @@ pub(crate) struct Edge {
     pub mapping: Option<Value>,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
+}
+
+/// What the director runs: a scene, its graph, and the registry entries of
+/// the plugins its nodes use (a missing entry means the plugin isn't registered).
+#[derive(Debug, Clone)]
+pub(crate) struct SceneSnapshot {
+    pub scene: Scene,
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+    pub plugins: HashMap<String, crate::modules::plugin::service::Plugin>,
 }
 
 impl From<EdgeRow> for Edge {
@@ -151,6 +176,9 @@ pub(crate) enum ServiceError {
     Connection(#[from] DbError),
     #[error("unknown error occurred: {0}")]
     Unknown(String),
+    /// A service this one needs (e.g. the director) isn't answering.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 impl From<sqlx::Error> for ServiceError {
@@ -201,6 +229,11 @@ pub(crate) struct Service {
 
 type Conn = sqlx::pool::PoolConnection<sqlx::Sqlite>;
 
+/// Write transactions take SQLite's write lock up front. A deferred one
+/// would read first and then fail with "database is locked" (instead of
+/// waiting) if it can't upgrade to a write.
+const WRITE_TX: &str = "BEGIN IMMEDIATE";
+
 impl Service {
     pub(crate) fn new(
         db: &'static Database,
@@ -230,22 +263,35 @@ impl Service {
             .map_err(not_found("scene"))
     }
 
-    pub(crate) async fn create_scene(&self, name: &str) -> Result<Scene, ServiceError> {
-        let name = required_name(name)?;
+    pub(crate) async fn create_scene(&self, input: &SceneInput) -> Result<Scene, ServiceError> {
+        let (name, max_hops) = check_scene(input)?;
         let mut conn = self.conn().await?;
-        let scene =
-            query_sqlite::create_scene(&mut conn, &Ulid::generate().to_string(), &name).await?;
+        let id = Ulid::generate().to_string();
+        let scene = query_sqlite::create_scene(&mut conn, &id, &name, max_hops).await?;
         log::debug!("Scene service: created scene [{}]", scene.id);
         Ok(scene)
     }
 
-    pub(crate) async fn update_scene(&self, id: &str, name: &str) -> Result<Scene, ServiceError> {
-        let name = required_name(name)?;
+    /// Replaces the scene's settings (name, hop limit).
+    pub(crate) async fn update_scene(
+        &self,
+        id: &str,
+        input: &SceneInput,
+    ) -> Result<Scene, ServiceError> {
+        let (name, max_hops) = check_scene(input)?;
+        let _guard = self.lock.lock().await;
         let mut conn = self.conn().await?;
-        // A rename doesn't change the workflow, so the director isn't told.
-        query_sqlite::update_scene(&mut conn, id, &name)
+        let before = query_sqlite::get_scene(&mut conn, id)
             .await
-            .map_err(not_found("scene"))
+            .map_err(not_found("scene"))?;
+        let scene = query_sqlite::update_scene(&mut conn, id, &name, max_hops)
+            .await
+            .map_err(not_found("scene"))?;
+        // A rename doesn't change the workflow; a new hop limit does.
+        if scene.enabled && scene.max_hops != before.max_hops {
+            self.director.request_reload(id);
+        }
+        Ok(scene)
     }
 
     pub(crate) async fn delete_scene(&self, id: &str) -> Result<(), ServiceError> {
@@ -289,25 +335,11 @@ impl Service {
             return Ok(scene);
         }
         if enabled {
-            let mut problems = vec![];
-            for node in query_sqlite::list_nodes(&mut conn, id).await? {
-                match self.plugins.get(&node.plugin_id).await {
-                    Ok(plugin) if self.plugins.is_installed(&plugin) => {}
-                    Ok(_) => problems.push(format!(
-                        "node {}: plugin {} is registered but its files are missing",
-                        node.id, node.plugin_id
-                    )),
-                    Err(PluginError::NotFound) => problems.push(format!(
-                        "node {}: plugin {} isn't registered",
-                        node.id, node.plugin_id
-                    )),
-                    Err(e) => return Err(ServiceError::Unknown(e.to_string())),
-                }
-            }
-            if !problems.is_empty() {
+            let check = self.check_nodes(&mut conn, id).await?;
+            if !check.problems.is_empty() {
                 return Err(ServiceError::Conflict(
                     "scene can't be enabled".into(),
-                    problems,
+                    check.problems,
                 ));
             }
         }
@@ -322,6 +354,209 @@ impl Service {
             if enabled { "enabled" } else { "disabled" }
         );
         Ok(scene)
+    }
+
+    /// Whether the scene can run on this server, and why not. Enabling is
+    /// refused while there are problems. A scene created here normally has
+    /// none; an imported one (or one whose plugin was removed or replaced)
+    /// may.
+    pub(crate) async fn check(&self, id: &str) -> Result<SceneCheck, ServiceError> {
+        let mut conn = self.conn().await?;
+        query_sqlite::get_scene(&mut conn, id)
+            .await
+            .map_err(not_found("scene"))?;
+        self.check_nodes(&mut conn, id).await
+    }
+
+    async fn check_nodes(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        scene_id: &str,
+    ) -> Result<SceneCheck, ServiceError> {
+        let mut check = SceneCheck::default();
+        for row in query_sqlite::list_nodes(conn, scene_id).await? {
+            let node = Node::try_from(row)?;
+            let label = match &node.name {
+                Some(name) => format!("node {} ({name})", node.id),
+                None => format!("node {}", node.id),
+            };
+            let plugin = match self.plugins.get(&node.plugin_id).await {
+                Ok(plugin) => plugin,
+                Err(PluginError::NotFound) => {
+                    check.problems.push(format!(
+                        "{label}: plugin {} isn't installed on this server",
+                        node.plugin_id
+                    ));
+                    // What doesn't depend on the plugin can still be listed.
+                    check
+                        .problems
+                        .extend(node.config.missing_token().map(|p| format!("{label}: {p}")));
+                    continue;
+                }
+                Err(e) => return Err(ServiceError::Unknown(e.to_string())),
+            };
+            if !self.plugins.is_installed(&plugin) {
+                check.problems.push(format!(
+                    "{label}: plugin {} is registered but its files are missing",
+                    plugin.id
+                ));
+            }
+            if plugin.plugin_type != node.node_type {
+                check.problems.push(format!(
+                    "{label}: it's a {}, but plugin {} on this server is a {}",
+                    node.node_type, plugin.id, plugin.plugin_type
+                ));
+                continue;
+            }
+            if let Some(version) = &node.plugin_version
+                && *version != plugin.version
+            {
+                check.warnings.push(format!(
+                    "{label}: configured with plugin {} {version}; this server has {}",
+                    plugin.id, plugin.version
+                ));
+            }
+            check.problems.extend(
+                validate_against_plugin(&node.config, &plugin)?
+                    .into_iter()
+                    .map(|p| format!("{label}: {p}")),
+            );
+        }
+        // Mappings, against this server's plugin schemas.
+        for edge in query_sqlite::list_edges(conn, scene_id).await? {
+            let Some(mapping) = edge.mapping.as_deref() else {
+                continue;
+            };
+            let spec = serde_json::from_str::<Value>(mapping)
+                .ok()
+                .and_then(|v| MappingSpec::parse(&v).ok().flatten());
+            let Some(spec) = spec else {
+                check.problems.push(format!(
+                    "edge {} → {}: the stored mapping is unreadable",
+                    edge.source_node_id, edge.target_node_id
+                ));
+                continue;
+            };
+            let (source, target) = self
+                .edge_schemas(conn, scene_id, &edge.source_node_id, &edge.target_node_id)
+                .await?;
+            if let Err(errors) = mapping::compile(
+                &spec,
+                mapping::Schemas {
+                    source: source.as_ref(),
+                    target: target.as_ref(),
+                },
+            ) {
+                check.problems.extend(errors.into_iter().map(|e| {
+                    format!(
+                        "edge {} → {}: {e}",
+                        edge.source_node_id, edge.target_node_id
+                    )
+                }));
+            }
+        }
+        Ok(check)
+    }
+
+    /// The source node's `out` and the target node's `in` schema, from their
+    /// plugins, where those are installed with the node's type.
+    async fn edge_schemas(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        scene_id: &str,
+        source_node_id: &str,
+        target_node_id: &str,
+    ) -> Result<(Option<SchemaDefinition>, Option<SchemaDefinition>), ServiceError> {
+        let mut schemas = [None, None];
+        for (slot, (node_id, side)) in schemas
+            .iter_mut()
+            .zip([(source_node_id, "out"), (target_node_id, "in")])
+        {
+            let Ok(node) = query_sqlite::get_node(conn, scene_id, node_id).await else {
+                continue;
+            };
+            let plugin = match self.plugins.get(&node.plugin_id).await {
+                Ok(plugin) if plugin.plugin_type == node.node_type => plugin,
+                Ok(_) | Err(PluginError::NotFound) => continue,
+                Err(e) => return Err(ServiceError::Unknown(e.to_string())),
+            };
+            let json = if side == "out" {
+                plugin.out_schema
+            } else {
+                plugin.in_schema
+            };
+            *slot = json.as_deref().and_then(|j| rules::parse_json(j).ok());
+        }
+        let [source, target] = schemas;
+        Ok((source, target))
+    }
+
+    /// The scene's run-time status from the director. A scene it hasn't run
+    /// (e.g. disabled since the server started) reports `STOPPED`.
+    pub(crate) async fn runtime_status(
+        &self,
+        id: &str,
+    ) -> Result<(Scene, SceneStatus), ServiceError> {
+        let scene = self.get_scene(id).await?;
+        let status = self
+            .director
+            .status(id)
+            .await
+            .map_err(|e| ServiceError::Unavailable(format!("director: {e}")))?
+            .unwrap_or(SceneStatus {
+                state: SceneState::Stopped,
+                errors: vec![],
+                max_hops: None,
+                nodes: vec![],
+            });
+        Ok((scene, status))
+    }
+
+    // ----- for the director -----
+
+    /// Ids of the scenes that should run.
+    pub(crate) async fn enabled_scene_ids(&self) -> Result<Vec<String>, ServiceError> {
+        let mut conn = self.conn().await?;
+        Ok(query_sqlite::enabled_scene_ids(&mut conn).await?)
+    }
+
+    /// A scene with its whole graph and the registry entries of its plugins,
+    /// read under the service lock, so it never reflects a half-applied change.
+    pub(crate) async fn snapshot(&self, id: &str) -> Result<SceneSnapshot, ServiceError> {
+        let _guard = self.lock.lock().await;
+        let mut conn = self.conn().await?;
+        let scene = query_sqlite::get_scene(&mut conn, id)
+            .await
+            .map_err(not_found("scene"))?;
+        let nodes = query_sqlite::list_nodes(&mut conn, id)
+            .await?
+            .into_iter()
+            .map(Node::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        let edges: Vec<Edge> = query_sqlite::list_edges(&mut conn, id)
+            .await?
+            .into_iter()
+            .map(Edge::from)
+            .collect();
+        let mut plugins = HashMap::new();
+        for node in &nodes {
+            if plugins.contains_key(&node.plugin_id) {
+                continue;
+            }
+            match self.plugins.get(&node.plugin_id).await {
+                Ok(plugin) => {
+                    plugins.insert(node.plugin_id.clone(), plugin);
+                }
+                Err(PluginError::NotFound) => {}
+                Err(e) => return Err(ServiceError::Unknown(e.to_string())),
+            }
+        }
+        Ok(SceneSnapshot {
+            scene,
+            nodes,
+            edges,
+            plugins,
+        })
     }
 
     // ----- nodes -----
@@ -354,7 +589,7 @@ impl Service {
         let _guard = self.lock.lock().await;
         let prepared = self.prepare_node(input, None).await?;
         let mut conn = self.conn().await?;
-        let mut tx = conn.begin().await?;
+        let mut tx = conn.begin_with(WRITE_TX).await?;
         let scene = query_sqlite::get_scene(&mut tx, scene_id)
             .await
             .map_err(not_found("scene"))?;
@@ -386,7 +621,7 @@ impl Service {
             .map_err(not_found("node"))?
             .try_into()?;
         let prepared = self.prepare_node(input, Some(&existing)).await?;
-        let mut tx = conn.begin().await?;
+        let mut tx = conn.begin_with(WRITE_TX).await?;
         let row = query_sqlite::update_node(&mut tx, scene_id, id, &prepared.values()).await?;
         // A new plugin type or queue policy can break edges that were valid before.
         check_graph(&mut tx, scene_id).await?;
@@ -462,6 +697,7 @@ impl Service {
             name,
             node_type: plugin.plugin_type,
             plugin_id: plugin.id,
+            plugin_version: Some(plugin.version),
             config_json: serde_json::to_string(&config).expect("config serializes"),
         })
     }
@@ -548,6 +784,27 @@ impl Service {
                 errors.push(format!("{field} {node_id:?} isn't a node of this scene"));
             }
         }
+        if errors.is_empty()
+            && let Ok(Some(spec)) = MappingSpec::parse(&input.mapping)
+        {
+            let (source, target) = self
+                .edge_schemas(
+                    &mut conn,
+                    scene_id,
+                    &input.source_node_id,
+                    &input.target_node_id,
+                )
+                .await?;
+            if let Err(problems) = mapping::compile(
+                &spec,
+                mapping::Schemas {
+                    source: source.as_ref(),
+                    target: target.as_ref(),
+                },
+            ) {
+                errors.extend(problems);
+            }
+        }
         if !errors.is_empty() {
             return Err(ServiceError::Invalid(errors));
         }
@@ -557,7 +814,7 @@ impl Service {
             target_node_id: &input.target_node_id,
             mapping: mapping.as_deref(),
         };
-        let mut tx = conn.begin().await?;
+        let mut tx = conn.begin_with(WRITE_TX).await?;
         let written = match id {
             None => {
                 query_sqlite::insert_edge(&mut tx, scene_id, &Ulid::generate().to_string(), &values)
@@ -596,6 +853,7 @@ struct PreparedNode {
     name: Option<String>,
     node_type: String,
     plugin_id: String,
+    plugin_version: Option<String>,
     config_json: String,
 }
 
@@ -605,6 +863,7 @@ impl PreparedNode {
             name: self.name.as_deref(),
             node_type: &self.node_type,
             plugin_id: &self.plugin_id,
+            plugin_version: self.plugin_version.as_deref(),
             config: &self.config_json,
         }
     }
@@ -690,6 +949,62 @@ async fn check_graph(
         Ok(())
     } else {
         Err(ServiceError::Invalid(errors))
+    }
+}
+
+/// What [`Service::check`] found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct SceneCheck {
+    /// Why the scene can't be enabled (e.g. a plugin isn't installed, a remote
+    /// node has no token). Empty = it can run.
+    pub problems: Vec<String>,
+    /// Worth knowing, but not blocking (e.g. a different plugin version).
+    pub warnings: Vec<String>,
+}
+
+/// Upper bound for a scene's `max_hops` (the DB has the same CHECK). High
+/// enough for complex scenes; low enough that a typo can't make a cycle
+/// effectively unbounded.
+pub(crate) const MAX_HOPS_LIMIT: u32 = 10_000;
+
+/// A scene's own settings, for create and update.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SceneInput {
+    pub name: String,
+    /// `None` = use the server default (`[director] max_hops`).
+    pub max_hops: Option<u32>,
+}
+
+impl SceneInput {
+    #[cfg(test)]
+    pub(crate) fn named(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            max_hops: None,
+        }
+    }
+}
+
+/// Checks a scene's settings; returns every problem.
+fn check_scene(input: &SceneInput) -> Result<(String, Option<u32>), ServiceError> {
+    let mut problems = vec![];
+    let name = match required_name(&input.name) {
+        Ok(name) => name,
+        Err(ServiceError::Invalid(mut errors)) => {
+            problems.append(&mut errors);
+            String::new()
+        }
+        Err(other) => return Err(other),
+    };
+    if let Some(hops) = input.max_hops
+        && !(1..=MAX_HOPS_LIMIT).contains(&hops)
+    {
+        problems.push(format!("max_hops must be between 1 and {MAX_HOPS_LIMIT}"));
+    }
+    if problems.is_empty() {
+        Ok((name, input.max_hops))
+    } else {
+        Err(ServiceError::Invalid(problems))
     }
 }
 
@@ -787,7 +1102,10 @@ pub(crate) mod tests {
 
     impl Fixture {
         pub(crate) async fn scene(&self) -> Scene {
-            self.service.create_scene("scene").await.unwrap()
+            self.service
+                .create_scene(&SceneInput::named("scene"))
+                .await
+                .unwrap()
         }
 
         pub(crate) async fn node(&self, scene: &str, plugin: &str, config: Value) -> Node {
@@ -817,6 +1135,8 @@ pub(crate) mod tests {
                     DirectorCommand::Reload { scene_id, .. } => format!("reload {scene_id}"),
                     DirectorCommand::Stop { scene_id, .. } => format!("stop {scene_id}"),
                     DirectorCommand::Status { scene_id, .. } => format!("status {scene_id}"),
+                    DirectorCommand::Overview { .. } => "overview".to_string(),
+                    DirectorCommand::Snapshot { .. } => "snapshot".to_string(),
                 });
             }
             out
@@ -1132,11 +1452,26 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        f.service.update_scene(&s.id, "renamed").await.unwrap();
+        f.service
+            .update_scene(&s.id, &SceneInput::named("renamed"))
+            .await
+            .unwrap();
         assert_eq!(
             f.commands().await,
             [format!("reload {}", s.id)],
             "graph change reloads, rename doesn't"
+        );
+        let with_limit = SceneInput {
+            name: "renamed".into(),
+            max_hops: Some(100),
+        };
+        let scene = f.service.update_scene(&s.id, &with_limit).await.unwrap();
+        assert_eq!(scene.max_hops, Some(100));
+        f.service.update_scene(&s.id, &with_limit).await.unwrap();
+        assert_eq!(
+            f.commands().await,
+            [format!("reload {}", s.id)],
+            "a new hop limit reloads; the same one again doesn't"
         );
 
         f.service.set_enabled(&s.id, false).await.unwrap();
@@ -1146,6 +1481,101 @@ pub(crate) mod tests {
         f.commands().await;
         f.service.delete_scene(&s.id).await.unwrap();
         assert_eq!(f.commands().await, [format!("stop {}", s.id)]);
+    }
+
+    #[tokio::test]
+    async fn scene_settings_are_validated() {
+        let f = fixture().await;
+        let bad = SceneInput {
+            name: " ".into(),
+            max_hops: Some(0),
+        };
+        assert_eq!(
+            invalid(f.service.create_scene(&bad).await.unwrap_err()),
+            ["name is empty", "max_hops must be between 1 and 10000"]
+        );
+        let too_high = SceneInput {
+            name: "x".into(),
+            max_hops: Some(MAX_HOPS_LIMIT + 1),
+        };
+        assert!(f.service.create_scene(&too_high).await.is_err());
+        let ok = SceneInput {
+            name: "x".into(),
+            max_hops: Some(MAX_HOPS_LIMIT),
+        };
+        let scene = f.service.create_scene(&ok).await.unwrap();
+        assert_eq!(scene.max_hops, Some(MAX_HOPS_LIMIT));
+        // Back to the server default.
+        let scene = f
+            .service
+            .update_scene(&scene.id, &SceneInput::named("x"))
+            .await
+            .unwrap();
+        assert_eq!(scene.max_hops, None);
+    }
+
+    #[tokio::test]
+    async fn edge_mappings_are_checked_against_the_plugin_schemas() {
+        let f = fixture().await;
+        let s = f.scene().await;
+        let source = f.node(&s.id, "test-source", Value::Null).await;
+        let sink = f.node(&s.id, "test-sink", Value::Null).await;
+        let create = |mapping: Value| {
+            f.service
+                .create_edge(&s.id, edge_input(&source.id, &sink.id, mapping))
+        };
+        // test-sink takes {url: STRING, body: BYTES}.
+        let errors = invalid(
+            create(json!({"rules": [
+                {"target": "nope", "value": "x"},
+                {"target": "url", "value": 5},
+                {"target": "body", "value": "bytes from a string"}
+            ]}))
+            .await
+            .unwrap_err(),
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("no field \"nope\""), "{errors:?}");
+        assert!(errors[1].contains("5 can't be a STRING"), "{errors:?}");
+        // Lua: compiled when saved (with the mapping-lua feature), refused without it.
+        let lua = create(json!({"rules": [{"target": "url", "lua": "return 'x'"}]})).await;
+        #[cfg(feature = "mapping-lua")]
+        {
+            let edge = lua.unwrap();
+            f.service.delete_edge(&s.id, &edge.id).await.unwrap();
+            let errors = invalid(
+                create(json!({"rules": [{"target": "url", "lua": "return ("}]}))
+                    .await
+                    .unwrap_err(),
+            );
+            assert!(errors[0].starts_with("mapping.rules[0].lua:"), "{errors:?}");
+        }
+        #[cfg(not(feature = "mapping-lua"))]
+        {
+            let errors = invalid(lua.unwrap_err());
+            assert!(
+                errors[0].contains("built without Lua support"),
+                "{errors:?}"
+            );
+        }
+        let errors = invalid(
+            create(json!({"rules": [{"target": "a..b", "value": 1}]}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(errors[0].contains("path \"a..b\""), "{errors:?}");
+        create(json!({"mode": "replace", "rules": [{"target": "url", "value": "http://x"}]}))
+            .await
+            .unwrap();
+        assert!(
+            f.service
+                .check(&s.id)
+                .await
+                .unwrap()
+                .problems
+                .iter()
+                .all(|p| !p.contains("mapping"))
+        );
     }
 
     #[tokio::test]

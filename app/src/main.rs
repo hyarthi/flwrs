@@ -12,8 +12,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Application is starting up...");
     log::debug!("Working directory: {}", env::current_dir()?.display());
 
-    // Order matters: the director's handle is used by the plugin and scene
-    // services, and the scene service uses the plugin registry.
+    // Order matters: the hub is bound first (the director will launch plugins
+    // pointing at its address), the director's handle is used by the plugin
+    // and scene services, and the scene service uses the plugin registry.
+    let hub = modules::hub::init().await?;
+    log::info!("Hub bound to {}", hub.local_addr());
     let director = modules::director::init();
     modules::plugin::init(director.clone()).await;
     modules::scene::init(director.clone()).await;

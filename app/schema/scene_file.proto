@@ -1,0 +1,59 @@
+syntax = "proto3";
+
+// A scene exported from one flwrs server, to import into another: the body of
+// a `.flwr` file. The file is
+//
+//   "FLWR" | u32 LE version length | version (ASCII, e.g. "1.0.0") | SceneFile
+//
+// The version is the file format's, not the plugin protocol's. Evolve this
+// message backward compatibly (add fields; never renumber or reuse); a change
+// readers can't skip safely needs a new file version.
+package flwrs.scene_file;
+
+import "google/protobuf/timestamp.proto";
+
+message SceneFile {
+  string name = 1;
+  // The scene's own hop limit; unset = the importing server's default.
+  optional uint32 max_hops = 2;
+  repeated Node nodes = 3;
+  repeated Edge edges = 4;
+  google.protobuf.Timestamp export_time = 5;
+  // Whether remote nodes' tokens are included (export with include_secrets).
+  bool includes_secrets = 6;
+  // Version of the server that wrote the file; informational.
+  string exporter_version = 7;
+}
+
+message PluginType {
+  enum Enum {
+    UNDEFINED = 0;
+    SOURCE = 1;
+    SINK = 2;
+    TRANSFORM = 3;
+  }
+}
+
+message Node {
+  // Identifies the node within this file (its id on the exporting server).
+  // Edges refer to it. An import assigns new ids.
+  string key = 1;
+  optional string name = 2;
+  PluginType.Enum type = 3;
+  // Registry id of the plugin the node runs.
+  string plugin_id = 4;
+  // The plugin version the node was configured with; empty if unknown.
+  string plugin_version = 5;
+  // The node's config as JSON text. JSON rather than google.protobuf.Struct,
+  // which would turn every number into a double (launch_args keep integers).
+  // Remote nodes always have `remote_id`; `token` only with includes_secrets.
+  string config_json = 6;
+}
+
+message Edge {
+  optional string name = 1;
+  string source_key = 2;
+  string target_key = 3;
+  // The edge mapping as JSON text; unset = events pass through unchanged.
+  optional string mapping_json = 4;
+}

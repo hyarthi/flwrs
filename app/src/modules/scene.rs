@@ -3,7 +3,10 @@
 
 pub(crate) mod api;
 pub(crate) mod api_graph;
+pub(crate) mod api_status;
+pub(crate) mod api_transfer;
 pub(crate) mod graph;
+pub(crate) mod scene_file;
 pub(crate) mod service;
 
 use crate::db::main_db;
