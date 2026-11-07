@@ -37,7 +37,11 @@ reqwest = { workspace = true, optional = true } # OTLP/HTTP export (feature otel
 pbjson = { workspace = true, optional = true } # OTLP JSON telemetry files (feature otel)
 flate2 = { workspace = true, optional = true } # gzip for closed telemetry files (feature telemetry-file)
 pbjson-types.workspace = true # Timestamp in event metadata
-prost.workspace = true # scene export files (.flwr)
+rustls = { workspace = true, optional = true } # TLS listener for remote plugins (feature remote)
+tokio-rustls = { workspace = true, optional = true }
+x509-parser = { workspace = true, optional = true } # client certificate names (mTLS)
+prost.workspace = true # scene export files (.flwr), protocol messages
+bytes.workspace = true # opaque event bodies
 prost-types.workspace = true
 
 [target.'cfg(unix)'.dependencies]
@@ -47,7 +51,7 @@ nix.workspace = true # SIGTERM / SIGKILL to plugin process groups (safe API)
 windows-sys.workspace = true # Ctrl-Break and Job Objects for plugin processes
 
 [features]
-default = ["mapping-lua", "otel", "telemetry-file"]
+default = ["mapping-lua", "otel", "telemetry-file", "remote"]
 # Lua edge mappings (lua rules, script, filter). On by default; build with
 # --no-default-features for targets without a working C toolchain or with very
 # little flash. Without it, scenes with Lua mappings can be imported but not run.
@@ -59,6 +63,11 @@ otel = ["dep:reqwest", "dep:pbjson"]
 # JSON Lines (with otel), SQLite, InfluxDB line protocol, OpenMetrics). On by
 # default; minimal edge builds can leave it out.
 telemetry-file = ["dep:flate2"]
+# Remote plugins: nodes with `launch = "remote"` (pre-shared tokens, remote_id),
+# and the TLS listener ([hub.tls], rustls) with optional client certificates
+# (mTLS). On by default; a bare build for a small edge device can leave it
+# out, and then only runs local plugins over loopback.
+remote = ["dep:rustls", "dep:tokio-rustls", "dep:x509-parser", "flwrs-plugin/tls"]
 
 [build-dependencies]
 prost-build.workspace = true
@@ -70,3 +79,4 @@ tempfile.workspace = true
 toml.workspace = true # parsing config snippets in tests
 tower.workspace = true
 http-body-util.workspace = true
+rcgen.workspace = true # test certificates (TLS / mTLS tests)

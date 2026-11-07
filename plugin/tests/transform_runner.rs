@@ -1,21 +1,19 @@
 mod common;
 
-use common::{FakeHub, connection, listen};
-use flwrs_plugin::plugin::core::InitializeRequest;
+use common::{FakeHub, connection, listen, payload, text};
+use flwrs_plugin::plugin::core::{InboundEvent, InitializeRequest};
 use flwrs_plugin::plugin::error::{InitializeError, ShutdownError, TransformError};
-use flwrs_plugin::schema::common::{
-    EventMetadata, InitializeResponse, log_level::Enum as LogLevel,
-};
-use flwrs_plugin::schema::schema::{Field, FieldValue, PluginPayload, field_value::Value};
-use flwrs_plugin::schema::transform::{
-    RuntimeTransformMessage, TransformEvent, TransformMessage, runtime_transform_message,
-    transform_message::Payload,
+use flwrs_plugin::schema::payload::{FieldValue, PluginPayload, field_value::Value};
+use flwrs_plugin::schema::protocol::{
+    Ack, Credit, Event, Exit, Nack, capability::Enum as Capability, log_level::Enum as LogLevel,
+    msg_code::Enum as MsgCode, plugin_type::Enum as PluginType,
 };
 use flwrs_plugin::transform::local_sink::LocalSink;
 use flwrs_plugin::transform::plugin::Transform;
 use flwrs_plugin::transform::runner::{TransformRunner, TransformRunnerConfig};
 
-/// Upper-cases every string field.
+/// Upper-cases every string field. "split" gives two outputs, "drop" none,
+/// an event without fields fails.
 struct Upper;
 
 impl Transform for Upper {
@@ -35,108 +33,80 @@ impl Transform for Upper {
     }
     fn process_event(
         &mut self,
-        mut event: TransformEvent,
-    ) -> Result<TransformEvent, TransformError> {
-        let payload = event
-            .payload
-            .as_mut()
-            .ok_or(TransformError::new("no payload"))?;
-        for field in &mut payload.fields {
+        mut event: InboundEvent,
+    ) -> Result<Vec<PluginPayload>, TransformError> {
+        if event.payload.fields.is_empty() {
+            return Err(TransformError::new("no fields"));
+        }
+        let mut word = String::new();
+        for field in &mut event.payload.fields {
             if let Some(FieldValue {
                 value: Some(Value::String(s)),
             }) = &mut field.value
             {
+                word = s.clone();
                 *s = s.to_uppercase();
             }
         }
-        // A fresh output event: the runner must copy the input's metadata.
-        Ok(TransformEvent {
-            metadata: None,
-            ..event
+        Ok(match word.as_str() {
+            "drop" => vec![],
+            "split" => vec![event.payload.clone(), event.payload],
+            _ => vec![event.payload],
         })
     }
 }
 
-fn is_log(msg: &TransformMessage) -> bool {
-    matches!(msg.payload, Some(Payload::Log(_)))
+fn output(frame: &flwrs_plugin::plugin::frame::Frame) -> (u64, u64, PluginPayload) {
+    assert_eq!(frame.code(), MsgCode::Event, "{frame:?}");
+    let event: Event = frame.decode().unwrap();
+    (frame.header.seq, frame.header.input_seq, event.payload.unwrap())
 }
 
 #[tokio::test]
-async fn transform_returns_processed_event() {
+async fn outputs_are_tied_to_their_input_and_followed_by_its_ack() {
     let (listener, port) = listen().await;
     let runner = tokio::spawn(async move {
         let mut runner = TransformRunner::initialize(
             Upper,
-            TransformRunnerConfig {
-                plugin_id: "upper".into(),
-                log_level: LogLevel::Warn,
-                hub_connection: connection(port),
-            },
+            TransformRunnerConfig::new("upper".into(), LogLevel::Warn, connection(port)),
         )
         .await
         .unwrap();
         runner.run().await
     });
-    let mut hub = FakeHub::accept(&listener).await;
-    let init: TransformMessage = hub.recv(is_log).await;
-    assert!(matches!(init.payload, Some(Payload::Initialize(_))));
-    hub.send(&RuntimeTransformMessage {
-        payload: Some(runtime_transform_message::Payload::Initialize(
-            InitializeResponse {},
-        )),
-    })
-    .await;
+    let (mut hub, init) = FakeHub::handshake(&listener).await;
+    assert_eq!(init.plugin_type, PluginType::Transform as i32);
+    assert!(init.in_schema.is_some() && init.out_schema.is_some());
+    hub.accept_plugin(&[Capability::Acks, Capability::Credits], 0).await;
+    hub.send(&Credit { events: 100 }).await;
 
-    let field = |s: &str| Field {
-        key: "text".into(),
-        value: Some(FieldValue {
-            value: Some(Value::String(s.into())),
-        }),
-    };
-    let metadata = EventMetadata {
-        event_id: "e1".into(),
-        trace_id: "t1".into(),
-        hops: 2,
-        origin_node_id: "src".into(),
-        create_time: None,
-    };
-    hub.send(&RuntimeTransformMessage {
-        payload: Some(runtime_transform_message::Payload::Event(TransformEvent {
-            plugin_id: "upper".into(),
-            plugin_version: "1".into(),
-            payload: Some(PluginPayload {
-                fields: vec![field("hello")],
-            }),
-            metadata: Some(metadata.clone()),
-        })),
-    })
-    .await;
-    let out: TransformMessage = hub.recv(is_log).await;
-    match out.payload {
-        Some(Payload::Event(e)) => {
-            assert_eq!(e.payload.unwrap().fields, vec![field("HELLO")]);
-            // Metadata is carried over from the input event.
-            assert_eq!(e.metadata, Some(metadata));
-        }
-        other => panic!("expected Event, got {other:?}"),
+    // One output: tied to input 1, then input 1 is acked.
+    hub.send_event(payload(vec![text("text", "hello")]), None).await;
+    let (seq, input, out) = output(&hub.next().await);
+    assert_eq!((seq, input), (1, 1));
+    assert_eq!(out, payload(vec![text("text", "HELLO")]));
+    let ack: Ack = hub.expect().await;
+    assert_eq!((ack.up_to, ack.seqs), (0, vec![1]));
+
+    // Two outputs for input 2, none for input 3.
+    hub.send_event(payload(vec![text("text", "split")]), None).await;
+    hub.send_event(payload(vec![text("text", "drop")]), None).await;
+    for expected_seq in [2, 3] {
+        let (seq, input, out) = output(&hub.next().await);
+        assert_eq!((seq, input), (expected_seq, 2));
+        assert_eq!(out, payload(vec![text("text", "SPLIT")]));
     }
+    let ack: Ack = hub.expect().await;
+    assert_eq!((ack.up_to, ack.seqs), (0, vec![2]));
+    let ack: Ack = hub.expect().await;
+    assert_eq!((ack.up_to, ack.seqs), (0, vec![3]));
 
-    hub.send(&RuntimeTransformMessage {
-        payload: Some(runtime_transform_message::Payload::Event(
-            TransformEvent::default(),
-        )),
-    })
-    .await;
-    let err: TransformMessage = hub.recv(is_log).await;
-    assert!(matches!(err.payload, Some(Payload::Error(e)) if e.message == "no payload"));
+    // A failure: NACK, not retryable.
+    hub.send_event(payload(vec![]), None).await;
+    let nack: Nack = hub.expect().await;
+    assert_eq!((nack.seq, nack.retry, nack.reason.as_str()), (4, false, "no fields"));
 
-    hub.send(&RuntimeTransformMessage {
-        payload: Some(runtime_transform_message::Payload::Shutdown(
-            flwrs_plugin::schema::common::Shutdown {},
-        )),
-    })
-    .await;
-    let exit: TransformMessage = hub.recv(is_log).await;
-    assert!(matches!(exit.payload, Some(Payload::Exit(_))));
-    runner.await.unwrap().unwrap();
+    hub.shutdown("").await;
+    let _: Exit = hub.expect().await;
+    common::finished(runner).await.unwrap();
 }

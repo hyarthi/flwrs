@@ -4,12 +4,18 @@
 
 mod config;
 mod service;
+#[cfg(feature = "remote")]
+mod tls;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "remote"))]
+mod tls_tests;
 pub(crate) mod wire;
 
 pub(crate) use config::HubConfig;
-pub(crate) use service::{ExpectedNode, Hub, HubError, HubEvent, LinkSender, NodeLink};
+pub(crate) use service::{
+    ExpectedNode, Hub, HubError, HubEvent, LinkSender, NodeAuth, NodeLink, Routed,
+};
 use std::sync::OnceLock;
 
 static HUB: OnceLock<Hub> = OnceLock::new();

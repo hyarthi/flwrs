@@ -2,8 +2,9 @@
 //! datetimes and the difference between u64 and i64 survive, unlike JSON) and
 //! converts both ways with `PluginPayload`.
 
-use flwrs_plugin::schema::schema::{
-    ArrayValue, Field, FieldDefinition, FieldValue, MapValue, PluginPayload, SchemaDefinition,
+use flwrs_plugin::schema::payload::{
+    ArrayValue, Field, FieldDefinition, FieldValue, MapValue, PackedF32, PackedF64, PackedI32,
+    PackedI64, PackedU32, PackedU64, PluginPayload, SchemaDefinition,
     field_type::Enum as FieldType, field_value::Value as Pb,
 };
 use pbjson_types::Timestamp;
@@ -27,6 +28,108 @@ pub(crate) enum Value {
     Map(BTreeMap<String, Value>),
     /// Named fields (`OBJECT`, and the payload itself), in order.
     Object(Vec<(String, Value)>),
+    /// A packed numeric array (`PACKED_*`).
+    Packed(Packed),
+}
+
+/// The packed numeric arrays (`PACKED_F32` …).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Packed {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+impl Packed {
+    pub(crate) fn field_type(&self) -> FieldType {
+        match self {
+            Packed::F32(_) => FieldType::PackedF32,
+            Packed::F64(_) => FieldType::PackedF64,
+            Packed::I32(_) => FieldType::PackedI32,
+            Packed::I64(_) => FieldType::PackedI64,
+            Packed::U32(_) => FieldType::PackedU32,
+            Packed::U64(_) => FieldType::PackedU64,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Packed::F32(v) => v.len(),
+            Packed::F64(v) => v.len(),
+            Packed::I32(v) => v.len(),
+            Packed::I64(v) => v.len(),
+            Packed::U32(v) => v.len(),
+            Packed::U64(v) => v.len(),
+        }
+    }
+
+    /// Element `i` as a scalar value.
+    pub(crate) fn get(&self, i: usize) -> Option<Value> {
+        Some(match self {
+            Packed::F32(v) => Value::F32(*v.get(i)?),
+            Packed::F64(v) => Value::F64(*v.get(i)?),
+            Packed::I32(v) => Value::I32(*v.get(i)?),
+            Packed::I64(v) => Value::I64(*v.get(i)?),
+            Packed::U32(v) => Value::U32(*v.get(i)?),
+            Packed::U64(v) => Value::U64(*v.get(i)?),
+        })
+    }
+
+    /// The elements as scalar values.
+    pub(crate) fn to_values(&self) -> Vec<Value> {
+        (0..self.len()).filter_map(|i| self.get(i)).collect()
+    }
+
+    /// Builds a packed array of `packed` type from scalar values, converting
+    /// each losslessly to the element type.
+    pub(crate) fn from_values(packed: FieldType, values: Vec<Value>) -> Result<Packed, String> {
+        let element = element_type(packed).ok_or("not a packed type")?;
+        let def = FieldDefinition {
+            r#type: element as i32,
+            ..Default::default()
+        };
+        let mut items = Vec::with_capacity(values.len());
+        for (i, v) in values.into_iter().enumerate() {
+            items.push(coerce(v, &def).map_err(|e| format!("[{i}]: {e}"))?);
+        }
+        macro_rules! collect {
+            ($variant:ident) => {
+                Packed::$variant(
+                    items
+                        .into_iter()
+                        .map(|v| match v {
+                            Value::$variant(n) => Ok(n),
+                            other => Err(format!("unexpected {}", other.type_name())),
+                        })
+                        .collect::<Result<_, String>>()?,
+                )
+            };
+        }
+        Ok(match element {
+            FieldType::F32 => collect!(F32),
+            FieldType::F64 => collect!(F64),
+            FieldType::I32 => collect!(I32),
+            FieldType::I64 => collect!(I64),
+            FieldType::U32 => collect!(U32),
+            _ => collect!(U64),
+        })
+    }
+}
+
+/// The element type of a packed type (`PACKED_F32` → `F32`).
+pub(crate) fn element_type(packed: FieldType) -> Option<FieldType> {
+    Some(match packed {
+        FieldType::PackedF32 => FieldType::F32,
+        FieldType::PackedF64 => FieldType::F64,
+        FieldType::PackedI32 => FieldType::I32,
+        FieldType::PackedI64 => FieldType::I64,
+        FieldType::PackedU32 => FieldType::U32,
+        FieldType::PackedU64 => FieldType::U64,
+        _ => return None,
+    })
 }
 
 impl Value {
@@ -46,6 +149,7 @@ impl Value {
             Value::Array(_) => "ARRAY",
             Value::Map(_) => "MAP",
             Value::Object(_) => "OBJECT",
+            Value::Packed(p) => p.field_type().as_str_name(),
         }
     }
 
@@ -102,6 +206,12 @@ fn from_field_value(value: Option<&FieldValue>) -> Value {
                 .map(|(k, v)| (k.clone(), from_field_value(Some(v))))
                 .collect(),
         ),
+        Pb::PackedF32(p) => Value::Packed(Packed::F32(p.values.clone())),
+        Pb::PackedF64(p) => Value::Packed(Packed::F64(p.values.clone())),
+        Pb::PackedI32(p) => Value::Packed(Packed::I32(p.values.clone())),
+        Pb::PackedI64(p) => Value::Packed(Packed::I64(p.values.clone())),
+        Pb::PackedU32(p) => Value::Packed(Packed::U32(p.values.clone())),
+        Pb::PackedU64(p) => Value::Packed(Packed::U64(p.values.clone())),
         Pb::Object(m) => {
             // Proto maps have no order: sort, so output is deterministic.
             let mut fields: Vec<(String, Value)> = m
@@ -143,6 +253,14 @@ fn into_field_value(value: Value) -> FieldValue {
                 .map(|(k, v)| (k, into_field_value(v)))
                 .collect(),
         })),
+        Value::Packed(p) => Some(match p {
+            Packed::F32(values) => Pb::PackedF32(PackedF32 { values }),
+            Packed::F64(values) => Pb::PackedF64(PackedF64 { values }),
+            Packed::I32(values) => Pb::PackedI32(PackedI32 { values }),
+            Packed::I64(values) => Pb::PackedI64(PackedI64 { values }),
+            Packed::U32(values) => Pb::PackedU32(PackedU32 { values }),
+            Packed::U64(values) => Pb::PackedU64(PackedU64 { values }),
+        }),
     };
     FieldValue { value }
 }
@@ -262,6 +380,19 @@ pub(crate) fn from_json(
             };
             coerce(value, def)
         }
+        FieldType::PackedF32
+        | FieldType::PackedF64
+        | FieldType::PackedI32
+        | FieldType::PackedI64
+        | FieldType::PackedU32
+        | FieldType::PackedU64 => {
+            let items = json.as_array().ok_or_else(mismatch)?;
+            let values = items
+                .iter()
+                .map(|v| from_json(v, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            Packed::from_values(field_type, values).map(Value::Packed)
+        }
         FieldType::Undefined => Err("the target field has no type".into()),
     }
 }
@@ -336,6 +467,8 @@ pub(crate) fn coerce(value: Value, def: &FieldDefinition) -> Result<Value, Strin
             }
         },
         FieldType::Array => match value {
+            // A packed array becomes an ARRAY of its element type.
+            Value::Packed(p) => coerce(Value::Array(p.to_values()), def),
             Value::Array(items) => {
                 let Some(nested) = def.nested_type_definition.as_deref() else {
                     return Ok(Value::Array(items));
@@ -374,6 +507,17 @@ pub(crate) fn coerce(value: Value, def: &FieldDefinition) -> Result<Value, Strin
             };
             coerce_fields(fields, &def.object_fields).map(Value::Object)
         }
+        FieldType::PackedF32
+        | FieldType::PackedF64
+        | FieldType::PackedI32
+        | FieldType::PackedI64
+        | FieldType::PackedU32
+        | FieldType::PackedU64 => match value {
+            Value::Packed(p) if p.field_type() == field_type => Ok(Value::Packed(p)),
+            Value::Packed(p) => Packed::from_values(field_type, p.to_values()).map(Value::Packed),
+            Value::Array(items) => Packed::from_values(field_type, items).map(Value::Packed),
+            other => Err(mismatch(&other)),
+        },
         FieldType::Undefined => Err("the target field has no type".into()),
     }
 }
@@ -426,15 +570,52 @@ fn whole_float(f: f64) -> Option<i128> {
 pub(crate) fn convertible(from: FieldType, to: FieldType) -> bool {
     use FieldType::*;
     let numeric = |t| matches!(t, I32 | I64 | U32 | U64 | F32 | F64);
+    let sequence = |t: FieldType| t == Array || element_type(t).is_some();
     from == to
         || (numeric(from) && numeric(to))
         || (matches!(from, Map | Object) && matches!(to, Map | Object))
+        // Element types are checked when the value is converted.
+        || (sequence(from) && sequence(to))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn packed_arrays_round_trip_and_convert() {
+        let packed = Value::Packed(Packed::F32(vec![0.5, -2.0]));
+        let payload = Value::Object(vec![("v".into(), packed.clone())]).into_payload().unwrap();
+        assert_eq!(
+            Value::from_payload(&payload),
+            Value::Object(vec![("v".into(), packed.clone())])
+        );
+        // To an ARRAY of F64 and back to another packed type, losslessly.
+        let mut array_def = def(FieldType::Array);
+        array_def.nested_type_definition = Some(Box::new(def(FieldType::F64)));
+        assert_eq!(
+            coerce(packed.clone(), &array_def).unwrap(),
+            Value::Array(vec![Value::F64(0.5), Value::F64(-2.0)])
+        );
+        assert_eq!(
+            coerce(packed, &def(FieldType::PackedF64)).unwrap(),
+            Value::Packed(Packed::F64(vec![0.5, -2.0]))
+        );
+        let ints = Value::Array(vec![Value::I64(1), Value::I64(-3)]);
+        assert_eq!(
+            coerce(ints.clone(), &def(FieldType::PackedI32)).unwrap(),
+            Value::Packed(Packed::I32(vec![1, -3]))
+        );
+        assert!(coerce(ints, &def(FieldType::PackedU32)).is_err(), "-3 isn't a u32");
+        assert_eq!(
+            from_json(&json!([1, 2.5]), Some(&def(FieldType::PackedF64))).unwrap(),
+            Value::Packed(Packed::F64(vec![1.0, 2.5]))
+        );
+        assert!(convertible(FieldType::PackedF32, FieldType::Array));
+        assert!(convertible(FieldType::Array, FieldType::PackedU64));
+        assert!(!convertible(FieldType::PackedF32, FieldType::String));
+    }
 
     fn def(field_type: FieldType) -> FieldDefinition {
         FieldDefinition {

@@ -23,6 +23,9 @@ message SceneFile {
   bool includes_secrets = 6;
   // Version of the server that wrote the file; informational.
   string exporter_version = 7;
+  // The scene's defaults for its nodes as a JSON object (durable,
+  // remote_auth, require_tls); unset = none.
+  optional string defaults_json = 8;
 }
 
 message PluginType {

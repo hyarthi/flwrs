@@ -1,3 +1,4 @@
+use crate::modules::node_config::SceneDefaults;
 use crate::modules::api_error::{ApiError, ErrorBody, api_error, internal};
 use crate::modules::scene::service::{self, ListFilters, Service, ServiceError};
 use crate::modules::scene::{api_graph, api_status, api_transfer};
@@ -41,6 +42,8 @@ pub(crate) struct Scene {
     /// Events are dropped after this many handovers (stops runaway loops in
     /// cycles). `null` = the server default (`[director] max_hops`, 32).
     pub max_hops: Option<u32>,
+    /// Defaults for the scene's nodes; a node's own setting wins.
+    pub defaults: SceneDefaults,
     pub create_time: i64,
     pub update_time: i64,
 }
@@ -52,6 +55,7 @@ impl From<service::Scene> for Scene {
             name: value.name,
             enabled: value.enabled,
             max_hops: value.max_hops,
+            defaults: value.defaults,
             create_time: value.create_time.timestamp_millis(),
             update_time: value.update_time.timestamp_millis(),
         }
@@ -66,6 +70,11 @@ pub(crate) struct SceneRequest {
     /// server default. Changing it on an enabled scene restarts the scene.
     #[serde(default)]
     pub max_hops: Option<u32>,
+    /// Defaults for the scene's nodes: `durable` (queues kept on disk until
+    /// acknowledged), `remote_auth` (`token` or `mtls`), `require_tls`.
+    /// Omitted = none. Changing them on an enabled scene reloads it.
+    #[serde(default)]
+    pub defaults: SceneDefaults,
 }
 
 impl From<SceneRequest> for service::SceneInput {
@@ -73,6 +82,7 @@ impl From<SceneRequest> for service::SceneInput {
         Self {
             name: req.name,
             max_hops: req.max_hops,
+            defaults: req.defaults,
         }
     }
 }
@@ -248,6 +258,8 @@ async fn disable_scene(
         api_transfer::import_scene,
         api_transfer::check_scene,
         api_status::scene_status,
+        api_status::purge_scene_spool,
+        api_status::purge_node_spool,
         api_graph::list_nodes,
         api_graph::create_node,
         api_graph::get_node,
@@ -272,6 +284,7 @@ async fn disable_scene(
         api_transfer::ImportResponse,
         api_transfer::SceneUpload,
         api_status::SceneStatusResponse,
+        api_status::PurgeResponse,
     ))
 )]
 pub(crate) struct Api;

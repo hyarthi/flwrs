@@ -1,0 +1,23 @@
+[package]
+name = "flwrs-trellis"
+description = "Checks that a flwrs plugin (in any language) follows the plugin protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+flwrs-plugin.workspace = true # framing, messages and schema rules
+tokio.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

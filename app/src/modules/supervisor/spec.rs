@@ -1,14 +1,15 @@
 //! Everything needed to run one node, resolved from the node's config and its
 //! plugin's registry entry.
 
-use crate::modules::hub::ExpectedNode;
+use crate::modules::hub::{ExpectedNode, NodeAuth};
 use crate::modules::node_config::{
+    EffectiveAuth, SceneDefaults,
     LaunchMode, NodeConfig, QueueConfig, RuntimeConfig, SpillConfig, WhenFull,
 };
 use crate::modules::plugin::manifest::{self, PluginType};
 use crate::modules::plugin::service::Plugin;
 use flwrs_plugin::schema::rules;
-use flwrs_plugin::schema::schema::SchemaDefinition;
+use flwrs_plugin::schema::payload::SchemaDefinition;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -41,6 +42,7 @@ pub(crate) struct NodeSpec {
     pub timings: Timings,
     /// The node's inbound queue (sinks and transforms).
     pub queue: QueueSpec,
+    pub delivery: DeliverySpec,
     pub max_event_bytes: Option<usize>,
 }
 
@@ -48,8 +50,8 @@ pub(crate) struct NodeSpec {
 pub(crate) enum Launch {
     /// The supervisor starts the plugin as a child process.
     Local(LocalLaunch),
-    /// The plugin runs elsewhere and connects with this pre-shared token.
-    Remote { token: String },
+    /// The plugin runs elsewhere and connects with these credentials.
+    Remote { auth: NodeAuth },
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +103,37 @@ pub(crate) struct QueueSpec {
     pub spill_enabled: Option<bool>,
     /// Limits that apply when spill is on.
     pub spill: SpillSpec,
+    /// `runtime.queue.durable`; `None` = the scene's default.
+    pub durable: Option<bool>,
+}
+
+pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 5;
+pub(crate) const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
+
+/// Redelivery to a plugin with ACKS (`runtime.delivery`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DeliverySpec {
+    /// Deliveries of one event (the first included) before it's dead-lettered.
+    pub max_attempts: u32,
+    /// Wait before redelivering an event the plugin rejected with retry.
+    pub retry_delay: Duration,
+}
+
+impl DeliverySpec {
+    pub(crate) fn resolve(node: &RuntimeConfig, defaults: &RuntimeConfig) -> Self {
+        let (n, d) = (node.delivery.as_ref(), defaults.delivery.as_ref());
+        Self {
+            max_attempts: n
+                .and_then(|x| x.max_attempts)
+                .or(d.and_then(|x| x.max_attempts))
+                .map_or(DEFAULT_MAX_ATTEMPTS, |v| u32::try_from(v).unwrap_or(u32::MAX)),
+            retry_delay: Duration::from_millis(
+                n.and_then(|x| x.retry_delay_ms)
+                    .or(d.and_then(|x| x.retry_delay_ms))
+                    .unwrap_or(DEFAULT_RETRY_DELAY_MS),
+            ),
+        }
+    }
 }
 
 pub(crate) const DEFAULT_SPILL_MEMORY_MAX_EVENTS: usize = 256;
@@ -143,6 +176,7 @@ impl QueueSpec {
                     .unwrap_or(DEFAULT_BLOCK_TIMEOUT_MS),
             ),
             spill_enabled: spill_field(n, d, |s| s.enabled),
+            durable: n.and_then(|q| q.durable).or(d.and_then(|q| q.durable)),
             spill: SpillSpec {
                 memory_max_events: spill_field(n, d, |s| s.memory_max_events)
                     .map_or(DEFAULT_SPILL_MEMORY_MAX_EVENTS, to_usize),
@@ -267,6 +301,16 @@ pub(crate) fn server_log_level() -> String {
     }
 }
 
+/// What resolving a node needs from the server and its scene.
+pub(crate) struct Surroundings<'a> {
+    /// The hub's plain listener (local plugins connect to it).
+    pub hub_addr: SocketAddr,
+    /// The hub has a TLS listener.
+    pub tls_available: bool,
+    pub log_level: &'a str,
+    pub scene_defaults: &'a SceneDefaults,
+}
+
 impl NodeSpec {
     /// Resolves a node (its parsed `config`) running `plugin`. Validation is
     /// repeated here: the supervisor doesn't trust that the database is valid.
@@ -275,9 +319,14 @@ impl NodeSpec {
         node_id: &str,
         config: &NodeConfig,
         plugin: &Plugin,
-        hub_addr: SocketAddr,
-        log_level: &str,
+        at: &Surroundings,
     ) -> Result<Self, Vec<String>> {
+        let Surroundings {
+            hub_addr,
+            tls_available,
+            log_level,
+            scene_defaults,
+        } = *at;
         let mut errors = vec![];
         let manifest = plugin
             .parsed_manifest()
@@ -302,17 +351,39 @@ impl NodeSpec {
         let out_schema = parse_schema(&plugin.out_schema, "out", &mut errors);
 
         let launch = match config.launch {
-            LaunchMode::Remote => match &config.token {
-                Some(token) if !token.is_empty() => Launch::Remote {
-                    token: token.clone(),
-                },
-                _ => {
-                    errors.push("config.token is required for remote nodes".into());
-                    Launch::Remote {
-                        token: String::new(),
+            LaunchMode::Remote => {
+                if let Some(unsupported) = config.unsupported() {
+                    errors.push(unsupported);
+                }
+                match config.effective_auth(scene_defaults, tls_available) {
+                    EffectiveAuth::Token { require_tls } => match &config.token {
+                        Some(token) if !token.is_empty() => Launch::Remote {
+                            auth: NodeAuth::Token {
+                                token: token.clone(),
+                                require_tls,
+                            },
+                        },
+                        _ => {
+                            errors.push(
+                                "config.token is required for remote nodes with token auth".into(),
+                            );
+                            Launch::Remote {
+                                auth: NodeAuth::local(String::new()),
+                            }
+                        }
+                    },
+                    EffectiveAuth::Mtls { pin } => {
+                        if !tls_available {
+                            errors.push(
+                                "auth mtls needs the hub's TLS listener ([hub.tls])".into(),
+                            );
+                        }
+                        Launch::Remote {
+                            auth: NodeAuth::Mtls { pin },
+                        }
                     }
                 }
-            },
+            }
             LaunchMode::Local => {
                 let args =
                     manifest::launch_args_to_argv(manifest.launch_args_style, &config.launch_args)
@@ -353,13 +424,14 @@ impl NodeSpec {
             out_schema,
             timings: Timings::resolve(&config.runtime, &defaults),
             queue: QueueSpec::resolve(&config.runtime, &defaults),
+            delivery: DeliverySpec::resolve(&config.runtime, &defaults),
             launch,
             max_event_bytes,
         })
     }
 
     /// What the hub should accept for this node, with `token`.
-    pub(crate) fn expected(&self, token: String) -> ExpectedNode {
+    pub(crate) fn expected(&self, auth: NodeAuth) -> ExpectedNode {
         ExpectedNode {
             scene_id: self.scene_id.clone(),
             node_id: self.node_id.clone(),
@@ -369,7 +441,7 @@ impl NodeSpec {
             plugin_version: self.plugin_version.clone(),
             in_schema: self.in_schema.clone(),
             out_schema: self.out_schema.clone(),
-            token,
+            auth,
             max_event_bytes: self.max_event_bytes,
         }
     }

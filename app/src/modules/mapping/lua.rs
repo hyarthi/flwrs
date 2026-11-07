@@ -20,8 +20,8 @@
 //! an empty `{}` becomes an array or a map as the target field says.
 
 use super::value::{self, Value};
-use flwrs_plugin::schema::common::EventMetadata;
-use flwrs_plugin::schema::schema::{
+use flwrs_plugin::schema::protocol::EventMetadata;
+use flwrs_plugin::schema::payload::{
     FieldDefinition, SchemaDefinition, field_type::Enum as FieldType,
 };
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
@@ -239,6 +239,19 @@ impl Runtime {
         readonly(&self.lua, t, &self.readonly_error, &self.next)
     }
 
+    fn array_to_lua(&self, items: &[Value]) -> mlua::Result<mlua::Value> {
+        let t = self.lua.create_table()?;
+        for (i, item) in items.iter().enumerate() {
+            t.raw_set(i + 1, self.to_lua(item)?)?;
+        }
+        Ok(mlua::Value::Table(readonly(
+            &self.lua,
+            t,
+            &self.readonly_error,
+            &self.next,
+        )?))
+    }
+
     /// A read-only Lua view of a value.
     fn to_lua(&self, value: &Value) -> mlua::Result<mlua::Value> {
         Ok(match value {
@@ -255,13 +268,9 @@ impl Runtime {
             Value::F32(n) => mlua::Value::Number(f64::from(*n)),
             Value::F64(n) => mlua::Value::Number(*n),
             Value::DateTime(t) => mlua::Value::Integer(epoch_ms(t)),
-            Value::Array(items) => {
-                let t = self.lua.create_table()?;
-                for (i, item) in items.iter().enumerate() {
-                    t.raw_set(i + 1, self.to_lua(item)?)?;
-                }
-                mlua::Value::Table(readonly(&self.lua, t, &self.readonly_error, &self.next)?)
-            }
+            Value::Array(items) => self.array_to_lua(items)?,
+            // A packed array is a plain Lua sequence of numbers.
+            Value::Packed(p) => self.array_to_lua(&p.to_values())?,
             Value::Map(map) => {
                 let t = self.lua.create_table()?;
                 for (k, v) in map {
@@ -399,6 +408,14 @@ fn table_value(table: Table, def: Option<&FieldDefinition>) -> Result<Value, Str
             table,
             def.map(|d| d.object_fields.as_slice()).unwrap_or_default(),
         ),
+        Some(packed) if value::element_type(packed).is_some() => {
+            let mut items = vec![];
+            for i in 1..=table.raw_len() {
+                let item: mlua::Value = table.raw_get(i).map_err(err)?;
+                items.push(from_lua(item, None).map_err(|e| format!("[{}]: {e}", i - 1))?);
+            }
+            value::Packed::from_values(packed, items).map(Value::Packed)
+        }
         Some(other) => Err(format!("a table can't be a {}", other.as_str_name())),
         None => {
             // No schema: a sequence is an array, anything else an object.
@@ -486,7 +503,7 @@ mod tests {
     use super::super::{MappingSpec, path::Path};
     use super::*;
     use flwrs_plugin::schema::rules::parse_json;
-    use flwrs_plugin::schema::schema::PluginPayload;
+    use flwrs_plugin::schema::payload::PluginPayload;
     use serde_json::json;
 
     fn spec(json: serde_json::Value) -> MappingSpec {

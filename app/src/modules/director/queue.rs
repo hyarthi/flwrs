@@ -13,7 +13,11 @@
 //! task does all disk I/O (writes and refills), so they can't race. See
 //! [`spill`].
 
+mod durable;
 mod spill;
+
+pub(crate) use durable::{DurableSettings, delete_files, purge_files};
+use durable::{DurableCore, Push};
 
 use crate::modules::hub::wire::DataEvent;
 use crate::modules::node_config::WhenFull;
@@ -221,6 +225,8 @@ impl Drop for SoftShare {
 pub(crate) struct Queued {
     pub event: DataEvent,
     pub size: usize,
+    /// Durable queues: the event's row in the spool file (deleted on ack).
+    row: Option<i64>,
     _hold: Hold,
 }
 
@@ -245,6 +251,8 @@ pub(crate) struct QueueStats {
     pub evicted: u64,
     /// Spill on for this queue.
     pub spill: bool,
+    /// Durable: every event is on disk until the plugin acks it.
+    pub durable: bool,
     /// Events are going to disk (until the disk is empty again).
     pub spilling: bool,
     /// Events on disk (including those about to be written).
@@ -259,6 +267,14 @@ pub(crate) struct QueueStats {
     pub disk_blocked: bool,
     /// Total time producers waited for room (`block`), in milliseconds.
     pub blocked_ms: u64,
+    /// Delivered to the plugin, waiting for its ACK (capability ACKS).
+    pub in_flight: u64,
+    /// Delivered again: after a disconnect, a crash or a NACK with retry.
+    pub redelivered: u64,
+    /// Rejected by the plugin (NACK).
+    pub nacked: u64,
+    /// Given up on: out of attempts, or a NACK without retry.
+    pub dead_lettered: u64,
 }
 
 #[derive(Default)]
@@ -275,6 +291,10 @@ struct Counters {
     disk_bytes_written: AtomicU64,
     dropped_disk_error: AtomicU64,
     blocked_us: AtomicU64,
+    in_flight: AtomicU64,
+    redelivered: AtomicU64,
+    nacked: AtomicU64,
+    dead_lettered: AtomicU64,
 }
 
 #[derive(Default)]
@@ -297,10 +317,13 @@ struct State {
     disk_bytes: u64,
     /// The free-space guard tripped; writes wait.
     disk_blocked: bool,
+    /// The spill task should empty the file (a purge).
+    purge_disk: Option<tokio::sync::oneshot::Sender<u64>>,
 }
 
 pub(crate) struct NodeQueue {
-    settings: QueueSettings,
+    /// Changeable in place (a reload of a node keeps its queue).
+    settings: Mutex<QueueSettings>,
     budget: Budget,
     spill: Option<SpillSettings>,
     state: Mutex<State>,
@@ -312,9 +335,52 @@ pub(crate) struct NodeQueue {
     work: Notify,
     counters: Counters,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// Durable queues: the file-backed core every operation goes to.
+    durable: Option<Arc<DurableCore>>,
+}
+
+/// Where a queue keeps its events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueueKind {
+    Memory,
+    /// Memory, overflowing to disk.
+    Spill,
+    /// Disk, until acked; memory is a cache.
+    Durable,
 }
 
 impl NodeQueue {
+    /// A durable queue (see [`durable`]); starts its task, which opens (or
+    /// adopts) the node's spool file.
+    pub(crate) fn new_durable(
+        settings: QueueSettings,
+        budget: Budget,
+        durable: DurableSettings,
+    ) -> Arc<Self> {
+        let core = DurableCore::new(durable);
+        core.start();
+        Arc::new(Self {
+            settings: Mutex::new(settings),
+            budget,
+            spill: None,
+            state: Mutex::default(),
+            pushed: Notify::new(),
+            popped: Notify::new(),
+            work: Notify::new(),
+            counters: Counters::default(),
+            task: Mutex::new(None),
+            durable: Some(core),
+        })
+    }
+
+    pub(crate) fn kind(&self) -> QueueKind {
+        match (&self.durable, &self.spill) {
+            (Some(_), _) => QueueKind::Durable,
+            (None, Some(_)) => QueueKind::Spill,
+            (None, None) => QueueKind::Memory,
+        }
+    }
+
     /// A queue; with `spill`, also starts its spill task (which creates the
     /// spool file on the first spill, and deletes it in [`NodeQueue::finish`]).
     pub(crate) fn new(
@@ -324,7 +390,7 @@ impl NodeQueue {
     ) -> Arc<Self> {
         let spilling = spill.is_some();
         let queue = Arc::new(Self {
-            settings,
+            settings: Mutex::new(settings),
             budget,
             spill,
             state: Mutex::default(),
@@ -333,6 +399,7 @@ impl NodeQueue {
             work: Notify::new(),
             counters: Counters::default(),
             task: Mutex::new(None),
+            durable: None,
         });
         if spilling {
             let task = tokio::spawn(spill::run(queue.clone()));
@@ -345,23 +412,63 @@ impl NodeQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn settings(&self) -> QueueSettings {
+        self.settings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// New limits and policy, from now on (events already queued stay).
+    pub(crate) fn reconfigure(&self, settings: QueueSettings) {
+        *self.settings.lock().unwrap_or_else(PoisonError::into_inner) = settings;
+        // Waiting producers re-check against the new limits.
+        self.popped.notify_waiters();
+    }
+
     /// An event larger than the queue's byte limit still fits an empty queue:
     /// node limits shape normal traffic, and only the hub-wide limit
     /// (`[hub] max_inflight_bytes`) decides what's too large.
     fn has_room(&self, state: &State, size: usize) -> bool {
-        state.items.len() < self.settings.capacity
-            && (state.bytes + size <= self.settings.max_bytes || state.items.is_empty())
+        let settings = self.settings();
+        state.items.len() < settings.capacity
+            && (state.bytes + size <= settings.max_bytes || state.items.is_empty())
     }
 
     /// Adds an event, applying the queue's `when_full` policy. With `block`,
     /// waits (up to `block_timeout`) for room.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn push(&self, event: DataEvent, size: usize) -> Pushed {
+        self.push_tracked(event, size).await.0
+    }
+
+    /// [`NodeQueue::push`]; for a durable queue, also the ticket to wait on
+    /// ([`NodeQueue::committed`]) before the event counts as stored.
+    pub(crate) async fn push_tracked(&self, event: DataEvent, size: usize) -> (Pushed, Option<u64>) {
         let started = Instant::now();
-        let result = match &self.spill {
-            None => self.push_memory(event, size).await,
-            Some(spill) => self.push_spill(spill, event, size).await,
+        let settings = self.settings();
+        let when_full = settings.when_full;
+        let mut ticket = None;
+        let result = match (&self.durable, &self.spill) {
+            (Some(core), _) => {
+                if size > self.budget.total {
+                    Pushed::Dropped(DropReason::Oversized)
+                } else {
+                    match core.push(event, size, when_full, settings.block_timeout).await {
+                        Push::Queued(t) => {
+                            ticket = Some(t);
+                            Pushed::Queued
+                        }
+                        Push::Full => Pushed::Dropped(DropReason::Full),
+                        Push::Timeout => Pushed::Dropped(DropReason::Timeout),
+                        Push::Closed => Pushed::Dropped(DropReason::Closed),
+                    }
+                }
+            }
+            (None, None) => self.push_memory(event, size).await,
+            (None, Some(spill)) => self.push_spill(spill, event, size).await,
         };
-        if self.settings.when_full == WhenFull::Block {
+        if when_full == WhenFull::Block {
             let waited = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
             self.counters
                 .blocked_us
@@ -373,10 +480,19 @@ impl NodeQueue {
             Pushed::Dropped(DropReason::Full) => &self.counters.dropped_full,
             Pushed::Dropped(DropReason::Timeout) => &self.counters.dropped_timeout,
             Pushed::Dropped(DropReason::Budget) => &self.counters.dropped_budget,
-            Pushed::Dropped(DropReason::Closed) => return result,
+            Pushed::Dropped(DropReason::Closed) => return (result, None),
         };
         counter.fetch_add(1, Ordering::Relaxed);
-        result
+        (result, ticket)
+    }
+
+    /// Waits until a durable push's event is committed to disk. `false` if
+    /// writing it failed (or the queue closed first).
+    pub(crate) async fn committed(&self, ticket: u64) -> bool {
+        match &self.durable {
+            Some(core) => core.committed(ticket).await,
+            None => true,
+        }
     }
 
     async fn push_memory(&self, event: DataEvent, size: usize) -> Pushed {
@@ -386,9 +502,10 @@ impl NodeQueue {
         let Ok(permits) = u32::try_from(size) else {
             return Pushed::Dropped(DropReason::Oversized);
         };
-        let deadline = Instant::now() + self.settings.block_timeout;
+        let settings = self.settings();
+        let deadline = Instant::now() + settings.block_timeout;
         let semaphore = self.budget.semaphore.clone();
-        let permit = match self.settings.when_full {
+        let permit = match settings.when_full {
             WhenFull::Block => {
                 match tokio::time::timeout_at(deadline, semaphore.acquire_many_owned(permits)).await
                 {
@@ -407,6 +524,7 @@ impl NodeQueue {
         let item = Queued {
             event,
             size,
+            row: None,
             _hold: Hold::Budget(permit),
         };
 
@@ -420,7 +538,7 @@ impl NodeQueue {
                     return Pushed::Dropped(DropReason::Closed);
                 }
                 let room = self.has_room(&state, size);
-                if !room && self.settings.when_full == WhenFull::DropOldest {
+                if !room && settings.when_full == WhenFull::DropOldest {
                     while !self.has_room(&state, size) {
                         let Some(old) = state.items.pop_front() else {
                             break;
@@ -436,7 +554,7 @@ impl NodeQueue {
                     self.pushed.notify_waiters();
                     return Pushed::Queued;
                 }
-                if self.settings.when_full == WhenFull::DropNewest {
+                if settings.when_full == WhenFull::DropNewest {
                     return Pushed::Dropped(DropReason::Full);
                 }
             }
@@ -456,7 +574,8 @@ impl NodeQueue {
         if size > self.budget.total {
             return Pushed::Dropped(DropReason::Oversized);
         }
-        let deadline = Instant::now() + self.settings.block_timeout;
+        let settings = self.settings();
+        let deadline = Instant::now() + settings.block_timeout;
         let mut event = Some(event);
         loop {
             let popped = self.popped.notified();
@@ -481,6 +600,7 @@ impl NodeQueue {
                     state.items.push_back(Queued {
                         event: event.take().expect("pushed once"),
                         size,
+                        row: None,
                         _hold: hold,
                     });
                     drop(state);
@@ -491,7 +611,7 @@ impl NodeQueue {
                 state.spilling = true;
                 let room = self.disk_room(spill, &state, size);
                 let evict = !room
-                    && self.settings.when_full == WhenFull::DropOldest
+                    && settings.when_full == WhenFull::DropOldest
                     && !state.items.is_empty()
                     && self.writable(spill, &state);
                 if (room || evict) && spill.shared.disk.try_add(bytes) {
@@ -512,7 +632,7 @@ impl NodeQueue {
                     self.work.notify_one();
                     return Pushed::Queued;
                 }
-                if self.settings.when_full != WhenFull::Block {
+                if settings.when_full != WhenFull::Block {
                     return Pushed::Dropped(DropReason::Full);
                 }
             }
@@ -542,6 +662,9 @@ impl NodeQueue {
 
     /// The oldest event; waits while the queue is empty. `None` once closed.
     pub(crate) async fn pop(&self) -> Option<Queued> {
+        if let Some(core) = &self.durable {
+            return core.pop().await;
+        }
         loop {
             let pushed = self.pushed.notified();
             tokio::pin!(pushed);
@@ -584,6 +707,9 @@ impl NodeQueue {
     /// Puts an event back at the front (it couldn't be delivered), ignoring
     /// the limits: it was already counted against them.
     pub(crate) fn requeue(&self, item: Queued) {
+        if let Some(core) = &self.durable {
+            return core.requeue(item);
+        }
         let mut state = self.state();
         if state.closed {
             return;
@@ -594,8 +720,65 @@ impl NodeQueue {
         self.pushed.notify_waiters();
     }
 
-    pub(crate) fn delivered(&self) {
+    /// The plugin has the event (acked it, or it was sent to a plugin
+    /// without ACKS). Dropping `item` releases what it holds.
+    pub(crate) fn delivered(&self, item: Queued) {
+        if let Some(core) = &self.durable {
+            core.remove(item);
+        }
         self.counters.delivered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Delivery bookkeeping, kept by the queue's deliverer.
+    pub(crate) fn set_in_flight(&self, n: usize) {
+        self.counters.in_flight.store(n as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_redelivered(&self) {
+        self.counters.redelivered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_nacked(&self) {
+        self.counters.nacked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn dead_letter(&self, item: Queued) {
+        if let Some(core) = &self.durable {
+            core.remove(item);
+        }
+        self.counters.dead_lettered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drops every queued event (memory and disk). Events handed to the
+    /// plugin and not acked yet aren't affected. Returns how many went.
+    pub(crate) async fn purge(&self) -> u64 {
+        if let Some(core) = &self.durable {
+            return core.purge().await;
+        }
+        let (purged, disk) = {
+            let mut state = self.state();
+            let purged = (state.items.len() + state.pending.len()) as u64;
+            state.items.clear();
+            state.bytes = 0;
+            if let Some(spill) = &self.spill {
+                spill.shared.disk.sub(state.pending_bytes as u64);
+            }
+            state.pending.clear();
+            state.pending_bytes = 0;
+            let disk = self.spill.is_some().then(|| {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                state.purge_disk = Some(tx);
+                rx
+            });
+            (purged, disk)
+        };
+        self.popped.notify_waiters();
+        self.work.notify_one();
+        let on_disk = match disk {
+            Some(rx) => rx.await.unwrap_or(0),
+            None => 0,
+        };
+        purged + on_disk
     }
 
     /// Drops everything queued, and wakes and refuses every waiter. The spill
@@ -616,8 +799,13 @@ impl NodeQueue {
         self.work.notify_one();
     }
 
-    /// [`NodeQueue::close`], then waits for the spill task to delete the file.
-    pub(crate) async fn finish(&self) {
+    /// [`NodeQueue::close`], then waits for the spill task to delete the
+    /// file. A durable queue keeps its file (for the next start) unless
+    /// `remove` (its node is gone).
+    pub(crate) async fn finish(&self, remove: bool) {
+        if let Some(core) = &self.durable {
+            return core.finish(remove).await;
+        }
         self.close();
         let task = self
             .task
@@ -632,7 +820,7 @@ impl NodeQueue {
     pub(crate) fn stats(&self) -> QueueStats {
         let state = self.state();
         let c = &self.counters;
-        QueueStats {
+        let mut stats = QueueStats {
             len: state.items.len(),
             bytes: state.bytes,
             queued: c.queued.load(Ordering::Relaxed),
@@ -652,7 +840,28 @@ impl NodeQueue {
             dropped_disk_error: c.dropped_disk_error.load(Ordering::Relaxed),
             disk_blocked: state.disk_blocked,
             blocked_ms: c.blocked_us.load(Ordering::Relaxed) / 1_000,
+            in_flight: c.in_flight.load(Ordering::Relaxed),
+            redelivered: c.redelivered.load(Ordering::Relaxed),
+            nacked: c.nacked.load(Ordering::Relaxed),
+            dead_lettered: c.dead_lettered.load(Ordering::Relaxed),
+            durable: false,
+        };
+        if let Some(core) = &self.durable {
+            let d = core.stats();
+            let dc = &core.counters;
+            stats.durable = true;
+            stats.len = d.len;
+            stats.bytes = d.bytes;
+            stats.disk_len = d.disk_len;
+            stats.disk_bytes = d.disk_bytes;
+            stats.disk_blocked = d.disk_blocked;
+            stats.spilled = dc.spilled.load(Ordering::Relaxed);
+            stats.refilled = dc.refilled.load(Ordering::Relaxed);
+            stats.disk_bytes_written = dc.disk_bytes_written.load(Ordering::Relaxed);
+            stats.dropped_disk_error = dc.dropped_disk_error.load(Ordering::Relaxed);
+            stats.evicted = dc.evicted.load(Ordering::Relaxed);
         }
+        stats
     }
 }
 
@@ -668,7 +877,7 @@ mod tests {
 
     fn event(n: u32) -> DataEvent {
         DataEvent {
-            instance_id: n.to_string(),
+            body: n.to_string().into(),
             ..Default::default()
         }
     }
@@ -694,7 +903,7 @@ mod tests {
     async fn ids(q: &NodeQueue) -> Vec<String> {
         let mut out = vec![];
         while q.stats().len > 0 {
-            out.push(q.pop().await.unwrap().event.instance_id);
+            out.push(q.pop().await.unwrap().event.label());
         }
         out
     }
@@ -762,7 +971,7 @@ mod tests {
             let q = q.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                q.pop().await.map(|i| i.event.instance_id)
+                q.pop().await.map(|i| i.event.label())
             })
         };
         let started = std::time::Instant::now();

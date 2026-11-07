@@ -4,7 +4,7 @@ mod transfer;
 use crate::modules::director::DirectorHandle;
 use crate::modules::director::handle::{SceneState, SceneStatus};
 use crate::modules::mapping::{self, MappingSpec};
-use crate::modules::node_config::{NodeConfig, PluginRules, WhenFull};
+use crate::modules::node_config::{NodeConfig, PluginRules, SceneDefaults, WhenFull};
 use crate::modules::plugin::service::{
     Plugin, Service as PluginService, ServiceError as PluginError,
 };
@@ -12,7 +12,7 @@ use crate::modules::scene::graph;
 use chrono::Local;
 use flwrs_core::db::{Database, DbError};
 use flwrs_plugin::schema::rules;
-use flwrs_plugin::schema::schema::SchemaDefinition;
+use flwrs_plugin::schema::payload::SchemaDefinition;
 use query_sqlite::{EdgeValues, NodeValues};
 use serde_json::Value;
 use sqlx::Connection;
@@ -31,6 +31,9 @@ pub(crate) struct Scene {
     pub enabled: bool,
     /// Hop limit for this scene; `None` = the server default.
     pub max_hops: Option<u32>,
+    /// Defaults for the scene's nodes (durable queues, remote auth).
+    #[sqlx(json)]
+    pub defaults: SceneDefaults,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
 }
@@ -267,12 +270,13 @@ impl Service {
         let (name, max_hops) = check_scene(input)?;
         let mut conn = self.conn().await?;
         let id = Ulid::generate().to_string();
-        let scene = query_sqlite::create_scene(&mut conn, &id, &name, max_hops).await?;
+        let scene =
+            query_sqlite::create_scene(&mut conn, &id, &name, max_hops, &input.defaults).await?;
         log::debug!("Scene service: created scene [{}]", scene.id);
         Ok(scene)
     }
 
-    /// Replaces the scene's settings (name, hop limit).
+    /// Replaces the scene's settings (name, hop limit, defaults).
     pub(crate) async fn update_scene(
         &self,
         id: &str,
@@ -284,11 +288,13 @@ impl Service {
         let before = query_sqlite::get_scene(&mut conn, id)
             .await
             .map_err(not_found("scene"))?;
-        let scene = query_sqlite::update_scene(&mut conn, id, &name, max_hops)
+        let scene = query_sqlite::update_scene(&mut conn, id, &name, max_hops, &input.defaults)
             .await
             .map_err(not_found("scene"))?;
-        // A rename doesn't change the workflow; a new hop limit does.
-        if scene.enabled && scene.max_hops != before.max_hops {
+        // A rename doesn't change the workflow; a new hop limit or new
+        // defaults do.
+        if scene.enabled && (scene.max_hops != before.max_hops || scene.defaults != before.defaults)
+        {
             self.director.request_reload(id);
         }
         Ok(scene)
@@ -374,6 +380,10 @@ impl Service {
         scene_id: &str,
     ) -> Result<SceneCheck, ServiceError> {
         let mut check = SceneCheck::default();
+        let defaults = query_sqlite::get_scene(conn, scene_id)
+            .await
+            .map_err(not_found("scene"))?
+            .defaults;
         for row in query_sqlite::list_nodes(conn, scene_id).await? {
             let node = Node::try_from(row)?;
             let label = match &node.name {
@@ -388,9 +398,12 @@ impl Service {
                         node.plugin_id
                     ));
                     // What doesn't depend on the plugin can still be listed.
-                    check
-                        .problems
-                        .extend(node.config.missing_token().map(|p| format!("{label}: {p}")));
+                    check.problems.extend(
+                        [node.config.missing_token(&defaults), node.config.unsupported()]
+                            .into_iter()
+                            .flatten()
+                            .map(|p| format!("{label}: {p}")),
+                    );
                     continue;
                 }
                 Err(e) => return Err(ServiceError::Unknown(e.to_string())),
@@ -417,7 +430,7 @@ impl Service {
                 ));
             }
             check.problems.extend(
-                validate_against_plugin(&node.config, &plugin)?
+                validate_against_plugin(&node.config, &plugin, &defaults)?
                     .into_iter()
                     .map(|p| format!("{label}: {p}")),
             );
@@ -512,6 +525,24 @@ impl Service {
         Ok((scene, status))
     }
 
+    /// Drops the queued events of the scene's nodes, or of one node: in
+    /// their queues while the scene runs, else in its spool files (durable
+    /// queues of a disabled scene keep theirs). Returns how many went.
+    pub(crate) async fn purge_spool(
+        &self,
+        scene_id: &str,
+        node_id: Option<&str>,
+    ) -> Result<u64, ServiceError> {
+        self.get_scene(scene_id).await?;
+        if let Some(node_id) = node_id {
+            self.get_node(scene_id, node_id).await?;
+        }
+        self.director
+            .purge(scene_id, node_id)
+            .await
+            .map_err(|e| ServiceError::Unavailable(format!("director: {e}")))
+    }
+
     // ----- for the director -----
 
     /// Ids of the scenes that should run.
@@ -587,12 +618,12 @@ impl Service {
         input: NodeInput,
     ) -> Result<Node, ServiceError> {
         let _guard = self.lock.lock().await;
-        let prepared = self.prepare_node(input, None).await?;
         let mut conn = self.conn().await?;
-        let mut tx = conn.begin_with(WRITE_TX).await?;
-        let scene = query_sqlite::get_scene(&mut tx, scene_id)
+        let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
+        let prepared = self.prepare_node(input, None, &scene.defaults).await?;
+        let mut tx = conn.begin_with(WRITE_TX).await?;
         let row = query_sqlite::insert_node(
             &mut tx,
             scene_id,
@@ -620,7 +651,9 @@ impl Service {
             .await
             .map_err(not_found("node"))?
             .try_into()?;
-        let prepared = self.prepare_node(input, Some(&existing)).await?;
+        let prepared = self
+            .prepare_node(input, Some(&existing), &scene.defaults)
+            .await?;
         let mut tx = conn.begin_with(WRITE_TX).await?;
         let row = query_sqlite::update_node(&mut tx, scene_id, id, &prepared.values()).await?;
         // A new plugin type or queue policy can break edges that were valid before.
@@ -650,6 +683,7 @@ impl Service {
         &self,
         input: NodeInput,
         existing: Option<&Node>,
+        defaults: &SceneDefaults,
     ) -> Result<PreparedNode, ServiceError> {
         let mut errors = vec![];
         let name = optional_name(input.name, &mut errors);
@@ -686,7 +720,7 @@ impl Service {
             ));
         }
         if let (Some(plugin), Some(config)) = (&plugin, &config) {
-            errors.extend(validate_against_plugin(config, plugin)?);
+            errors.extend(validate_against_plugin(config, plugin, defaults)?);
         }
         if !errors.is_empty() {
             return Err(ServiceError::Invalid(errors));
@@ -873,6 +907,7 @@ impl PreparedNode {
 fn validate_against_plugin(
     config: &NodeConfig,
     plugin: &Plugin,
+    defaults: &SceneDefaults,
 ) -> Result<Vec<String>, ServiceError> {
     let manifest = plugin.parsed_manifest().ok_or_else(|| {
         ServiceError::Unknown(format!("plugin {} has an unreadable manifest", plugin.id))
@@ -889,10 +924,13 @@ fn validate_against_plugin(
             )
         }
     };
-    Ok(config.validate(&PluginRules {
-        launch_args_schema: validator.as_ref(),
-        launch_args_style: manifest.launch_args_style,
-    }))
+    Ok(config.validate(
+        &PluginRules {
+            launch_args_schema: validator.as_ref(),
+            launch_args_style: manifest.launch_args_style,
+        },
+        defaults,
+    ))
 }
 
 /// Whole-scene rules the DB can't express, checked before commit:
@@ -973,6 +1011,7 @@ pub(crate) struct SceneInput {
     pub name: String,
     /// `None` = use the server default (`[director] max_hops`).
     pub max_hops: Option<u32>,
+    pub defaults: SceneDefaults,
 }
 
 impl SceneInput {
@@ -980,7 +1019,7 @@ impl SceneInput {
     pub(crate) fn named(name: &str) -> Self {
         Self {
             name: name.into(),
-            max_hops: None,
+            ..Default::default()
         }
     }
 }
@@ -1135,6 +1174,9 @@ pub(crate) mod tests {
                     DirectorCommand::Reload { scene_id, .. } => format!("reload {scene_id}"),
                     DirectorCommand::Stop { scene_id, .. } => format!("stop {scene_id}"),
                     DirectorCommand::Status { scene_id, .. } => format!("status {scene_id}"),
+                    DirectorCommand::Purge {
+                        scene_id, node_id, ..
+                    } => format!("purge {scene_id} {}", node_id.unwrap_or_default()),
                     DirectorCommand::Overview { .. } => "overview".to_string(),
                     DirectorCommand::Snapshot { .. } => "snapshot".to_string(),
                 });
@@ -1235,6 +1277,32 @@ pub(crate) mod tests {
         ));
     }
 
+    #[cfg(not(feature = "remote"))]
+    #[tokio::test]
+    async fn remote_nodes_need_the_remote_feature() {
+        let f = fixture().await;
+        let scene = f.scene().await;
+        let err = f
+            .service
+            .create_node(
+                &scene.id,
+                node_input(
+                    "test-sink",
+                    json!({"launch": "remote", "token": "a-long-enough-token"}),
+                ),
+            )
+            .await
+            .unwrap_err();
+        let ServiceError::Invalid(problems) = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(
+            problems.iter().any(|p| p.contains("built without the remote feature")),
+            "{problems:?}"
+        );
+    }
+
+    #[cfg(feature = "remote")] // creates remote nodes
     #[tokio::test]
     async fn remote_token_is_kept_on_update_and_never_lost() {
         let f = fixture().await;
@@ -1464,6 +1532,7 @@ pub(crate) mod tests {
         let with_limit = SceneInput {
             name: "renamed".into(),
             max_hops: Some(100),
+            ..Default::default()
         };
         let scene = f.service.update_scene(&s.id, &with_limit).await.unwrap();
         assert_eq!(scene.max_hops, Some(100));
@@ -1489,6 +1558,7 @@ pub(crate) mod tests {
         let bad = SceneInput {
             name: " ".into(),
             max_hops: Some(0),
+            ..Default::default()
         };
         assert_eq!(
             invalid(f.service.create_scene(&bad).await.unwrap_err()),
@@ -1497,11 +1567,13 @@ pub(crate) mod tests {
         let too_high = SceneInput {
             name: "x".into(),
             max_hops: Some(MAX_HOPS_LIMIT + 1),
+            ..Default::default()
         };
         assert!(f.service.create_scene(&too_high).await.is_err());
         let ok = SceneInput {
             name: "x".into(),
             max_hops: Some(MAX_HOPS_LIMIT),
+            ..Default::default()
         };
         let scene = f.service.create_scene(&ok).await.unwrap();
         assert_eq!(scene.max_hops, Some(MAX_HOPS_LIMIT));

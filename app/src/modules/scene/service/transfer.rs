@@ -3,6 +3,7 @@
 //! this server lacks the plugins it names: those show up as problems in
 //! [`Service::check`] until they're installed.
 
+use crate::modules::node_config::SceneDefaults;
 use super::query_sqlite::{self, EdgeValues, NodeValues};
 use super::*;
 use crate::modules::node_config::LaunchMode;
@@ -78,6 +79,8 @@ impl Service {
             export_time: Some(now()),
             includes_secrets: include_secrets,
             exporter_version: env!("CARGO_PKG_VERSION").into(),
+            defaults_json: (scene.defaults != SceneDefaults::default())
+                .then(|| serde_json::to_string(&scene.defaults).expect("defaults serialize")),
         };
         log::info!(
             "Scene service: exported scene [{id}]{}",
@@ -101,8 +104,14 @@ impl Service {
         let mut conn = self.conn().await?;
         let mut tx = conn.begin_with(WRITE_TX).await?;
         let scene_id = Ulid::generate().to_string();
-        let scene =
-            query_sqlite::create_scene(&mut tx, &scene_id, &plan.name, plan.max_hops).await?;
+        let scene = query_sqlite::create_scene(
+            &mut tx,
+            &scene_id,
+            &plan.name,
+            plan.max_hops,
+            &plan.defaults,
+        )
+        .await?;
         // Ascending ids keep the file's node order in listings (all imported
         // nodes share one create_time).
         let mut generator = ulid::Generator::new();
@@ -176,6 +185,7 @@ struct PlannedEdge {
 struct Plan {
     name: String,
     max_hops: Option<u32>,
+    defaults: SceneDefaults,
     nodes: Vec<PlannedNode>,
     edges: Vec<PlannedEdge>,
 }
@@ -184,9 +194,18 @@ struct Plan {
 /// plugins. Returns every problem at once.
 fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
     let mut errors = vec![];
+    let defaults = match file.defaults_json.as_deref().map(SceneDefaults::parse) {
+        None => SceneDefaults::default(),
+        Some(Ok(defaults)) => defaults,
+        Some(Err(err)) => {
+            errors.push(err);
+            SceneDefaults::default()
+        }
+    };
     let (name, max_hops) = match check_scene(&SceneInput {
         name: file.name,
         max_hops: file.max_hops,
+        defaults: defaults.clone(),
     }) {
         Ok(settings) => settings,
         Err(ServiceError::Invalid(problems)) => {
@@ -296,6 +315,7 @@ fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
         Ok(Plan {
             name,
             max_hops,
+            defaults,
             nodes,
             edges,
         })
@@ -338,8 +358,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg_attr(not(feature = "remote"), allow(dead_code))]
     const TOKEN: &str = "a-long-enough-shared-secret";
 
+    #[cfg_attr(not(feature = "remote"), allow(dead_code))]
     /// source (test-source, no files) → local sink and remote sink.
     async fn sample(f: &Fixture) -> (Scene, Vec<Node>) {
         let scene = f
@@ -347,6 +369,10 @@ mod tests {
             .create_scene(&SceneInput {
                 name: "demo scene".into(),
                 max_hops: Some(50),
+                defaults: crate::modules::node_config::SceneDefaults {
+                    durable: Some(true),
+                    ..Default::default()
+                },
             })
             .await
             .unwrap();
@@ -375,10 +401,12 @@ mod tests {
         (scene, vec![source, local, remote])
     }
 
+    #[cfg_attr(not(feature = "remote"), allow(dead_code))]
     fn decode(export: &Export) -> pb::SceneFile {
         scene_file::decode(&export.bytes).unwrap()
     }
 
+    #[cfg(feature = "remote")] // creates remote nodes
     #[tokio::test]
     async fn export_then_import_recreates_the_scene_with_new_ids() {
         let f = fixture().await;
@@ -401,6 +429,7 @@ mod tests {
         let new = imported.scene;
         assert_ne!(new.id, scene.id);
         assert_eq!((new.name.as_str(), new.max_hops), ("demo scene", Some(50)));
+        assert_eq!(new.defaults.durable, Some(true), "defaults travel too");
         assert!(!new.enabled, "imports arrive disabled");
 
         // The file has the nodes in listing order; the import keeps it.
@@ -472,6 +501,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "remote")] // creates remote nodes
     #[tokio::test]
     async fn secrets_are_exported_only_when_asked() {
         let f = fixture().await;
@@ -517,6 +547,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")] // creates remote nodes
     #[tokio::test]
     async fn plugins_missing_here_dont_block_the_import() {
         let f = fixture().await;

@@ -2,20 +2,20 @@
 
 <img src="flwrs-logo.svg" alt="flwrs logo" width="100" height="100">
 
-A lightweight framework and server for running pluggable workflows, inspired by [Node-RED](https://nodered.org/).
+A lightweight framework and server for running pluggable dynamic workflows, inspired by [Node-RED](https://nodered.org/).
 
-With flwrs you build workflows (data flows) of any complexity from **pre-compiled plugins** and **configuration**, without writing code. The same runtime is meant to run both in the data centre and at the edge, for anything from simple automation to complex pipelines, such as running ML models as workflow steps.
+With flwrs you build workflows (data flows) of any complexity from **pre-compiled plugins** and **configuration**, with little to no code. The same runtime is meant to run both in the data centre and at the edge, for anything from simple automation to complex pipelines, such as running ML/AI models as workflow steps.
 
 > **Status:** early development; expect breaking changes. What works today:
 >
-> - the server core, the plugin protocol and its Rust SDK, the plugin registry (package upload), and scene management over REST;
-> - running scenes: the director launches and supervises plugins (local or remote), routes events through bounded queues with optional spill to disk, applies edge mappings (dot notation and Lua), and applies edits to a running scene as a diff, restarting only what changed;
+> - the server core, the [plugin protocol](docs/protocol.md) (version 2) with its Rust SDK and a conformance suite, the plugin registry (package upload), and scene management over REST;
+> - running scenes: the director launches and supervises plugins (local, or remote over TLS with tokens or client certificates), routes events through bounded queues (credit-based flow control, at-least-once delivery with acks, optionally durable on disk), applies edge mappings (dot notation and Lua), and applies edits to a running scene as a diff, restarting only what changed;
 > - scene export / import between servers, status endpoints, and telemetry export (OpenTelemetry, or local files);
 > - one base plugin (HTTP sink, Rust), plus minimal demo plugins in Python, Go, TypeScript and Java.
 >
 > See the [roadmap](#roadmap) for what's missing.
 > 
-> I'm using this project as a learning/test bed to experiment with Rust and local/open ML/AI models.
+> I'm using this project as a learning/test bed to experiment with Rust, edge and heavy-load event systems and various ML/AI models.
 
 ## Concepts
 
@@ -57,7 +57,7 @@ Binaries end up in `target/debug/` (or `target/release/`).
 
 **Optional features** of the server, all on by default: `mapping-lua` (Lua edge mappings), `otel` (exporting stats to OpenTelemetry) and `telemetry-file` (writing stats to local files). `--no-default-features` builds without any of them, for small edge devices; add back what you need, e.g. `--no-default-features --features telemetry-file`.
 
-**Lua mappings** (the `mapping-lua` feature) are built in by default. For a target without a working C toolchain, or with very little flash, build the server without them: `cargo build -p flwrs-app --no-default-features --features otel,telemetry-file` (or with no features at all). Such a server can still import scenes that use Lua, but won't run them (see *Lua*, below).
+**Cargo features** of the server, all on by default: `mapping-lua` (Lua edge mappings), `otel` (OpenTelemetry export), `telemetry-file` (telemetry files) and `remote` (remote plugins: tokens, `remote_id`, the TLS listener and client certificates). For a small edge device, or a target without a working C toolchain, leave out what you don't need, down to a bare server that only runs local plugins: `cargo build -p flwrs-app --no-default-features`. A server built without a feature can still import scenes that use it (Lua mappings, remote nodes), but lists them as problems and won't run them.
 
 ## Running the server
 
@@ -79,9 +79,19 @@ sink_type = "CONSOLE"
 filename = "main.db"
 
 [hub]
-host = "127.0.0.1"   # a reachable address for remote plugins
+host = "127.0.0.1"   # local plugins connect here (plain TCP)
 port = 7400          # 0 = pick a free port
 # max_inflight_bytes = 536870912   # all queued events, across scenes
+# heartbeat_interval_ms = 10000    # PING every connection this often (0 = never)
+# credit_window = 64               # events a producer with CREDITS may have in flight
+# max_unacked = 1024               # upper bound for a consumer's window (default_max_unacked = 64)
+
+[hub.tls]            # optional: a second listener, with TLS, for remote plugins (remote feature)
+port = 7401
+cert = "hub.pem"     # the hub's certificate chain and key (PEM)
+key = "hub.key"
+# client_ca = "clients-ca.pem"     # CA of the client certificates of mtls nodes
+# host = "0.0.0.0"
 
 [director]
 # max_hops = 32      # an event is dropped after this many handovers (stops loops); scenes can override it
@@ -106,92 +116,18 @@ It keeps everything the server writes at run time (database, installed plugins, 
 
 ## Plugin protocol
 
-The protocol is the contract between the server and a plugin, so plugins can be written in any language. The Rust SDK in `plugin/` is one implementation of it.
+The protocol is the contract between the server and a plugin, so plugins can be written in any language. **The specification is [`docs/protocol.md`](docs/protocol.md)**; the messages are in [`plugin/schema/`](plugin/schema). The Rust SDK in `plugin/` is one implementation of it. In short:
 
-### Process and connection
+- The server starts a local plugin with `--id <instance id> --host <hub host> --port <hub port> --log-level <level>` (plus the node's launch arguments) and a per-launch token in `FLWRS_TOKEN`. A remote plugin is started by an operator, and authenticates with the node's pre-shared token or a client certificate. Every plugin opens one TCP connection to the hub, or a TLS connection to its TLS listener.
+- Every message is a frame: `u32 LE length | u8 framing version (2) | u32 LE header length | FrameHeader | body`. The protobuf `FrameHeader` names the body's message (`MsgCode`), and carries the routing metadata of data events, so the hub forwards bodies without decoding them.
+- The first frame is the plugin's `Initialize` (instance id, token, type, version, payload schemas, protocol versions, capabilities). The hub answers `InitializeResponse` or, to reject it, `Shutdown`. Then data events flow, `PING` is answered with `PONG`, and `Shutdown` is answered with `Exit`. A plugin that loses its connection reconnects with backoff (at most 30 s).
+- Optional capabilities: **`ACKS`** (acknowledgements and redelivery: at-least-once delivery) and **`CREDITS`** (credit-based flow control for what a plugin produces). A plugin without them still works, with TCP backpressure and at-most-once delivery on its hops.
 
-A node runs its plugin in one of two ways (the node's `config.launch`):
+**Check a plugin** in any language with the conformance suite, which runs it against a fake hub:
 
-- **Local** (default): the server starts the plugin executable as a child process, in the plugin's install folder, with `--id <instance id> --host <hub host> --port <hub port> --log-level <trace|debug|info|warn|error>`, followed by the node's `launch_args`. A fresh token for this launch is in the `FLWRS_TOKEN` environment variable.
-- **Remote:** an operator starts the plugin on another machine, with the same arguments pointing at the hub's reachable address, and the node's pre-shared token in `FLWRS_TOKEN` (or `--token`; the environment is preferred, since arguments show up in `ps`). Until TLS is supported, run remote links over a trusted network or a tunnel.
-
-The plugin opens one TCP connection to `host:port`. It carries frames in both directions until shutdown.
-
-**Supervision of local plugins** (timings are per node in `config.runtime`, with defaults from the manifest's `runtime_defaults`, then built-in):
-
-- The plugin must be accepted (`Initialize` → `InitializeResponse`) within `init_timeout_ms` (10 s) of being started. Otherwise it's killed (SIGTERM, `kill_grace_ms` = 2 s, SIGKILL) and relaunched after `restart_delay_ms` (5 s), with a new token. `restart_backoff` makes the delay grow exponentially (off by default). After `max_restarts` consecutive launches that never got accepted (unlimited by default), the node is `Failed`.
-- A plugin rejected for its type, version or schemas isn't relaunched: the same executable would fail the same way.
-- If it disconnects but keeps running, it has `reconnect_timeout_ms` (60 s) to come back. If its process exits, or it sends an `Exit` nobody asked for, it's relaunched.
-- To stop it, the hub sends `Shutdown` and waits `shutdown_grace_ms` (10 s) for the process to exit. Then it asks the OS to stop the plugin and every process the plugin started, waits `kill_grace_ms`, and kills them:
-  - **Linux, macOS and other Unixes:** each plugin runs in its own process group; SIGTERM, then SIGKILL, go to the whole group.
-  - **Windows:** each plugin runs in its own console process group and in a Job Object; a Ctrl-Break event, then terminating the Job, which also takes the plugin's child processes down if the server itself exits.
-
-  A plugin should therefore exit on `Shutdown`, and treat SIGTERM (Unix) or Ctrl-Break (Windows) as a last request to stop.
-- Whatever it writes to stdout and stderr ends up in the server log, tagged with scene and node.
-
-### Framing
-
-Every message is one frame. All integers are unsigned 32-bit little-endian:
-
+```sh
+cargo run -p flwrs-trellis -- path/to/unzipped-package   # --list shows the cases
 ```
-+-------------+-------------+---------------------------+------------------------+
-| packet_len  | header_len  | header (header_len bytes) | protobuf message bytes |
-|   u32 LE    |   u32 LE    | "Name: value" lines       |                        |
-+-------------+-------------+---------------------------+------------------------+
-              |<----------------------- packet_len bytes ----------------------->|
-```
-
-- `packet_len` counts everything after itself: `4 + header_len + message length`. The reference SDK rejects frames larger than 256 MiB. The hub skips (and logs) messages larger than its per-event limit (`[hub] max_event_bytes`, 16 MiB by default, lowered per node by `runtime.queue.max_event_bytes`), and closes a connection whose first frame is over 1 MiB (`max_handshake_bytes`) or that sends no `Initialize` within 10 s (`handshake_timeout_ms`).
-- The header is HTTP-style lines, for example:
-
-  ```
-  Version: 1.0.0\r\n
-  Msg-Code: 3\r\n
-  ```
-
-  - ASCII only, at most 4 KiB. Each line is `Name: value` and ends with CRLF; readers also accept a bare LF. The last line must end with a line break too. There's no blank line at the end: `header_len` says where the header ends.
-  - Names are case-insensitive, and whitespace around values is trimmed. A duplicate name is an error. **Unknown names are ignored**, so headers can be added later.
-  - Required: `Version` (currently `1.0.0`) and `Msg-Code`. A missing or unknown value, a duplicate, a malformed line or a non-ASCII byte is a frame error, and the connection is closed.
-- `Msg-Code` says which message type the body holds (`schema.common.MsgCode`):
-
-  | Code | Message | Direction |
-  |---|---|---|
-  | 1 | `schema.source.SourceMessage` | source → runtime |
-  | 2 | `schema.source.RuntimeSourceMessage` | runtime → source |
-  | 3 | `schema.sink.SinkMessage` | sink → runtime |
-  | 4 | `schema.sink.RuntimeSinkMessage` | runtime → sink |
-  | 5 | `schema.transform.TransformMessage` | transform → runtime |
-  | 6 | `schema.transform.RuntimeTransformMessage` | runtime → transform |
-
-  `0` (`UNDEFINED`) is never valid. A plugin sends only its own type's plugin → runtime code, and receives only the matching runtime → plugin code. Anything else is a protocol violation: the receiver closes the connection.
-
-### Messages
-
-The schemas are in [`plugin/schema/`](plugin/schema). Generate code for your language with `protoc` (or `buf`). Each message type has a `oneof payload` that says what it carries.
-
-- **Data messages** travel along the scene's edges: `SourceEvent` (from sources), `TransformEvent` (into and out of transforms) and `SinkEvent` (into sinks). Each carries a `PluginPayload` and `metadata` (`common.EventMetadata`: event id, trace id, hop count, origin node, create time).
-- **System messages** are between one plugin and the hub, and are never routed: `Initialize` / `InitializeResponse`, `LogEvent`, `ErrorEvent`, `Shutdown` and `Exit`.
-
-### Lifecycle
-
-1. **Initialize.** The first frame on every connection is the plugin's `Initialize`: its instance id (`--id`), its version, its `token`, and its payload schemas (`schema` for sources and sinks, `in_schema` / `out_schema` for transforms). The hub checks the id, token, type, version and schemas against the node and the installed plugin.
-   - Accepted: the hub answers `InitializeResponse`. If the node already had a connection, the new one replaces it (the old one is closed).
-   - Rejected (unknown id, wrong token, mismatch): the hub answers `Shutdown` and closes. The plugin must honour `Shutdown` at any time, including before `InitializeResponse`, and must not reconnect after it.
-2. **Run.** After `Initialize`, the plugin may send `LogEvent`s (`log`) and `ErrorEvent`s (`error`). **Data events may be sent only after `InitializeResponse`.**
-   - Sources send `SourceEvent`s whenever they have data. Leave `metadata` unset; the hub fills it in.
-   - Sinks receive `SinkEvent`s.
-   - Transforms receive a `TransformEvent` and answer with a `TransformEvent` (and may send extra ones). **A transform copies the input event's `metadata` onto every output event produced from it**, so traces and the hop limit survive the transform.
-   - A failed event is reported as an `ErrorEvent`. The hub only logs it; the plugin keeps running.
-   - **Sends may block.** When downstream is slower, the hub stops reading from the plugin and its TCP writes block. That's flow control, not an error.
-3. **Shutdown.** The runtime sends `Shutdown`. The plugin cleans up, sends `common.Exit` with a code (`OK` / `INTERRUPTED` / `ERROR`) and exits. An `Exit` the hub didn't ask for means the plugin is stopping on its own, and a local plugin is relaunched.
-
-**Reconnect rule.** If the connection drops without a `Shutdown`, the plugin keeps running and reconnects, with backoff (for example 1 s, doubling up to at most 30 s, with some jitter). On every new connection it re-sends the same `Initialize` (same token) and waits for `InitializeResponse` again before sending data. Work tied to the old connection is dropped: the Rust SDK cancels a source's `run` and restarts it after the reconnect, and data sent while disconnected fails. This lets plugins ride out hub restarts and network blips. For local plugins, the hub gives a reconnecting plugin 60 s by default before treating it as unhealthy.
-
-### Compatibility
-
-Every enum's zero value is `UNDEFINED`, so a field that was never set can't be mistaken for a real value. A `FieldValue` with no variant set means null. Payload field types are string, i32, u32, i64, u64, f32, f64, bool, datetime, bytes, array, map and object.
-
-The `.proto` files evolve backward compatibly: fields, messages and enum values are only ever added, never renumbered or reused. New optional frame headers can be added freely; a new required header or a new `Msg-Code` comes with a new protocol `Version`, and the hub keeps accepting the old one.
 
 ## Scenes
 
@@ -199,21 +135,24 @@ A **scene** is a workflow: a directed graph whose **nodes** are plugin instances
 
 | Request | Purpose |
 |---|---|
-| `GET/POST /api/scenes`, `GET/PUT/DELETE /api/scenes/by-id/{id}` | List, create, get, update (`name`, `max_hops`), delete scenes (deleting removes nodes and edges). |
+| `GET/POST /api/scenes`, `GET/PUT/DELETE /api/scenes/by-id/{id}` | List, create, get, update (`name`, `max_hops`, `defaults`), delete scenes (deleting removes nodes, edges and queued events). |
 | `POST /api/scenes/by-id/{id}/enable`, `…/disable` | Run or stop the workflow. Enabling requires every node's plugin to be installed. |
 | `GET/POST /api/scenes/by-id/{id}/nodes`, `GET/PUT/DELETE …/nodes/by-id/{node_id}` | Manage nodes. A node runs a registered plugin; its `type` is the plugin's type. |
 | `GET/POST /api/scenes/by-id/{id}/edges`, `GET/PUT/DELETE …/edges/by-id/{edge_id}` | Manage edges. A SINK can't send and a SOURCE can't receive; at most one edge per direction between two nodes. |
 | `GET /api/scenes/by-id/{id}/export`, `POST /api/scenes/import` | Move a scene to another server as a `.flwr` file (see below). |
 | `GET /api/scenes/by-id/{id}/check` | Whether the scene can run here: `launchable`, `problems` (block enabling), `warnings`. |
 | `GET /api/scenes/by-id/{id}/status` | What the scene is doing right now (see *Status*, below). |
+| `DELETE /api/scenes/by-id/{id}/spool`, `…/nodes/by-id/{node_id}/spool` | Drop the events queued for the scene's nodes, or one node's (memory and spool files). For a disabled scene, that's what its durable queues kept. Returns `purged_events`. |
 
 Invalid requests return **422** with every problem listed in `details`.
 
 **Hop limit:** every handover of an event between nodes counts as a hop, and an event is dropped (and counted) once it exceeds the limit. That stops events from circling forever in a cycle. The limit is `[director] max_hops` (32) unless the scene sets its own `max_hops` (1 to 10 000), for complex scenes with long chains or deliberate loops:
 
 ```json
-{ "name": "enrichment pipeline", "max_hops": 200 }
+{ "name": "enrichment pipeline", "max_hops": 200, "defaults": { "durable": true } }
 ```
+
+**Scene defaults** (`defaults`, all optional) apply to every node that doesn't set its own: `durable` (durable queues, below), `remote_auth` (`token` or `mtls`) and `require_tls` (remote nodes, below).
 
 **Node config** (all optional):
 
@@ -225,15 +164,20 @@ Invalid requests return **422** with every problem listed in `details`.
 }
 ```
 
-- **`launch`:** `local` (the hub starts the plugin) or `remote` (the plugin runs elsewhere and connects with `token`, a pre-shared secret of at least 16 characters).
-- **`remote_id`** (remote nodes): the id the remote plugin is started with (`--id`). Defaults to the node id, but unlike the node id it stays the same when the scene is exported and imported elsewhere. Several nodes may share one; their tokens tell them apart.
+- **`launch`:** `local` (the hub starts the plugin) or `remote` (the plugin runs elsewhere and connects to the hub).
+- **`remote_id`** (remote nodes): the id the remote plugin is started with (`--id`). Defaults to the node id, but unlike the node id it stays the same when the scene is exported and imported elsewhere. Several nodes may share one; their credentials tell them apart.
+- **`auth`** (remote nodes): `token` (a pre-shared secret of at least 16 characters, in `token`) or `mtls` (a client certificate on the TLS listener: one that chains to `[hub.tls] client_ca` and names the `remote_id` in its SAN or CN, or the one pinned in `tls.client_cert_sha256`). Default: the scene's `remote_auth`, else `token`. **`require_tls`** (token nodes): only accept the plugin over the TLS listener; default: the scene's, else true when the hub has a TLS listener. A remote plugin built on the Rust SDK takes its TLS settings from `FLWRS_TLS_CA`, `FLWRS_TLS_SERVER_NAME`, `FLWRS_TLS_CERT` and `FLWRS_TLS_KEY`.
 - **`token`:** never returned by the API (`has_token` instead). Omitting it on update keeps the stored one.
 - **`launch_args`:** checked against the plugin's launch-args schema and argument rules. Local nodes only.
-- **`runtime`:** timeouts, restarts and the event queue. Unknown keys are rejected. A node on a cycle can't use `"when_full": "block"`, because blocking can deadlock there.
+- **`runtime`:** timeouts, restarts, the event queue and redelivery (`delivery`: `max_attempts`, 5, and `retry_delay_ms`, 1 000). Unknown keys are rejected. A node on a cycle can't use `"when_full": "block"`, because blocking can deadlock there.
 
 **Event queues.** Every node that receives events has an inbound queue. By default it holds up to 1 024 events or 64 MiB in memory; when it's full, `when_full` decides: `block` (the default: the producer waits, up to `block_timeout_ms`), `drop_newest` or `drop_oldest`. All queues share a hub-wide budget (`[hub] max_inflight_bytes`, 512 MiB).
 
-With **spill to disk** (`"queue": {"spill": {"enabled": true}}`, or `[director] spill_default = true`), a queue keeps up to `memory_max_events` / `memory_max_bytes` (256 / 8 MiB) in memory, and puts the rest in a per-node SQLite file under `[director] spool_dir`, up to `disk_max_events` / `disk_max_bytes` (1 000 000 / 1 GiB). The order is kept exactly. Spool files are deleted when their node or scene stops (a node that restarts on a reload starts with an empty queue), so delivery stays at-most-once. A free-space guard (`spill_min_free_bytes`, 1 GiB) keeps a burst from filling the disk. Spill is for bursts: on SD cards and cheap flash, a permanently slow consumer wears the storage out.
+With **spill to disk** (`"queue": {"spill": {"enabled": true}}`, or `[director] spill_default = true`), a queue keeps up to `memory_max_events` / `memory_max_bytes` (256 / 8 MiB) in memory, and puts the rest in a per-node SQLite file under `[director] spool_dir`, up to `disk_max_events` / `disk_max_bytes` (1 000 000 / 1 GiB). The order is kept exactly. A spilling queue's file is deleted when its node or scene stops. A free-space guard (`spill_min_free_bytes`, 1 GiB) keeps a burst from filling the disk. Spill is for bursts: on SD cards and cheap flash, a permanently slow consumer wears the storage out.
+
+**Delivery.** For a plugin that offers `ACKS` (the Rust SDK does), the hub keeps every event it delivered until the plugin acks it, at most the plugin's window at a time. It delivers an event again, with the same `event_id` and a higher attempt number, after a disconnect, a crash, or a NACK with retry (after `retry_delay_ms`). After `max_attempts` deliveries it's dead-lettered (dropped, logged and counted). So delivery is at-least-once while the server runs: consumers may see an event twice. A changed node keeps its queue across a reload, unless its queue kind changes (spill or durable switched on or off).
+
+**Durable queues** (`"queue": {"durable": true}`, or the scene's `defaults.durable`): every event is committed to the node's spool file before its producer is told it's taken, and stays there until the consumer acks it, so it survives a server restart or a power loss. Limits are the spill ones (`spill.*`): memory is a cache of the oldest events, and the disk limits make the queue full. When a durable node's scene is disabled, its file stays and is delivered when the scene runs again (or dropped with `DELETE …/spool`). Files of deleted scenes and removed nodes are deleted, also at start-up.
 
 **Event size:** an event larger than a node's own limits is still accepted on its own (into an empty queue, or onto an empty disk), since it only uses the shared budget for a while. Only an event larger than the hub-wide limit (`max_inflight_bytes`) is dropped, with a WARN.
 
@@ -279,7 +223,7 @@ The output is then shaped to the target node's input schema. Conversions that lo
 - **`GET /api/scenes/by-id/{id}/status`**: the scene's `state` (`RUNNING`, `STOPPED`, or `FAILED` with `errors`), its hop limit, and per node:
   - the plugin's state (`LAUNCHING`, `WAITING`, `RUNNING`, `DISCONNECTED`, `UNHEALTHY`, `STOPPING`, `STOPPED`, `FAILED`), its pid, launches and last error;
   - `counters`: `emitted` (events the plugin produced), `received` (events delivered to it), `dropped`, `mapping_errors`, `restarts`;
-  - the inbound `queue`: depth in events and bytes, drops by reason, time producers spent blocked (`blocked_ms`), and spill details (on disk, written, refilled, whether the free-space guard is holding writes).
+  - the inbound `queue`: depth in events and bytes, drops by reason, time producers spent blocked (`blocked_ms`), delivery (`in_flight`, `redelivered`, `nacked`, `dead_lettered`), and disk details (`spill`, `durable`, on disk, written, refilled, whether the free-space guard is holding writes).
 - **`GET /api/status`**: the server at a glance: every scene the director has handled since it started (state, node counts), the hub's address, and memory and disk in use against their limits (the hub-wide queue budget, spill memory, spool files).
 
 Counters start at zero when a node starts: when its scene starts, or when a reload restarts that node. Nodes a reload leaves running keep counting.
@@ -352,7 +296,7 @@ curl -o line3.flwr "http://source:8080/api/scenes/by-id/<id>/export?include_secr
 curl -F file=@line3.flwr http://destination:8080/api/scenes/import
 ```
 
-- **The file** (`.flwr`, `application/vnd.flwrs.scene`) holds the scene's name and hop limit, every node (type, plugin id and version, config) and every edge (with its mapping). Format: the ASCII magic `FLWR`, a u32 little-endian length, the format version (`1.0.0`), then a protobuf `SceneFile` ([`app/schema/scene_file.proto`](app/schema/scene_file.proto)).
+- **The file** (`.flwr`, `application/vnd.flwrs.scene`) holds the scene's name, hop limit and defaults, every node (type, plugin id and version, config) and every edge (with its mapping). Format: the ASCII magic `FLWR`, a u32 little-endian length, the format version (`1.0.0`), then a protobuf `SceneFile` ([`app/schema/scene_file.proto`](app/schema/scene_file.proto)).
 - **Secrets:** remote nodes' tokens are left out unless you export with `include_secrets=true`. Treat such a file like a password. Without tokens, the imported remote nodes need one set before the scene can be enabled.
 - **Ids:** an import always creates a new scene with new node and edge ids, so the same file can be imported twice. Remote nodes keep their `remote_id` (the export fills it in from the node id if it was never set), so remote plugins don't need to be restarted with new ids.
 - **Mappings travel with the scene** (as JSON, Lua code included), and the destination checks them against **its** plugins and build: a mapping that names a field the destination's plugin version doesn't have, Lua code with a syntax error, or any Lua on a server built without Lua support is reported as a problem (blocking enabling), not an import error. Only an invalid mapping shape (e.g. a malformed path) makes the file itself invalid.
@@ -419,9 +363,15 @@ curl -F file=@target/plugins/http-sink-0.0.1-macos-aarch64.zip http://localhost:
 
 ## Writing a plugin
 
-**In Rust:** create a binary crate under `plugins/`, add it to `members` in the root `Cargo.toml`, depend on `flwrs-plugin`, implement `Sink`, `Source` or `Transform`, declare the plugin's schema, and run the matching runner (`SinkRunner`, `SourceRunner`, `TransformRunner`). The runner handles the connection (token from `FLWRS_TOKEN` or `ConnectionConfig::with_token`), reconnecting, logging, error reporting, metadata propagation and shutdown. A source emits events through the `LocalSink` handle it receives in `initialize`. [`plugins/http_sink`](plugins/http_sink) is a complete example, including its package files. Package it with `cargo xtask package-plugin <dir>`.
+**In Rust:** create a binary crate under `plugins/`, add it to `members` in the root `Cargo.toml`, depend on `flwrs-plugin`, implement `Sink`, `Source` or `Transform`, declare the plugin's schema, and run the matching runner (`SinkRunner`, `SourceRunner`, `TransformRunner`). The runner handles the connection (token from `FLWRS_TOKEN` or `ConnectionConfig::with_token`; TLS with the `tls` feature), the handshake, heartbeats, credit, acks, reconnecting, logging and shutdown.
 
-**In any other language:** build an executable that follows the [plugin protocol](#plugin-protocol). Generate message types from `plugin/schema/*.proto`, implement the framing and header lines (a few dozen lines in most languages), and follow the lifecycle and reconnect rule above. [`examples/plugins/`](examples/plugins) has minimal demo HTTP sinks in Python, Go, TypeScript (Node.js) and Java, each about 150 lines with a `build.sh` that produces an uploadable package.
+- A sink's `consume_event` gets an `InboundEvent` (payload, metadata, attempt); `Ok` acks it, an error NACKs it (`SinkError::retryable` to have it delivered again).
+- A transform's `process_event` returns any number of outputs, sent tied to their input (so the trace continues), then the input is acked. A stateful transform returns none until it's ready, and can emit later through its `LocalSink`: `emit` starts a new trace, `emit_linked` continues an earlier input's.
+- A source emits through the `LocalSink` it gets in `initialize`: `emit` (waits for credit), or `emit_confirmed` (also waits until the hub has stored the event).
+
+[`plugins/http_sink`](plugins/http_sink) is a complete example, including its package files. Package it with `cargo xtask package-plugin <dir>`.
+
+**In any other language:** build an executable that follows the [plugin protocol](docs/protocol.md). Generate message types from `plugin/schema/*.proto`, implement the framing (a few dozen lines in most languages), and follow the lifecycle and reconnect rule; section 16 of the spec lists the minimum. [`examples/plugins/`](examples/plugins) has minimal demo HTTP sinks in Python, Go, TypeScript (Node.js) and Java, each with a `build.sh` that produces an uploadable package. Check yours with the conformance suite (`cargo run -p flwrs-trellis -- <package folder>`).
 
 ## Roadmap
 
@@ -432,7 +382,7 @@ flwrs is in early development. The main things still missing, roughly in order:
 3. **A web UI** for building and running scenes visually (nodes, edges, mappings, status), instead of through the REST API.
 4. **Running as a cluster.** The server currently runs in **single-node mode only**: one server runs every scene it has, and there's no swarming, no handover of scenes between servers, and no load balancing. Remote plugins can run on other machines, but they all connect to one hub. Running properly in a data-centre environment (in-cluster) needs scenes spread across servers, failover, and load balancing.
 
-Smaller known gaps (no TLS for remote plugins yet, at-most-once delivery, no Windows CI) are listed in [AGENTS.md](AGENTS.md), *Current state / known gaps*.
+Smaller known gaps (no Windows CI, durable delivery only within one server) are listed in [AGENTS.md](AGENTS.md), *Current state / known gaps*.
 
 ## Contributing with AI agents
 

@@ -5,13 +5,13 @@
 set -e
 cd "$(dirname "$0")"
 rm -rf pb bin dist && mkdir -p pb bin dist
-# The protos have no go_package option: map all three into one Go package.
+# The protos have no go_package option: map both into one Go package.
+PROTOS="schema/payload.proto schema/protocol.proto"
 M=""
-for f in schema/schema.proto schema/common.proto schema/sink.proto; do
+for f in $PROTOS; do
   M="$M --go_opt=M$f=flwrs.example/http-sink-go/pb"
 done
-protoc -I ../../../plugin --go_out=pb --go_opt=paths=source_relative $M \
-  schema/schema.proto schema/common.proto schema/sink.proto
+protoc -I ../../../plugin --go_out=pb --go_opt=paths=source_relative $M $PROTOS
 mv pb/schema/*.go pb/ && rmdir pb/schema
 go mod tidy
 go build -o bin/http-sink-go-example .

@@ -1,5 +1,5 @@
 use flwrs_plugin::plugin::core::{FieldDefinition, SchemaDefinition};
-use flwrs_plugin::schema::schema::field_type::Enum as FieldType;
+use flwrs_plugin::schema::payload::field_type::Enum as FieldType;
 
 pub(crate) const URL_KEY: &str = "url";
 pub(crate) const METHOD_KEY: &str = "method";

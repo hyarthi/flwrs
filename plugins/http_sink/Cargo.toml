@@ -11,7 +11,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-flwrs-plugin.workspace = true
+flwrs-plugin = { workspace = true, features = ["tls"] } # TLS for remote use
 tokio.workspace = true
 clap.workspace = true
 log.workspace = true

@@ -1,12 +1,47 @@
-use crate::schema::schema::{
+use crate::plugin::frame::PROTOCOL_VERSION;
+use crate::plugin::msg_client::{Connector, HubClient};
+use crate::schema::payload::{
     FieldDefinition as PbFieldDefinition, SchemaDefinition as PbSchemaDefinition,
     field_type::Enum as FieldType,
 };
-use crate::schema::sink::Initialize as SinkInitialize;
-use crate::schema::source::Initialize as SourceInitialize;
-use crate::schema::transform::Initialize as TransformInitialize;
+use crate::schema::payload::PluginPayload;
+use crate::schema::protocol::{
+    EventMetadata, Initialize, capability::Enum as Capability, plugin_type::Enum as PluginType,
+};
 use prost::alloc::boxed::Box as PbBox;
 use std::time::Duration;
+
+/// A data event received from the hub.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct InboundEvent {
+    /// The hub's sequence number for this event on this connection.
+    pub seq: u64,
+    /// Delivery attempt: 1 for the first; higher means it may be a duplicate.
+    pub attempt: u32,
+    /// The hub's routing metadata (event id, trace id, hops, …).
+    pub metadata: Option<EventMetadata>,
+    pub payload: PluginPayload,
+    /// The connection it arrived on (seq numbers are per connection).
+    pub(crate) conn_id: u64,
+}
+
+impl InboundEvent {
+    /// A reference to this event, for a transform that emits an output for it
+    /// later (an accumulator), through `LocalSink::emit_linked`.
+    pub fn input_ref(&self) -> InputRef {
+        InputRef {
+            conn_id: self.conn_id,
+            seq: self.seq,
+        }
+    }
+}
+
+/// Which input an output belongs to (see [`InboundEvent::input_ref`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputRef {
+    pub(crate) conn_id: u64,
+    pub(crate) seq: u64,
+}
 
 pub struct InitializeRequest {
     id: String,
@@ -62,36 +97,27 @@ impl Default for InitializeRequest {
     }
 }
 
-impl From<InitializeRequest> for SinkInitialize {
-    fn from(req: InitializeRequest) -> Self {
-        SinkInitialize {
-            plugin_id: req.id,
-            plugin_version: req.version,
-            schema: Some(req.in_schema.into()),
-            token: String::new(), // set by the runner
-        }
-    }
-}
-
-impl From<InitializeRequest> for SourceInitialize {
-    fn from(req: InitializeRequest) -> Self {
-        SourceInitialize {
-            plugin_id: req.id,
-            plugin_version: req.version,
-            schema: Some(req.out_schema.into()),
-            token: String::new(), // set by the runner
-        }
-    }
-}
-
-impl From<InitializeRequest> for TransformInitialize {
-    fn from(req: InitializeRequest) -> Self {
-        TransformInitialize {
-            plugin_id: req.id,
-            plugin_version: req.version,
-            in_schema: Some(req.in_schema.into()),
-            out_schema: Some(req.out_schema.into()),
-            token: String::new(), // set by the runner
+impl InitializeRequest {
+    /// The protocol message for a plugin of `plugin_type`. The runner fills in
+    /// the token and the consumer window. Only the schemas the type uses are
+    /// sent: `in` for sinks and transforms, `out` for sources and transforms.
+    pub(crate) fn into_initialize(self, plugin_type: PluginType) -> Initialize {
+        let (in_schema, out_schema) = match plugin_type {
+            PluginType::Sink => (Some(self.in_schema.into()), None),
+            PluginType::Source => (None, Some(self.out_schema.into())),
+            _ => (Some(self.in_schema.into()), Some(self.out_schema.into())),
+        };
+        Initialize {
+            instance_id: self.id,
+            plugin_version: self.version,
+            plugin_type: plugin_type as i32,
+            token: String::new(),
+            in_schema,
+            out_schema,
+            min_protocol_version: PROTOCOL_VERSION,
+            max_protocol_version: PROTOCOL_VERSION,
+            capabilities: vec![Capability::Acks as i32, Capability::Credits as i32],
+            max_unacked: 0,
         }
     }
 }
@@ -141,6 +167,7 @@ pub struct FieldDefinition {
     type_: FieldType,
     nested_type_definition: Option<Box<FieldDefinition>>,
     object_fields: Option<Vec<FieldDefinition>>,
+    content_type: Option<String>,
 }
 
 impl FieldDefinition {
@@ -151,6 +178,7 @@ impl FieldDefinition {
             type_: FieldType::Undefined,
             nested_type_definition: None,
             object_fields: None,
+            content_type: None,
         }
     }
 
@@ -178,6 +206,12 @@ impl FieldDefinition {
         self.object_fields = Some(fields);
         self
     }
+
+    /// BYTES only: the media type of the bytes, e.g. `image/jpeg`.
+    pub fn with_content_type(mut self, content_type: impl Into<String>) -> Self {
+        self.content_type = Some(content_type.into());
+        self
+    }
 }
 
 impl From<FieldDefinition> for PbFieldDefinition {
@@ -195,6 +229,7 @@ impl From<FieldDefinition> for PbFieldDefinition {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            content_type: field.content_type.unwrap_or_default(),
         }
     }
 }
@@ -221,6 +256,10 @@ pub struct ConnectionConfig {
     /// environment over a command-line argument: arguments show up in `ps`.
     pub token: Option<String>,
     pub reconnect: ReconnectPolicy,
+    /// Connect to the hub's TLS listener. `None` = from the `FLWRS_TLS_*`
+    /// environment variables, if `FLWRS_TLS_CA` is set; else plain TCP.
+    #[cfg(feature = "tls")]
+    pub tls: Option<crate::plugin::tls::TlsSettings>,
 }
 
 impl ConnectionConfig {
@@ -230,7 +269,16 @@ impl ConnectionConfig {
             port,
             token: None,
             reconnect: ReconnectPolicy::default(),
+            #[cfg(feature = "tls")]
+            tls: None,
         }
+    }
+
+    /// Connect over TLS (see [`crate::plugin::tls::TlsSettings`]).
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls: crate::plugin::tls::TlsSettings) -> Self {
+        self.tls = Some(tls);
+        self
     }
 
     pub fn with_token(mut self, token: Option<String>) -> Self {
@@ -245,6 +293,27 @@ impl ConnectionConfig {
 
     pub(crate) fn addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
+    }
+
+    /// The connection a runner for `plugin_type` uses.
+    pub(crate) fn client(
+        &self,
+        plugin_type: PluginType,
+    ) -> Result<std::sync::Arc<HubClient>, crate::plugin::error::Error> {
+        #[cfg(feature = "tls")]
+        let connector = match self
+            .tls
+            .clone()
+            .or_else(crate::plugin::tls::TlsSettings::from_env)
+        {
+            Some(settings) => Connector::Tls(std::sync::Arc::new(
+                crate::plugin::tls::ClientTls::new(&settings, &self.host)?,
+            )),
+            None => Connector::Plain,
+        };
+        #[cfg(not(feature = "tls"))]
+        let connector = Connector::Plain;
+        Ok(HubClient::new(self.addr(), plugin_type, connector))
     }
 
     /// The configured token, else [`TOKEN_ENV`], else empty (the hub will

@@ -4,7 +4,7 @@ use crate::modules::api_error::{ApiError, ErrorBody};
 use crate::modules::director::handle::SceneStatus;
 use crate::modules::scene::api::Svc;
 use axum::extract::{Path, State};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -43,8 +43,65 @@ pub(super) async fn scene_status(
     }))
 }
 
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PurgeResponse {
+    /// Queued events that were dropped.
+    pub purged_events: u64,
+}
+
+#[utoipa::path(
+    delete,
+    path = "/by-id/{id}/spool",
+    operation_id = "scene-purge-spool",
+    summary = "Drop every event queued for the scene's nodes",
+    description = "Empties the inbound queues of all the scene's nodes: memory and spool files. For a disabled scene, that's the events its durable queues kept for when it runs again. Events already handed to a plugin and not acknowledged yet aren't affected.",
+    params(("id" = String, Path, description = "Scene ID")),
+    responses(
+        (status = 200, description = "Purged", body = PurgeResponse),
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 503, description = "The director isn't answering", body = ErrorBody),
+    )
+)]
+pub(super) async fn purge_scene_spool(
+    State(service): State<Svc>,
+    Path(id): Path<String>,
+) -> Result<Json<PurgeResponse>, ApiError> {
+    let purged_events = service.purge_spool(&id, None).await?;
+    Ok(Json(PurgeResponse { purged_events }))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/by-id/{id}/nodes/by-id/{node_id}/spool",
+    operation_id = "node-purge-spool",
+    summary = "Drop every event queued for one node",
+    description = "Like the scene's purge, for one node's inbound queue.",
+    params(
+        ("id" = String, Path, description = "Scene ID"),
+        ("node_id" = String, Path, description = "Node ID"),
+    ),
+    responses(
+        (status = 200, description = "Purged", body = PurgeResponse),
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 503, description = "The director isn't answering", body = ErrorBody),
+    )
+)]
+pub(super) async fn purge_node_spool(
+    State(service): State<Svc>,
+    Path((id, node_id)): Path<(String, String)>,
+) -> Result<Json<PurgeResponse>, ApiError> {
+    let purged_events = service.purge_spool(&id, Some(&node_id)).await?;
+    Ok(Json(PurgeResponse { purged_events }))
+}
+
 pub(super) fn routes() -> Router<Svc> {
-    Router::new().route("/scenes/by-id/{id}/status", get(scene_status))
+    Router::new()
+        .route("/scenes/by-id/{id}/status", get(scene_status))
+        .route("/scenes/by-id/{id}/spool", delete(purge_scene_spool))
+        .route(
+            "/scenes/by-id/{id}/nodes/by-id/{node_id}/spool",
+            delete(purge_node_spool),
+        )
 }
 
 #[cfg(test)]

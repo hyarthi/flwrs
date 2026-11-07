@@ -1,39 +1,37 @@
 mod common;
 
-use common::{FakeHub, TOKEN, connection, listen};
-use flwrs_plugin::plugin::core::InitializeRequest;
+use common::{FakeHub, connection, listen, payload, text};
+use flwrs_plugin::plugin::core::{InboundEvent, InitializeRequest};
 use flwrs_plugin::plugin::error::{Error, InitializeError, ShutdownError, SinkError};
-use flwrs_plugin::schema::common::{
-    InitializeResponse, Shutdown, exit_code, log_level::Enum as LogLevel, msg_code::Enum as MsgCode,
-};
-use flwrs_plugin::schema::sink::{
-    RuntimeSinkMessage, SinkEvent, SinkMessage, runtime_sink_message, sink_message::Payload,
+use flwrs_plugin::schema::payload::field_value::Value;
+use flwrs_plugin::schema::protocol::{
+    Ack, EventMetadata, Exit, Nack, Ping, Pong, capability::Enum as Capability, exit_code,
+    log_level::Enum as LogLevel, msg_code::Enum as MsgCode, plugin_type::Enum as PluginType,
 };
 use flwrs_plugin::sink::plugin::Sink;
-use flwrs_plugin::sink::runner::{SinkRunner, SinkRunnerConfig};
+use flwrs_plugin::sink::runner::{DEFAULT_MAX_UNACKED, SinkRunner, SinkRunnerConfig};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 
 #[derive(Default)]
 struct Counters {
-    seen: Mutex<Vec<String>>,
+    seen: Mutex<Vec<InboundEvent>>,
     initialized: AtomicUsize,
     shut_down: AtomicUsize,
+    /// "slow" events wait for this.
+    gate: tokio::sync::Notify,
 }
 
+/// Accepts events whose `text` field is "ok"; "bad" fails for good, "later"
+/// fails with a retryable error; "slow" is accepted once `gate` opens.
 struct TestSink(Arc<Counters>);
 
 impl Sink for TestSink {
-    fn initialize(
-        &mut self,
-        id: String,
-        _: LogLevel,
-    ) -> Result<InitializeRequest, InitializeError> {
+    fn initialize(&mut self, id: String, _: LogLevel) -> Result<InitializeRequest, InitializeError> {
         self.0.initialized.fetch_add(1, Ordering::SeqCst);
-        Ok(InitializeRequest::new()
-            .with_id(id)
-            .with_version("1".into()))
+        Ok(InitializeRequest::new().with_id(id).with_version("1".into()))
     }
     fn shutdown(&mut self) -> Result<(), ShutdownError> {
         self.0.shut_down.fetch_add(1, Ordering::SeqCst);
@@ -42,53 +40,44 @@ impl Sink for TestSink {
     fn version(&self) -> String {
         "1".into()
     }
-    fn consume_event(&mut self, event: SinkEvent) -> Result<(), SinkError> {
-        if event.plugin_version != "1" {
-            return Err(SinkError::new("bad version"));
+    async fn consume_event(&self, event: InboundEvent) -> Result<(), SinkError> {
+        let text = match event.payload.fields.first().and_then(|f| f.value.clone()) {
+            Some(value) => match value.value {
+                Some(Value::String(s)) => s,
+                _ => String::new(),
+            },
+            None => String::new(),
+        };
+        match text.as_str() {
+            "bad" => Err(SinkError::new("bad event")),
+            "later" => Err(SinkError::retryable("try again later")),
+            "slow" => {
+                self.0.gate.notified().await;
+                self.0.seen.lock().unwrap().push(event);
+                Ok(())
+            }
+            _ => {
+                self.0.seen.lock().unwrap().push(event);
+                Ok(())
+            }
         }
-        self.0.seen.lock().unwrap().push(event.plugin_id);
-        Ok(())
-    }
-}
-
-fn is_log(msg: &SinkMessage) -> bool {
-    matches!(msg.payload, Some(Payload::Log(_)))
-}
-
-fn event(version: &str) -> RuntimeSinkMessage {
-    RuntimeSinkMessage {
-        payload: Some(runtime_sink_message::Payload::Event(SinkEvent {
-            plugin_id: "sink-1".into(),
-            plugin_version: version.into(),
-            payload: None,
-            metadata: None,
-        })),
-    }
-}
-
-fn accept_msg() -> RuntimeSinkMessage {
-    RuntimeSinkMessage {
-        payload: Some(runtime_sink_message::Payload::Initialize(
-            InitializeResponse {},
-        )),
-    }
-}
-
-fn shutdown_msg() -> RuntimeSinkMessage {
-    RuntimeSinkMessage {
-        payload: Some(runtime_sink_message::Payload::Shutdown(Shutdown {})),
     }
 }
 
 fn start(port: u16, counters: Arc<Counters>) -> JoinHandle<Result<(), Error>> {
+    start_with(port, counters, 1)
+}
+
+fn start_with(
+    port: u16,
+    counters: Arc<Counters>,
+    max_concurrent: usize,
+) -> JoinHandle<Result<(), Error>> {
     tokio::spawn(async move {
         let mut runner = SinkRunner::initialize(
             TestSink(counters),
-            SinkRunnerConfig {
-                plugin_id: "sink-1".into(),
-                log_level: LogLevel::Trace,
-                hub_connection: connection(port),
-            },
+            SinkRunnerConfig::new("sink-1".into(), LogLevel::Trace, connection(port))
+                .with_max_concurrent(max_concurrent),
         )
         .await
         .unwrap();
@@ -96,57 +85,155 @@ fn start(port: u16, counters: Arc<Counters>) -> JoinHandle<Result<(), Error>> {
     })
 }
 
-/// Accepts a connection and checks its first frame is the expected Initialize.
-async fn handshake(listener: &tokio::net::TcpListener) -> FakeHub {
-    let mut hub = FakeHub::accept(listener).await;
-    // Initialize must be the very first frame: don't skip logs here.
-    let init: SinkMessage = hub.recv(|_| false).await;
-    match init.payload {
-        Some(Payload::Initialize(init)) => {
-            assert_eq!(init.plugin_id, "sink-1");
-            assert_eq!(init.plugin_version, "1");
-            assert_eq!(init.token, TOKEN);
-        }
-        other => panic!("expected Initialize, got {other:?}"),
-    }
-    hub
-}
-
 async fn expect_exit_ok(hub: &mut FakeHub) {
-    let exit: SinkMessage = hub.recv(is_log).await;
-    match exit.payload {
-        Some(Payload::Exit(exit)) => assert_eq!(exit.code, exit_code::Enum::Ok as i32),
-        other => panic!("expected Exit, got {other:?}"),
-    }
+    let exit: Exit = hub.expect().await;
+    assert_eq!(exit.code, exit_code::Enum::Ok as i32);
 }
 
 // The tests share the process-wide logger, so they run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
-async fn sink_lifecycle() {
+async fn sink_lifecycle_with_acks_and_nacks() {
     let _serial = SERIAL.lock().await;
     let (listener, port) = listen().await;
     let counters = Arc::new(Counters::default());
     let runner = start(port, counters.clone());
 
-    let mut hub = handshake(&listener).await;
-    hub.send(&accept_msg()).await;
-    hub.send(&event("1")).await;
-    hub.send(&event("2")).await; // rejected by the plugin -> ErrorEvent
-    let err: SinkMessage = hub.recv(is_log).await;
-    match err.payload {
-        Some(Payload::Error(e)) => assert_eq!(e.message, "bad version"),
-        other => panic!("expected Error, got {other:?}"),
-    }
+    let (mut hub, init) = FakeHub::handshake(&listener).await;
+    assert_eq!(init.instance_id, "sink-1");
+    assert_eq!(init.plugin_version, "1");
+    assert_eq!(init.plugin_type, PluginType::Sink as i32);
+    assert!(init.in_schema.is_some() && init.out_schema.is_none());
+    assert_eq!(
+        init.capabilities,
+        [Capability::Acks as i32, Capability::Credits as i32]
+    );
+    assert_eq!(init.max_unacked, DEFAULT_MAX_UNACKED);
 
-    hub.send(&shutdown_msg()).await;
+    hub.accept_plugin(&[Capability::Acks], 0).await;
+    let metadata = EventMetadata {
+        event_id: "e1".into(),
+        trace_id: "t1".into(),
+        hops: 1,
+        ..Default::default()
+    };
+    hub.send_event(payload(vec![text("text", "ok")]), Some(metadata.clone()))
+        .await;
+    hub.send_event(payload(vec![text("text", "bad")]), None).await;
+    hub.send_event(payload(vec![text("text", "later")]), None).await;
+
+    let ack: Ack = hub.expect().await;
+    assert_eq!((ack.up_to, ack.seqs), (0, vec![1]));
+    let nack: Nack = hub.expect().await;
+    assert_eq!((nack.seq, nack.retry, nack.reason.as_str()), (2, false, "bad event"));
+    let nack: Nack = hub.expect().await;
+    assert_eq!((nack.seq, nack.retry), (3, true));
+
+    hub.shutdown("done").await;
     expect_exit_ok(&mut hub).await;
     hub.expect_closed().await;
 
-    runner.await.unwrap().unwrap();
-    assert_eq!(*counters.seen.lock().unwrap(), vec!["sink-1".to_string()]);
+    common::finished(runner).await.unwrap();
+    let seen = counters.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!((seen[0].seq, seen[0].attempt), (1, 1));
+    assert_eq!(seen[0].metadata, Some(metadata));
     assert_eq!(counters.shut_down.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn one_at_a_time_by_default() {
+    let _serial = SERIAL.lock().await;
+    let (listener, port) = listen().await;
+    let counters = Arc::new(Counters::default());
+    let runner = start(port, counters.clone());
+
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[Capability::Acks], 0).await;
+    hub.send_event(payload(vec![text("text", "slow")]), None).await;
+    hub.send_event(payload(vec![text("text", "ok")]), None).await;
+    // The second event waits for the first.
+    hub.expect_quiet(Duration::from_millis(200)).await;
+    counters.gate.notify_one();
+    let ack: Ack = hub.expect().await;
+    assert_eq!(ack.seqs, vec![1]);
+    let ack: Ack = hub.expect().await;
+    assert_eq!(ack.seqs, vec![2]);
+    hub.shutdown("").await;
+    expect_exit_ok(&mut hub).await;
+    common::finished(runner).await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_events_are_acked_as_they_finish_and_drained_on_shutdown() {
+    let _serial = SERIAL.lock().await;
+    let (listener, port) = listen().await;
+    let counters = Arc::new(Counters::default());
+    let runner = start_with(port, counters.clone(), 4);
+
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[Capability::Acks], 0).await;
+    hub.send_event(payload(vec![text("text", "slow")]), None).await;
+    hub.send_event(payload(vec![text("text", "ok")]), None).await;
+    // The second finishes first and is acked by itself (not cumulatively,
+    // which would also cover the first).
+    let ack: Ack = hub.expect().await;
+    assert_eq!((ack.up_to, ack.seqs), (0, vec![2]));
+
+    // Shutdown while the first is still running: it's finished and acked
+    // before the Exit.
+    hub.shutdown("").await;
+    hub.expect_quiet(Duration::from_millis(200)).await;
+    counters.gate.notify_one();
+    let ack: Ack = hub.expect().await;
+    assert_eq!((ack.up_to, ack.seqs), (0, vec![1]));
+    expect_exit_ok(&mut hub).await;
+    common::finished(runner).await.unwrap();
+    assert_eq!(counters.seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn no_acks_unless_the_hub_enables_them() {
+    let _serial = SERIAL.lock().await;
+    let (listener, port) = listen().await;
+    let counters = Arc::new(Counters::default());
+    let runner = start(port, counters.clone());
+
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[], 0).await;
+    hub.send_event(payload(vec![text("text", "ok")]), None).await;
+    hub.send_event(payload(vec![text("text", "bad")]), None).await;
+    hub.shutdown("").await;
+    // No ACK or NACK before the Exit.
+    expect_exit_ok(&mut hub).await;
+    common::finished(runner).await.unwrap();
+    assert_eq!(counters.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn answers_ping_and_honours_the_heartbeat_timeout() {
+    let _serial = SERIAL.lock().await;
+    let (listener, port) = listen().await;
+    let counters = Arc::new(Counters::default());
+    let runner = start(port, counters.clone());
+
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[Capability::Acks], 100).await;
+    hub.send(&Ping { nonce: 42 }).await;
+    let pong: Pong = hub.expect().await;
+    assert_eq!(pong.nonce, 42);
+    // Then silence: after three intervals the plugin gives up on this
+    // connection and reconnects.
+    let started = tokio::time::Instant::now();
+    hub.expect_closed().await;
+    assert!(started.elapsed() >= Duration::from_millis(250), "{:?}", started.elapsed());
+
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[], 0).await;
+    hub.shutdown("").await;
+    expect_exit_ok(&mut hub).await;
+    common::finished(runner).await.unwrap();
 }
 
 #[tokio::test]
@@ -156,25 +243,25 @@ async fn reconnects_and_reinitializes_after_hub_restart() {
     let counters = Arc::new(Counters::default());
     let runner = start(port, counters.clone());
 
-    let mut hub = handshake(&listener).await;
-    hub.send(&accept_msg()).await;
-    hub.send(&event("1")).await;
-    // Make sure the event got through before "restarting" the hub.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while counters.seen.lock().unwrap().is_empty() {
-        assert!(tokio::time::Instant::now() < deadline);
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    let (mut hub, first) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[Capability::Acks], 0).await;
+    hub.send_event(payload(vec![text("text", "ok")]), None).await;
+    let ack: Ack = hub.expect().await;
+    assert_eq!((ack.up_to, ack.seqs), (0, vec![1]));
     drop(hub);
 
-    // The plugin reconnects by itself and re-sends the same Initialize.
-    let mut hub = handshake(&listener).await;
-    hub.send(&accept_msg()).await;
-    hub.send(&event("1")).await;
-    hub.send(&shutdown_msg()).await;
+    // The plugin reconnects by itself and re-sends the same Initialize; the
+    // new connection's events start at seq 1 again.
+    let (mut hub, again) = FakeHub::handshake(&listener).await;
+    assert_eq!(again, first);
+    hub.accept_plugin(&[Capability::Acks], 0).await;
+    hub.send_event(payload(vec![text("text", "ok")]), None).await;
+    let ack: Ack = hub.expect().await;
+    assert_eq!((ack.up_to, ack.seqs), (0, vec![1]));
+    hub.shutdown("").await;
     expect_exit_ok(&mut hub).await;
 
-    runner.await.unwrap().unwrap();
+    common::finished(runner).await.unwrap();
     assert_eq!(counters.seen.lock().unwrap().len(), 2);
     // `Sink::initialize` runs once; the cached Initialize is re-sent.
     assert_eq!(counters.initialized.load(Ordering::SeqCst), 1);
@@ -188,34 +275,48 @@ async fn shutdown_before_initialize_response_means_rejected() {
     let counters = Arc::new(Counters::default());
     let runner = start(port, counters.clone());
 
-    let mut hub = handshake(&listener).await;
-    hub.send(&shutdown_msg()).await; // e.g. the token didn't match
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.shutdown("wrong token").await;
     expect_exit_ok(&mut hub).await;
     hub.expect_closed().await;
 
-    assert!(matches!(runner.await.unwrap(), Err(Error::Rejected)));
+    assert!(matches!(common::finished(runner).await, Err(Error::Rejected)));
     assert_eq!(counters.shut_down.load(Ordering::SeqCst), 1);
     // It doesn't try again.
-    let retry = tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept());
+    let retry = tokio::time::timeout(Duration::from_millis(300), listener.accept());
     assert!(retry.await.is_err());
 }
 
 #[tokio::test]
-async fn wrong_msg_code_from_hub_closes_and_reconnects() {
+async fn protocol_violations_by_the_hub_close_and_reconnect() {
     let _serial = SERIAL.lock().await;
     let (listener, port) = listen().await;
     let counters = Arc::new(Counters::default());
     let runner = start(port, counters.clone());
 
-    let mut hub = handshake(&listener).await;
-    hub.send(&accept_msg()).await;
-    // A sink must only receive RUNTIME_SINK_MESSAGE frames.
-    hub.send_raw(MsgCode::RuntimeSourceMessage, &[]).await;
+    // A code a sink never receives.
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[], 0).await;
+    hub.send_raw(&FakeHub::header(MsgCode::Log), &[]).await;
     hub.expect_closed().await;
 
-    let mut hub = handshake(&listener).await;
-    hub.send(&accept_msg()).await;
-    hub.send(&shutdown_msg()).await;
+    // Data before InitializeResponse.
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.send_event(payload(vec![]), None).await;
+    hub.expect_closed().await;
+
+    // A gap in the hub's sequence numbers.
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[], 0).await;
+    let mut header = FakeHub::header(MsgCode::Event);
+    header.seq = 5;
+    hub.send_raw(&header, &[]).await;
+    hub.expect_closed().await;
+
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[], 0).await;
+    hub.shutdown("").await;
     expect_exit_ok(&mut hub).await;
-    runner.await.unwrap().unwrap();
+    common::finished(runner).await.unwrap();
+    assert!(counters.seen.lock().unwrap().is_empty());
 }

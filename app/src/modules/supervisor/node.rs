@@ -3,9 +3,9 @@
 
 use super::process::{PluginProcess, new_token};
 use super::spec::{Launch, LocalLaunch, NodeSpec};
-use crate::modules::hub::wire::{DataEvent, RuntimeMsg};
+use crate::modules::hub::wire::DataEvent;
 use crate::modules::hub::{Hub, HubEvent, LinkSender, NodeLink};
-use flwrs_plugin::schema::common::Exit;
+use flwrs_plugin::schema::protocol::Exit;
 use serde::Serialize;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
@@ -45,12 +45,36 @@ pub(crate) struct NodeStatus {
     pub last_error: Option<String>,
 }
 
-/// A data event from a node's plugin, for the director.
+/// What a node's plugin sends that the director acts on, in the order the
+/// plugin sent it: data events (sources, transforms), and its acks for events
+/// the hub delivered (sinks, transforms). Keeping them in one ordered stream
+/// means a transform's ack of an input is handled only after the outputs it
+/// sent before it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NodeOutput {
     pub node_id: Arc<str>,
-    pub event: DataEvent,
-    pub size: usize,
+    pub item: Output,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Output {
+    Event {
+        conn_id: u64,
+        seq: u64,
+        event: DataEvent,
+        size: usize,
+    },
+    Acked {
+        conn_id: u64,
+        up_to: u64,
+        seqs: Vec<u64>,
+    },
+    Nacked {
+        conn_id: u64,
+        seq: u64,
+        reason: String,
+        retry: bool,
+    },
 }
 
 /// Controls one supervised node. Dropping it stops the node (in the
@@ -94,13 +118,13 @@ impl Drop for NodeHandle {
     }
 }
 
-/// Starts supervising `spec`. Data events from the plugin go to `output`.
+/// Starts supervising `spec`. Data events and acks from the plugin go to `output`.
 pub(crate) fn supervise(spec: NodeSpec, hub: &Hub, output: mpsc::Sender<NodeOutput>) -> NodeHandle {
-    let token = match &spec.launch {
-        Launch::Local(_) => new_token(),
-        Launch::Remote { token } => token.clone(),
+    let auth = match &spec.launch {
+        Launch::Local(_) => crate::modules::hub::NodeAuth::local(new_token()),
+        Launch::Remote { auth } => auth.clone(),
     };
-    let link = hub.expect(spec.expected(token));
+    let link = hub.expect(spec.expected(auth));
     let sender = link.sender();
     let initial = NodeStatus {
         state: match spec.launch {
@@ -213,13 +237,37 @@ impl Supervisor {
             match event {
                 // The expectation was replaced: someone else supervises this node now.
                 None => return Signal::Stop,
-                Some(HubEvent::Event { event, size }) => {
-                    self.pending = Some(NodeOutput {
-                        node_id: self.node_id.clone(),
-                        event,
-                        size,
-                    });
-                }
+                Some(HubEvent::Event {
+                    conn_id,
+                    seq,
+                    event,
+                    size,
+                }) => self.forward(Output::Event {
+                    conn_id,
+                    seq,
+                    event,
+                    size,
+                }),
+                Some(HubEvent::Acked {
+                    conn_id,
+                    up_to,
+                    seqs,
+                }) => self.forward(Output::Acked {
+                    conn_id,
+                    up_to,
+                    seqs,
+                }),
+                Some(HubEvent::Nacked {
+                    conn_id,
+                    seq,
+                    reason,
+                    retry,
+                }) => self.forward(Output::Nacked {
+                    conn_id,
+                    seq,
+                    reason,
+                    retry,
+                }),
                 Some(HubEvent::Connected { .. }) => return Signal::Connected,
                 Some(HubEvent::Rejected { reasons }) => return Signal::Rejected(reasons),
                 Some(HubEvent::Exit { exit, .. }) => return Signal::Exit(exit),
@@ -228,6 +276,13 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    fn forward(&mut self, item: Output) {
+        self.pending = Some(NodeOutput {
+            node_id: self.node_id.clone(),
+            item,
+        });
     }
 
     // --- local ---
@@ -440,7 +495,7 @@ impl Supervisor {
         let timings = self.spec.timings.clone();
         if let Some(process) = process.as_mut() {
             let mut exited = false;
-            if self.link.is_connected() && self.link.send(RuntimeMsg::Shutdown).await.is_ok() {
+            if self.link.is_connected() && self.link.shutdown("stopping").await.is_ok() {
                 let deadline = tokio::time::sleep(timings.shutdown_grace);
                 tokio::pin!(deadline);
                 // Keep forwarding events while the plugin drains.
@@ -510,7 +565,7 @@ impl Supervisor {
             }
         }
         self.set_state(NodeState::Stopping);
-        if self.link.is_connected() && self.link.send(RuntimeMsg::Shutdown).await.is_ok() {
+        if self.link.is_connected() && self.link.shutdown("stopping").await.is_ok() {
             let grace = self.spec.timings.shutdown_grace;
             let _ = tokio::time::timeout(grace, async {
                 loop {

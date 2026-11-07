@@ -1,0 +1,240 @@
+syntax = "proto3";
+
+// Messages between a plugin and the flwrs hub (protocol version 2). The frame
+// layout, the rules for when each message may be sent, and the meaning of
+// every field are in docs/protocol.md; comments here are a summary.
+//
+// Compatibility: fields, messages and enum values are only ever added. Never
+// renumber, reuse or change the type of an existing field or enum value.
+// Every enum's zero value is UNDEFINED, so an unset value can't be mistaken
+// for a real one.
+package flwrs.protocol;
+
+import "google/protobuf/timestamp.proto";
+import "schema/payload.proto";
+
+// ---------------------------------------------------------------------------
+// Frame header
+// ---------------------------------------------------------------------------
+
+// Which message the frame body holds. Each code has exactly one body type.
+message MsgCode {
+  enum Enum {
+    UNDEFINED = 0;            // never valid on the wire
+    INITIALIZE = 1;           // Initialize            plugin -> hub
+    INITIALIZE_RESPONSE = 2;  // InitializeResponse    hub -> plugin
+    EVENT = 3;                // Event                 both (see docs/protocol.md)
+    LOG = 4;                  // LogEvent              plugin -> hub
+    ERROR = 5;                // ErrorEvent            plugin -> hub
+    SHUTDOWN = 6;             // Shutdown              hub -> plugin
+    EXIT = 7;                 // Exit                  plugin -> hub
+    ACK = 8;                  // Ack                   both (capability ACKS)
+    NACK = 9;                 // Nack                  both (capability ACKS)
+    CREDIT = 10;              // Credit                hub -> plugin (capability CREDITS)
+    PING = 11;                // Ping                  both
+    PONG = 12;                // Pong                  both
+  }
+}
+
+// The header of every frame. Small on purpose: the hub routes, queues and
+// forwards events by reading only this, without decoding the body.
+message FrameHeader {
+  MsgCode.Enum code = 1;
+  // EVENT only: the sender's sequence number for this data event on this
+  // connection and direction: 1 for the first, then +1 for each event. ACK,
+  // NACK and input_seq refer to it. Starts again at 1 on a new connection.
+  uint64 seq = 2;
+  // EVENT from a transform: the seq of the input event this output was
+  // produced from. 0 = none (the hub starts a new trace).
+  uint64 input_seq = 3;
+  // EVENT from the hub: the event's routing metadata. Plugins never set it.
+  EventMetadata metadata = 4;
+  // EVENT from the hub: the delivery attempt, 1 for the first. Higher means
+  // this event (same metadata.event_id) may have been delivered before.
+  uint32 attempt = 5;
+  // Reserved for negotiated features (batching, compression). Must be 0; a
+  // receiver treats an unknown bit as a protocol violation.
+  uint32 flags = 6;
+  // Field numbers 7 and 8 are planned for clustering (slot id, ownership epoch).
+}
+
+// Hub-managed metadata of a data event, carried in FrameHeader.metadata.
+message EventMetadata {
+  // Unique id of this event, assigned by the hub per handover. Kept on
+  // redelivery, so a consumer can detect duplicates.
+  string event_id = 1;
+  // Shared by every event derived from the same original source event.
+  string trace_id = 2;
+  // Hub handovers since the original source event; the hub drops events
+  // over its hop limit (protects against cycles).
+  uint32 hops = 3;
+  // Node (plugin instance) that produced the original event of the trace.
+  string origin_node_id = 4;
+  // When the original event of the trace entered the hub.
+  google.protobuf.Timestamp create_time = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Handshake
+// ---------------------------------------------------------------------------
+
+message PluginType {
+  enum Enum {
+    UNDEFINED = 0;
+    SOURCE = 1;
+    SINK = 2;
+    TRANSFORM = 3;
+  }
+}
+
+// Optional protocol features, negotiated in the handshake.
+message Capability {
+  enum Enum {
+    UNDEFINED = 0;
+    // ACK / NACK of data events, the consumer window (max_unacked) and
+    // redelivery: at-least-once delivery on this plugin's hops.
+    ACKS = 1;
+    // Credit-based flow control for the events this plugin produces.
+    CREDITS = 2;
+  }
+}
+
+// Plugin -> hub: the first frame on every connection, including after a
+// reconnect (then with the same content).
+message Initialize {
+  // Instance id: the node id the plugin was started with (--id), or the
+  // node's remote_id for remote plugins.
+  string instance_id = 1;
+  // Must equal the version in the plugin's manifest.
+  string plugin_version = 2;
+  PluginType.Enum plugin_type = 3;
+  // The per-launch token (local plugins, from FLWRS_TOKEN) or the node's
+  // pre-shared token (remote plugins). Empty for remote nodes that
+  // authenticate with a client certificate (mTLS).
+  string token = 4;
+  // Payloads the plugin accepts: SINK and TRANSFORM.
+  flwrs.payload.SchemaDefinition in_schema = 5;
+  // Payloads the plugin emits: SOURCE and TRANSFORM.
+  flwrs.payload.SchemaDefinition out_schema = 6;
+  // Protocol versions the plugin speaks (inclusive range). This document
+  // describes version 2.
+  uint32 min_protocol_version = 7;
+  uint32 max_protocol_version = 8;
+  // Optional features the plugin supports.
+  repeated Capability.Enum capabilities = 9;
+  // With ACKS, for a consumer (SINK, TRANSFORM): the most events the hub may
+  // have sent to this plugin that it hasn't ACKed or NACKed yet. 0 = the
+  // hub's default.
+  uint32 max_unacked = 10;
+}
+
+// Hub -> plugin: the plugin is accepted. Data may flow after this.
+message InitializeResponse {
+  // The protocol version in use on this connection.
+  uint32 protocol_version = 1;
+  // The capabilities in use: those the plugin offered and the hub enabled.
+  repeated Capability.Enum capabilities = 2;
+  // The hub sends PING at least this often; a plugin that hears nothing for
+  // three intervals may treat the connection as dead. 0 = no heartbeats.
+  uint32 heartbeat_interval_ms = 3;
+  // With ACKS, for a consumer: the window the hub will use (at most the
+  // plugin's max_unacked).
+  uint32 max_unacked = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------------
+
+// A data event: from a source or transform to the hub, or from the hub to a
+// sink or transform. Its seq, input_seq and metadata are in the FrameHeader.
+message Event {
+  flwrs.payload.PluginPayload payload = 1;
+}
+
+// Acknowledges data events by seq: every seq <= up_to that wasn't NACKed,
+// plus each one listed. From a consumer: it's done with the event (a sink
+// handled it; a transform sent its outputs for it, or took it into its
+// state). From the hub: the event is routed (and stored where the target's
+// queue is durable).
+message Ack {
+  uint64 up_to = 1;
+  repeated uint64 seqs = 2;
+}
+
+// Rejects one data event.
+message Nack {
+  uint64 seq = 1;
+  string reason = 2;
+  // From a consumer: whether to deliver it again later. From the hub:
+  // whether sending it again may succeed.
+  bool retry = 3;
+}
+
+// Hub -> producer (capability CREDITS): permission to send this many more
+// EVENT frames. Grants add up; credit isn't carried over to a new connection.
+message Credit {
+  uint32 events = 1;
+}
+
+// ---------------------------------------------------------------------------
+// System messages
+// ---------------------------------------------------------------------------
+
+// Either side: are you there? The receiver answers with a Pong carrying the
+// same nonce.
+message Ping {
+  uint64 nonce = 1;
+}
+
+message Pong {
+  uint64 nonce = 1;
+}
+
+message LogLevel {
+  enum Enum {
+    UNDEFINED = 0;
+    TRACE = 1;
+    DEBUG = 2;
+    INFO = 3;
+    WARN = 4;
+    ERROR = 5;
+  }
+}
+
+// Plugin -> hub: a log record; the hub writes it to the server log.
+message LogEvent {
+  LogLevel.Enum level = 1;
+  string message = 2;
+  // Structured key-values attached to the record.
+  repeated flwrs.payload.Field details = 3;
+}
+
+// Plugin -> hub: something went wrong; the plugin keeps running. The hub
+// logs it.
+message ErrorEvent {
+  string message = 1;
+  repeated flwrs.payload.Field details = 2;
+}
+
+// Hub -> plugin: stop. Sent to end a run, or instead of InitializeResponse
+// to reject a plugin. The plugin answers with Exit and doesn't reconnect.
+message Shutdown {
+  // Why, for the plugin's log (e.g. "wrong token", "no common protocol version").
+  string reason = 1;
+}
+
+message ExitCode {
+  enum Enum {
+    UNDEFINED = 0;
+    OK = 1;
+    INTERRUPTED = 2;
+    ERROR = 3;
+  }
+}
+
+// Plugin -> hub: the last message before the plugin exits.
+message Exit {
+  ExitCode.Enum code = 1;
+  string message = 2;
+}

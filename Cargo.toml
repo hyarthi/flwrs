@@ -3,7 +3,7 @@ resolver = "3"
 # Members are listed explicitly (no `plugins/*` glob), so folders under plugins/
 # that aren't Rust crates (non-Rust plugins, installed packages) can't break the
 # workspace. Add each new Rust plugin here.
-members = ["core", "app", "plugin", "plugins/http_sink", "xtask"]
+members = ["core", "app", "plugin", "plugins/http_sink", "xtask", "trellis"]
 
 # Shared package metadata; crates opt in with `<field>.workspace = true`.
 [workspace.package]
@@ -18,12 +18,14 @@ repository = "https://github.com/hyarthi/flwrs"
 [workspace.dependencies]
 # internal crates
 flwrs-core = { path = "core" }
-flwrs-plugin = { path = "plugin" }
+# Without default features: crates opt into the SDK's TLS client (feature `tls`).
+flwrs-plugin = { path = "plugin", default-features = false }
 
 # async runtime
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-util = { version = "0.7.20", features = ["full"] }
 async-trait = "0.1.92"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 
 # logging and errors
 log = { version = "0.4.35", features = ["kv", "kv_serde"] }
@@ -75,8 +77,14 @@ prost-build = "0.14.4"
 protoc-bin-vendored = "3.3.0"
 bytes = "1.12.1"
 
+# TLS for remote plugins (ring: cross-compiles without cmake)
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+x509-parser = "0.18.1"
+
 # testing
 tempfile = "3.27.0"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.5"
 

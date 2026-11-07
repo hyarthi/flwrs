@@ -30,7 +30,8 @@
   <build>
     <finalName>${project.artifactId}</finalName>
     <plugins>
-      <!-- Generates Java from plugin/schema/*.proto (downloads protoc itself). -->
+      <!-- Generates Java from plugin/schema/{payload,protocol}.proto (downloads protoc itself).
+           The root is plugin/, since protocol.proto imports "schema/payload.proto". -->
       <plugin>
         <groupId>io.github.ascopes</groupId>
         <artifactId>protobuf-maven-plugin</artifactId>

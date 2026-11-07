@@ -34,12 +34,22 @@ macro_rules! plugin_error {
         #[derive(Debug)]
         pub struct $name {
             pub source: BoxError,
+            /// Whether trying again later may succeed. For an event a sink or
+            /// transform couldn't handle, the hub then redelivers it (up to
+            /// its attempt limit) instead of giving up on it.
+            pub retry: bool,
         }
 
         impl $name {
-            /// Wraps any error, or a message (`&str` / `String`).
+            /// Wraps any error, or a message (`&str` / `String`). Not retried.
             pub fn new(source: impl Into<BoxError>) -> Self {
-                Self { source: source.into() }
+                Self { source: source.into(), retry: false }
+            }
+
+            /// Like [`Self::new`], for a failure that may go away (a timeout,
+            /// a service that's down): the event is delivered again later.
+            pub fn retryable(source: impl Into<BoxError>) -> Self {
+                Self { source: source.into(), retry: true }
             }
         }
 

@@ -5,6 +5,7 @@ use super::handle::{
     DirectorCommand, DirectorError, Overview, SceneState, SceneStatus, SceneSummary, StatsSnapshot,
     Usage,
 };
+use super::queue::{delete_files, purge_files};
 use super::running::{Context, RunningScene};
 use crate::modules::scene::service::{Service as SceneService, ServiceError};
 use crate::modules::supervisor::NodeState;
@@ -35,7 +36,7 @@ impl Engine {
         shutdown: CancellationToken,
     ) {
         let engine = Arc::new(self);
-        clear_spool_dir(&engine.ctx.spill.spool_dir).await;
+        clean_spool_dir(&engine).await;
         let mut workers: HashMap<String, mpsc::UnboundedSender<DirectorCommand>> = HashMap::new();
         let mut tasks = JoinSet::new();
 
@@ -70,28 +71,47 @@ impl Engine {
     }
 }
 
-/// Spool files are only valid while their scene runs: anything there now is
-/// from an earlier run, so it goes.
-async fn clear_spool_dir(dir: &std::path::Path) {
+/// Removes orphaned spool files: folders of scenes that no longer exist,
+/// and files of nodes their scene no longer has. Everything else stays:
+/// durable queues replay it (disabled scenes keep theirs until they run).
+async fn clean_spool_dir(engine: &Engine) {
+    let dir = &engine.ctx.spill.spool_dir;
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return; // not created yet
     };
     let mut removed = 0;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        let result = if path.is_dir() {
-            tokio::fs::remove_dir_all(&path).await
-        } else {
-            tokio::fs::remove_file(&path).await
-        };
-        match result {
-            Ok(()) => removed += 1,
-            Err(err) => log::warn!("Director: couldn't remove {}: {err}", path.display()),
+        let scene_id = entry.file_name().to_string_lossy().into_owned();
+        if !path.is_dir() {
+            continue;
+        }
+        match engine.scenes.snapshot(&scene_id).await {
+            Err(ServiceError::NotFound(_)) => {
+                match tokio::fs::remove_dir_all(&path).await {
+                    Ok(()) => removed += 1,
+                    Err(err) => log::warn!("Director: couldn't remove {}: {err}", path.display()),
+                }
+            }
+            Ok(snapshot) => {
+                let Ok(mut files) = tokio::fs::read_dir(&path).await else {
+                    continue;
+                };
+                while let Ok(Some(file)) = files.next_entry().await {
+                    let name = file.file_name().to_string_lossy().into_owned();
+                    let node = name.split('.').next().unwrap_or_default();
+                    if name.ends_with(".db") && !snapshot.nodes.iter().any(|n| n.id == node) {
+                        delete_files(&file.path()).await;
+                        removed += 1;
+                    }
+                }
+            }
+            Err(err) => log::warn!("Director: can't check spool folder {scene_id}: {err}"),
         }
     }
     if removed > 0 {
         log::info!(
-            "Director: removed {removed} leftover spool entries from {}",
+            "Director: removed {removed} orphaned spool entries from {}",
             dir.display()
         );
     }
@@ -106,7 +126,8 @@ fn dispatch(
     let scene_id = match &command {
         DirectorCommand::Reload { scene_id, .. }
         | DirectorCommand::Stop { scene_id, .. }
-        | DirectorCommand::Status { scene_id, .. } => scene_id.clone(),
+        | DirectorCommand::Status { scene_id, .. }
+        | DirectorCommand::Purge { scene_id, .. } => scene_id.clone(),
         DirectorCommand::Overview { .. } | DirectorCommand::Snapshot { .. } => {
             // Asks every scene worker on a task of its own, so the command
             // loop keeps going meanwhile.
@@ -191,6 +212,22 @@ async fn scene_worker(
                 }
             }
             DirectorCommand::Overview { .. } | DirectorCommand::Snapshot { .. } => {} // answered by the engine
+            DirectorCommand::Purge { node_id, reply, .. } => {
+                let purged = match running.as_ref() {
+                    Some(scene) => scene.purge(node_id.as_deref()).await,
+                    None => {
+                        let dir = engine.ctx.spill.scene_dir(&scene_id);
+                        purge_files(&dir, node_id.as_deref()).await
+                    }
+                };
+                if purged > 0 {
+                    log::info!(
+                        "Director: purged {purged} queued events of scene [{scene_id}]{}",
+                        node_id.map_or(String::new(), |n| format!(" node [{n}]"))
+                    );
+                }
+                let _ = reply.send(purged);
+            }
             DirectorCommand::Status { reply, .. } => {
                 let status = SceneStatus {
                     state: match (&running, errors.is_empty()) {
@@ -282,10 +319,24 @@ async fn reload(
     errors.clear();
     let snapshot = match engine.scenes.snapshot(scene_id).await {
         Ok(snapshot) if snapshot.scene.enabled => snapshot,
-        Ok(_) | Err(ServiceError::NotFound(_)) => {
-            log::debug!("Director: scene [{scene_id}] is disabled or gone; not running it");
+        Ok(_) => {
+            log::debug!("Director: scene [{scene_id}] is disabled; not running it");
             if let Some(scene) = running.take() {
                 scene.stop().await;
+            }
+            return Ok(());
+        }
+        Err(ServiceError::NotFound(_)) => {
+            log::debug!("Director: scene [{scene_id}] is gone; not running it");
+            if let Some(scene) = running.take() {
+                scene.stop().await;
+            }
+            // Its queued events go with it.
+            let spool = engine.ctx.spill.scene_dir(scene_id);
+            if let Err(err) = tokio::fs::remove_dir_all(&spool).await
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                log::warn!("Director: couldn't remove {}: {err}", spool.display());
             }
             return Ok(());
         }
@@ -311,14 +362,8 @@ async fn reload(
             }
         },
         None => {
-            // A fresh spool folder per start: leftovers are from an earlier
-            // run, and nodes then never have to check for old files.
-            let spool = engine.ctx.spill.scene_dir(scene_id);
-            if let Err(err) = tokio::fs::remove_dir_all(&spool).await
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                log::warn!("Director: couldn't clear {}: {err}", spool.display());
-            }
+            // A fresh start: durable queues adopt their files; other
+            // leftovers go (RunningScene::start).
             RunningScene::start(&snapshot, &engine.ctx)
                 .await
                 .map(|scene| *running = Some(scene))

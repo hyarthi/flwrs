@@ -175,7 +175,8 @@ pub(super) fn routes() -> Router<Svc> {
         )
 }
 
-#[cfg(test)]
+// The tests export and import scenes with remote nodes.
+#[cfg(all(test, feature = "remote"))]
 mod tests {
     use crate::modules::scene::api::Api;
     use crate::modules::scene::service::tests::fixture;

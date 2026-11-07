@@ -1,11 +1,10 @@
 mod common;
 
 use common::{FakeHub, connection, listen};
-use flwrs_plugin::plugin::core::InitializeRequest;
+use flwrs_plugin::plugin::core::{InboundEvent, InitializeRequest};
 use flwrs_plugin::plugin::error::{InitializeError, ShutdownError, SinkError};
-use flwrs_plugin::schema::common::{log_level::Enum as LogLevel, plugin_type};
-use flwrs_plugin::schema::schema::field_value::Value;
-use flwrs_plugin::schema::sink::{SinkEvent, SinkMessage, sink_message::Payload};
+use flwrs_plugin::schema::payload::field_value::Value;
+use flwrs_plugin::schema::protocol::{LogEvent, log_level::Enum as LogLevel};
 use flwrs_plugin::sink::plugin::Sink;
 use flwrs_plugin::sink::runner::{SinkRunner, SinkRunnerConfig};
 
@@ -23,7 +22,7 @@ impl Sink for NoopSink {
     fn version(&self) -> String {
         "1".into()
     }
-    fn consume_event(&mut self, _: SinkEvent) -> Result<(), SinkError> {
+    async fn consume_event(&self, _: InboundEvent) -> Result<(), SinkError> {
         Ok(())
     }
 }
@@ -34,31 +33,17 @@ async fn forwards_formatted_logs_with_record_level_after_initialize() {
     let _runner = tokio::spawn(async move {
         let mut runner = SinkRunner::initialize(
             NoopSink,
-            SinkRunnerConfig {
-                plugin_id: "sink-log".into(),
-                log_level: LogLevel::Info,
-                hub_connection: connection(port),
-            },
+            SinkRunnerConfig::new("sink-log".into(), LogLevel::Info, connection(port)),
         )
         .await
         .unwrap();
         log::debug!("filtered out by level");
         runner.run().await
     });
-    let mut hub = FakeHub::accept(&listener).await;
-
-    let first: SinkMessage = hub.recv(|_| false).await;
-    assert!(
-        matches!(first.payload, Some(Payload::Initialize(_))),
-        "Initialize must be the first frame, got {first:?}"
-    );
-    let msg: SinkMessage = hub.recv(|_| false).await;
-    let Some(Payload::Log(event)) = msg.payload else {
-        panic!("expected a log message, got {msg:?}");
-    };
-    assert_eq!(event.plugin_id, "sink-log");
-    assert_eq!(event.plugin_type, plugin_type::Enum::Sink as i32);
-    assert_eq!(event.log_level, LogLevel::Warn as i32);
+    // Initialize must be the first frame.
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    let event: LogEvent = hub.frame().await.decode().unwrap();
+    assert_eq!(event.level, LogLevel::Warn as i32);
     assert_eq!(event.message, "retrying 3 of 5");
     assert_eq!(event.details.len(), 1);
     assert_eq!(event.details[0].key, "attempt");

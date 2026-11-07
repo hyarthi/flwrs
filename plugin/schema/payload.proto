@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+// Typed payload data model: what events carry, and how plugins declare the
+// shape of what they accept and emit. Part of the flwrs plugin protocol; see
+// docs/protocol.md.
+//
+// Compatibility: fields, messages and enum values are only ever added. Never
+// renumber, reuse or change the type of an existing field or enum value.
+package flwrs.payload;
+
+import "google/protobuf/timestamp.proto";
+
+message FieldType {
+  enum Enum {
+    UNDEFINED = 0;   // never valid in a schema
+    STRING = 1;
+    I32 = 2;
+    U32 = 3;
+    F32 = 4;
+    BOOL = 5;
+    DATETIME = 6;
+    BYTES = 7;
+    // Elements share FieldDefinition.nested_type_definition.
+    ARRAY = 8;
+    // String keys; values share FieldDefinition.nested_type_definition.
+    MAP = 9;
+    // Named fields with their own types; see FieldDefinition.object_fields.
+    // Values are sent as `object`.
+    OBJECT = 10;
+    I64 = 11;
+    U64 = 12;
+    F64 = 13;
+    // Packed numeric arrays: one protobuf packed repeated field instead of an
+    // ARRAY of FieldValues, for vectors such as embeddings. No nested type.
+    PACKED_F32 = 14;
+    PACKED_F64 = 15;
+    PACKED_I32 = 16;
+    PACKED_I64 = 17;
+    PACKED_U32 = 18;
+    PACKED_U64 = 19;
+  }
+}
+
+// One value. Exactly one variant is set; none set means "no value" (null).
+message FieldValue {
+  oneof value {
+    string string = 1;
+    int32 i32 = 2;
+    uint32 u32 = 3;
+    float f32 = 4;
+    bool bool = 5;
+    google.protobuf.Timestamp date_time = 6;
+    bytes bytes = 7;
+    ArrayValue array = 8;
+    // Homogeneous map: all values share FieldDefinition.nested_type_definition.
+    MapValue map = 9;
+    // Heterogeneous record: keys and types given by FieldDefinition.object_fields.
+    MapValue object = 10;
+    int64 i64 = 11;
+    uint64 u64 = 12;
+    double f64 = 13;
+    PackedF32 packed_f32 = 14;
+    PackedF64 packed_f64 = 15;
+    PackedI32 packed_i32 = 16;
+    PackedI64 packed_i64 = 17;
+    PackedU32 packed_u32 = 18;
+    PackedU64 packed_u64 = 19;
+  }
+}
+
+message ArrayValue {
+  repeated FieldValue value = 1;
+}
+
+message MapValue {
+  map<string, FieldValue> value = 1;
+}
+
+// Packed numeric arrays (proto3 packs repeated scalars on the wire).
+message PackedF32 { repeated float values = 1; }
+message PackedF64 { repeated double values = 1; }
+message PackedI32 { repeated int32 values = 1; }
+message PackedI64 { repeated int64 values = 1; }
+message PackedU32 { repeated uint32 values = 1; }
+message PackedU64 { repeated uint64 values = 1; }
+
+message Field {
+  string key = 1;
+  FieldValue value = 2;
+}
+
+message FieldDefinition {
+  string key = 1;
+  // For people; ignored when schemas are compared.
+  string description = 2;
+  FieldType.Enum type = 3;
+  // Element type for ARRAY, value type for MAP.
+  FieldDefinition nested_type_definition = 4;
+  // Field number 5 was skipped in the original schema; keep it unused.
+  reserved 5;
+  // Fields of an OBJECT.
+  repeated FieldDefinition object_fields = 6;
+  // BYTES only, optional: the media type of the bytes (e.g. "image/jpeg",
+  // "application/json"). Part of the field's contract: schemas must agree on it.
+  string content_type = 7;
+}
+
+message SchemaDefinition {
+  repeated FieldDefinition fields = 1;
+}
+
+// The data of one event: top-level fields, in order.
+message PluginPayload {
+  repeated Field fields = 1;
+}

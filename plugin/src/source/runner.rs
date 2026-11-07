@@ -1,15 +1,11 @@
 use crate::plugin::core::ConnectionConfig;
 use crate::plugin::error::Error;
 use crate::plugin::logger::PluginLogger;
-use crate::plugin::msg_client::{HubClient, Session, Stage};
+use crate::plugin::msg_client::{HubClient, Incoming, Session, Stage};
 use crate::plugin::runtime::{
     Backoff, RESTART_BACKOFF, SessionEnd, accept, error_event, finish, open_session,
 };
-use crate::schema::common::{log_level::Enum as LogLevel, plugin_type::Enum as PluginType};
-use crate::schema::source::{
-    Initialize, RuntimeSourceMessage, SourceMessage,
-    runtime_source_message::Payload as RuntimePayload, source_message::Payload,
-};
+use crate::schema::protocol::{log_level::Enum as LogLevel, plugin_type::Enum as PluginType};
 use crate::source::local_sink::LocalSink;
 use crate::source::plugin::Source;
 use std::sync::Arc;
@@ -37,13 +33,8 @@ enum Control {
 impl<T: Source> SourceRunner<T> {
     /// Installs the plugin logger. Connecting happens in [`SourceRunner::run`].
     pub async fn initialize(plugin: T, config: SourceRunnerConfig) -> Result<Self, Error> {
-        let client = HubClient::new(config.hub_connection.addr());
-        PluginLogger::initialize(
-            &config.plugin_id,
-            PluginType::Source,
-            config.log_level.into(),
-            client.clone(),
-        )?;
+        let client = config.hub_connection.client(PluginType::Source)?;
+        PluginLogger::initialize(&config.plugin_id, config.log_level.into(), client.clone())?;
         Ok(Self {
             plugin,
             plugin_id: config.plugin_id,
@@ -64,31 +55,23 @@ impl<T: Source> SourceRunner<T> {
     /// Returns [`Error::Rejected`] if the hub answers `Initialize` with
     /// `Shutdown` (unknown instance id or wrong token).
     pub async fn run(&mut self) -> Result<(), Error> {
-        let sink = LocalSink::new(
-            self.plugin_id.clone(),
-            self.plugin.version(),
-            self.client.clone(),
-        );
-        let mut init: Initialize = self
+        let sink = LocalSink::new(self.client.clone());
+        let mut init = self
             .plugin
             .initialize(self.plugin_id.clone(), self.log_level, sink)
             .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?
-            .into();
+            .into_initialize(PluginType::Source);
         init.token = self.connection.resolved_token();
-        let init = SourceMessage {
-            payload: Some(Payload::Initialize(init)),
-        };
 
         let mut backoff = Backoff::new(self.connection.reconnect);
         let mut finished = false;
         let end = loop {
             let mut session = open_session(&self.client, &init, &mut backoff).await;
-            let mut end = await_accept(&self.client, &mut session, &mut backoff).await;
+            let mut end = await_accept(&mut session, &mut backoff).await;
             if end.is_none() {
                 end = Some(
                     run_source(
                         &self.plugin,
-                        &self.plugin_id,
                         &self.client,
                         &mut session,
                         &mut finished,
@@ -106,50 +89,44 @@ impl<T: Source> SourceRunner<T> {
         };
 
         let shutdown = self.plugin.shutdown();
-        finish(&self.client, &self.plugin_id, end, shutdown, |exit| {
-            SourceMessage {
-                payload: Some(Payload::Exit(exit)),
-            }
-        })
-        .await
+        finish(&self.client, &self.plugin_id, end, shutdown).await
     }
 }
 
 /// Waits for `InitializeResponse`. Returns `None` once accepted, or how the
 /// session ended before that.
-async fn await_accept(
-    client: &HubClient,
-    session: &mut Session<RuntimeSourceMessage>,
-    backoff: &mut Backoff,
-) -> Option<SessionEnd> {
+async fn await_accept(session: &mut Session, backoff: &mut Backoff) -> Option<SessionEnd> {
     loop {
         let Some(msg) = session.next().await else {
             return Some(SessionEnd::Disconnected);
         };
-        match msg.payload {
-            None => log::error!("Message payload is missing"),
-            Some(RuntimePayload::Initialize(_)) => {
-                accept(client, session, backoff).await;
+        match msg {
+            Incoming::Accepted(response) => {
+                accept(session, &response, backoff);
                 return None;
             }
-            Some(RuntimePayload::Shutdown(_)) => {
+            Incoming::Shutdown(shutdown) => {
                 log::debug!("Received shutdown message");
-                return Some(SessionEnd::Shutdown { accepted: false });
+                return Some(SessionEnd::Shutdown {
+                    accepted: false,
+                    reason: shutdown.reason,
+                });
             }
+            // The reader refuses events to a source as a protocol violation.
+            Incoming::Event(_) => {}
         }
     }
 }
 
-fn control(msg: RuntimeSourceMessage) -> Control {
-    match msg.payload {
-        None => {
-            log::error!("Message payload is missing");
-            Control::Continue
-        }
-        Some(RuntimePayload::Initialize(_)) => Control::Continue,
-        Some(RuntimePayload::Shutdown(_)) => {
+fn control(msg: Incoming) -> Control {
+    match msg {
+        Incoming::Accepted(_) | Incoming::Event(_) => Control::Continue,
+        Incoming::Shutdown(shutdown) => {
             log::debug!("Received shutdown message");
-            Control::End(SessionEnd::Shutdown { accepted: true })
+            Control::End(SessionEnd::Shutdown {
+                accepted: true,
+                reason: shutdown.reason,
+            })
         }
     }
 }
@@ -158,9 +135,8 @@ fn control(msg: RuntimeSourceMessage) -> Control {
 /// messages, until `Shutdown` or a disconnect.
 async fn run_source<T: Source>(
     plugin: &T,
-    plugin_id: &str,
     client: &HubClient,
-    session: &mut Session<RuntimeSourceMessage>,
+    session: &mut Session,
     finished: &mut bool,
 ) -> SessionEnd {
     loop {
@@ -202,13 +178,7 @@ async fn run_source<T: Source>(
             Err(_) if client.stage() == Stage::Down => return SessionEnd::Disconnected,
             Err(err) => {
                 log::error!("Plugin crashed: {err}");
-                let msg = SourceMessage {
-                    payload: Some(Payload::Error(error_event(
-                        plugin_id,
-                        PluginType::Source,
-                        err.to_string(),
-                    ))),
-                };
+                let msg = error_event(err.to_string());
                 if client.send(&msg, Stage::Initializing).await.is_err() {
                     return SessionEnd::Disconnected;
                 }

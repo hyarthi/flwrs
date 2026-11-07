@@ -4,7 +4,7 @@ mod schema;
 use crate::plugin::PluginSettings;
 use clap::Parser;
 use flwrs_plugin::plugin::core::ConnectionConfig;
-use flwrs_plugin::schema::common::log_level::Enum as LogLevel;
+use flwrs_plugin::schema::protocol::log_level::Enum as LogLevel;
 use flwrs_plugin::sink::runner::{SinkRunner, SinkRunnerConfig};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -49,6 +49,11 @@ pub(crate) struct Args {
     /// HTTP client enable verbose logging
     #[arg(long)]
     http_verbose_logging: bool,
+
+    /// How many requests may be in flight at once. Each event is
+    /// acknowledged after its response, in whatever order responses arrive.
+    #[arg(long, default_value = "16", value_parser = clap::value_parser!(u32).range(1..=1024))]
+    max_concurrent_requests: u32,
 }
 
 #[tokio::main]
@@ -77,11 +82,15 @@ async fn main() -> ExitCode {
         "error" => LogLevel::Error,
         _ => LogLevel::Info,
     };
-    let cfg = SinkRunnerConfig {
-        plugin_id: args.id,
+    let concurrent = args.max_concurrent_requests;
+    let cfg = SinkRunnerConfig::new(
+        args.id,
         log_level,
-        hub_connection: ConnectionConfig::new(args.host, args.port).with_token(args.token),
-    };
+        ConnectionConfig::new(args.host, args.port).with_token(args.token),
+    )
+    // Room for the hub to send the next events while requests are running.
+    .with_max_unacked(concurrent.saturating_mul(2))
+    .with_max_concurrent(concurrent as usize);
     let mut runner = match SinkRunner::initialize(plugin, cfg).await {
         Ok(runner) => runner,
         Err(err) => {

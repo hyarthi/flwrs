@@ -4,12 +4,46 @@
 //! - [`diff`]: structural equality of two schemas (field order and descriptions
 //!   are ignored), reported as a list of human-readable differences.
 //! - [`parse_json`]: reads a schema in proto3 JSON form, as used in plugin manifests.
+//! - [`check_payload_depth`]: the protocol's nesting limit for payload values.
 
-use super::schema::{FieldDefinition, SchemaDefinition, field_type::Enum as FieldType};
+use super::payload::{
+    FieldDefinition, FieldValue, PluginPayload, SchemaDefinition, field_type::Enum as FieldType,
+    field_value::Value,
+};
 use std::collections::{BTreeMap, HashSet};
 
-/// Maximum nesting depth of a schema.
-pub const MAX_DEPTH: usize = 32;
+/// Maximum nesting depth of a schema or a payload value (the protocol limit).
+pub const MAX_DEPTH: usize = crate::plugin::frame::MAX_NESTING_DEPTH;
+
+/// Checks that no value in `payload` is nested deeper than [`MAX_DEPTH`]
+/// levels (a top-level field is level 1).
+pub fn check_payload_depth(payload: &PluginPayload) -> Result<(), String> {
+    for field in &payload.fields {
+        if let Some(value) = &field.value {
+            value_depth(value, 1).map_err(|()| {
+                format!("{}: nested deeper than {MAX_DEPTH} levels", field.key)
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn value_depth(value: &FieldValue, depth: usize) -> Result<(), ()> {
+    if depth > MAX_DEPTH {
+        return Err(());
+    }
+    match &value.value {
+        Some(Value::Array(array)) => array
+            .value
+            .iter()
+            .try_for_each(|v| value_depth(v, depth + 1)),
+        Some(Value::Map(map) | Value::Object(map)) => map
+            .value
+            .values()
+            .try_for_each(|v| value_depth(v, depth + 1)),
+        _ => Ok(()),
+    }
+}
 
 /// Parses a `SchemaDefinition` from its proto3 JSON form, e.g.
 /// `{"fields": [{"key": "url", "type": "STRING"}]}`. Both `camelCase` and
@@ -68,6 +102,9 @@ fn check_field(field: &FieldDefinition, path: &str, depth: usize, errors: &mut V
             }
         }
     }
+    if !field.content_type.is_empty() && kind != FieldType::Bytes {
+        errors.push(format!("{path}: content_type is only allowed for BYTES"));
+    }
     if kind == FieldType::Object {
         if field.object_fields.is_empty() {
             errors.push(format!("{path}: OBJECT needs object_fields"));
@@ -80,7 +117,8 @@ fn check_field(field: &FieldDefinition, path: &str, depth: usize, errors: &mut V
 }
 
 /// Compares the schema a plugin declared (`actual`) with the one its manifest
-/// declares (`expected`). Field order and descriptions are ignored. Returns
+/// declares (`expected`). Field order and descriptions are ignored; content
+/// types are compared. Returns
 /// every difference; an empty list means the schemas match.
 pub fn diff(expected: &SchemaDefinition, actual: &SchemaDefinition) -> Vec<String> {
     let mut diffs = vec![];
@@ -124,6 +162,12 @@ fn diff_field(
             type_name(actual.r#type)
         ));
         return;
+    }
+    if expected.content_type != actual.content_type {
+        diffs.push(format!(
+            "{path}: content type {:?} in manifest, {:?} from plugin",
+            expected.content_type, actual.content_type
+        ));
     }
     let suffix = match FieldType::try_from(expected.r#type) {
         Ok(FieldType::Array) => "[]",
@@ -246,6 +290,51 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("nested deeper than")),
             "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn content_type_only_on_bytes_and_compared() {
+        let mut image = field("image", FieldType::Bytes);
+        image.content_type = "image/jpeg".into();
+        let mut label = field("label", FieldType::String);
+        label.content_type = "text/plain".into();
+        let errors = check_well_formed(&schema(vec![image.clone(), label]));
+        assert_eq!(errors, ["label: content_type is only allowed for BYTES"]);
+        assert!(check_well_formed(&schema(vec![field("v", FieldType::PackedF32)])).is_empty());
+
+        let mut png = image.clone();
+        png.content_type = "image/png".into();
+        assert_eq!(
+            diff(&schema(vec![image]), &schema(vec![png])),
+            ["image: content type \"image/jpeg\" in manifest, \"image/png\" from plugin"]
+        );
+    }
+
+    #[test]
+    fn payload_depth_limit() {
+        use crate::schema::payload::{ArrayValue, Field};
+        let mut value = FieldValue {
+            value: Some(Value::I32(1)),
+        };
+        for _ in 0..MAX_DEPTH - 1 {
+            value = FieldValue {
+                value: Some(Value::Array(ArrayValue { value: vec![value] })),
+            };
+        }
+        let payload = |value: FieldValue| PluginPayload {
+            fields: vec![Field {
+                key: "deep".into(),
+                value: Some(value),
+            }],
+        };
+        assert!(check_payload_depth(&payload(value.clone())).is_ok());
+        let deeper = FieldValue {
+            value: Some(Value::Array(ArrayValue { value: vec![value] })),
+        };
+        assert_eq!(
+            check_payload_depth(&payload(deeper)).unwrap_err(),
+            "deep: nested deeper than 32 levels"
         );
     }
 

@@ -2,13 +2,13 @@
 
 use crate::plugin::core::{MAX_RECONNECT_DELAY, ReconnectPolicy};
 use crate::plugin::error::{Error, ShutdownError};
-use crate::plugin::frame::WireMessage;
 use crate::plugin::logger;
 use crate::plugin::msg_client::{HubClient, Session, Stage};
-use crate::schema::common::{
-    ErrorEvent, Exit, exit_code::Enum as ExitCode, plugin_type::Enum as PluginType,
+use crate::schema::protocol::{
+    ErrorEvent, Exit, Initialize, InitializeResponse, exit_code::Enum as ExitCode,
 };
 use std::hash::{BuildHasher, RandomState};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Delay before restarting a source whose `run` failed.
@@ -17,21 +17,19 @@ pub(crate) const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 /// How long to wait for queued logs to reach the hub before sending `Exit`.
 const LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
-pub(crate) fn error_event(plugin_id: &str, plugin_type: PluginType, message: String) -> ErrorEvent {
+pub(crate) fn error_event(message: String) -> ErrorEvent {
     ErrorEvent {
-        plugin_id: plugin_id.to_string(),
-        plugin_type: plugin_type as i32,
         message,
         details: vec![],
     }
 }
 
 /// How a session with the hub ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionEnd {
     /// The hub sent `Shutdown`. `accepted` is false if it came before
     /// `InitializeResponse`, i.e. the hub rejected this plugin.
-    Shutdown { accepted: bool },
+    Shutdown { accepted: bool, reason: String },
     /// The connection was lost; reconnect.
     Disconnected,
 }
@@ -76,11 +74,11 @@ fn jitter(delay: Duration) -> Duration {
 }
 
 /// Connects (retrying with backoff until it works) and sends `Initialize`.
-pub(crate) async fn open_session<Out: WireMessage, In: WireMessage + Send + 'static>(
-    client: &HubClient,
-    initialize: &Out,
+pub(crate) async fn open_session(
+    client: &Arc<HubClient>,
+    initialize: &Initialize,
     backoff: &mut Backoff,
-) -> Session<In> {
+) -> Session {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -110,13 +108,17 @@ pub(crate) async fn open_session<Out: WireMessage, In: WireMessage + Send + 'sta
     }
 }
 
-/// Marks the session as accepted after `InitializeResponse`.
-pub(crate) async fn accept<M>(client: &HubClient, session: &mut Session<M>, backoff: &mut Backoff) {
+/// Marks the session as accepted after `InitializeResponse` (the reader
+/// task has already applied what it negotiated).
+pub(crate) fn accept(session: &mut Session, response: &InitializeResponse, backoff: &mut Backoff) {
     if !session.accepted {
         session.accepted = true;
-        client.set_ready(session.id).await;
         backoff.reset();
-        log::debug!("The hub accepted the plugin");
+        log::debug!(
+            "The hub accepted the plugin (protocol {}, capabilities {:?})",
+            response.protocol_version,
+            response.capabilities
+        );
     }
 }
 
@@ -135,27 +137,34 @@ pub(crate) fn exit_message(shutdown: &Result<(), ShutdownError>) -> Exit {
 
 /// The end of a run: flush logs, send `Exit`, close the connection and send
 /// further logs to stderr. Returns the runner's result.
-pub(crate) async fn finish<M: WireMessage>(
+pub(crate) async fn finish(
     client: &HubClient,
     plugin_id: &str,
     end: SessionEnd,
     shutdown: Result<(), ShutdownError>,
-    exit: impl FnOnce(Exit) -> M,
 ) -> Result<(), Error> {
     if let Err(err) = &shutdown {
         log::error!("Error shutting down: {err}");
     }
-    let rejected = end == (SessionEnd::Shutdown { accepted: false });
-    if rejected {
-        let msg = "The hub rejected this plugin (Shutdown before InitializeResponse); \
-                   check its instance id and token";
+    let rejected = matches!(end, SessionEnd::Shutdown { accepted: false, .. });
+    if let SessionEnd::Shutdown {
+        accepted: false,
+        reason,
+    } = &end
+    {
+        let reason = if reason.is_empty() {
+            "no reason given; check the instance id and token"
+        } else {
+            reason
+        };
+        let msg = format!("The hub rejected this plugin: {reason}");
         log::error!("{msg}");
         eprintln!("{msg}");
     }
     log::info!("Plugin shutdown: {plugin_id}");
     logger::flush(LOG_FLUSH_TIMEOUT).await;
     let _ = client
-        .send(&exit(exit_message(&shutdown)), Stage::Initializing)
+        .send(&exit_message(&shutdown), Stage::Initializing)
         .await;
     client.disconnect(None).await;
     logger::close();

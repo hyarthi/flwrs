@@ -8,10 +8,11 @@
 //! with no restart: every event is routed with one table, the old or the new.
 
 use super::queue::{
-    Budget, DropReason, NodeQueue, Pushed, QueueSettings, QueueStats, SpillSettings, SpillShared,
+    Budget, DropReason, DurableSettings, NodeQueue, Pushed, QueueKind, QueueSettings, QueueStats,
+    Queued, SpillSettings, SpillShared, delete_files,
 };
-use crate::modules::hub::wire::{DataEvent, RuntimeMsg};
-use crate::modules::hub::{Hub, HubError, LinkSender};
+use crate::modules::hub::wire::{DataEvent, Negotiated};
+use crate::modules::hub::{Hub, HubError, LinkSender, Routed};
 use crate::modules::mapping::{self, Mapping, MappingSpec, Schemas};
 use crate::modules::node_config::WhenFull;
 use crate::modules::plugin::manifest::PluginType;
@@ -20,17 +21,19 @@ use crate::modules::scene::graph::nodes_in_cycles;
 use crate::modules::node_config::NodeConfig;
 use crate::modules::scene::service::{Edge, SceneSnapshot};
 use crate::modules::supervisor::{
-    Launch, NodeHandle, NodeOutput, NodeSpec, NodeState, NodeStatus, supervise,
+    DeliverySpec, Launch, NodeHandle, NodeOutput, NodeSpec, NodeState, NodeStatus, Output,
+    Surroundings, supervise,
 };
-use flwrs_plugin::schema::common::EventMetadata;
-use prost::Message;
+use flwrs_plugin::schema::payload::PluginPayload;
+use flwrs_plugin::schema::protocol::EventMetadata;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 use utoipa::ToSchema;
 
@@ -79,8 +82,8 @@ pub(crate) struct NodeCounters {
     /// Events handed to the node's plugin (sinks and transforms).
     pub received: u64,
     /// Events for this node that were dropped: queue full, block timeout,
-    /// budget, too large, evicted, disk errors; plus this node's events
-    /// dropped for the hop limit.
+    /// budget, too large, evicted, disk errors, dead-lettered (out of
+    /// delivery attempts); plus this node's events dropped for the hop limit.
     pub dropped: u64,
     /// This node's events that an out-edge's mapping couldn't map.
     pub mapping_errors: u64,
@@ -102,7 +105,8 @@ struct NodeKey {
     /// The queue policy in effect: its default depends on whether the node
     /// is on a cycle, which edge changes can alter.
     when_full: Option<WhenFull>,
-    spill: bool,
+    /// Memory, spill or durable (the scene's default can change it).
+    kind: Option<QueueKind>,
 }
 
 /// A node of a checked graph.
@@ -111,7 +115,7 @@ struct PlannedNode {
     key: NodeKey,
     /// Inbound queue (sinks and transforms).
     queue: Option<QueueSettings>,
-    spill: bool,
+    kind: QueueKind,
 }
 
 /// A scene's graph, checked and ready to run.
@@ -141,14 +145,13 @@ impl Plan {
                 ));
                 continue;
             };
-            match NodeSpec::resolve(
-                scene_id,
-                &node.id,
-                &node.config,
-                plugin,
-                ctx.hub.local_addr(),
-                &ctx.log_level,
-            ) {
+            let at = Surroundings {
+                hub_addr: ctx.hub.local_addr(),
+                tls_available: ctx.hub.tls_addr().is_some(),
+                log_level: &ctx.log_level,
+                scene_defaults: &snapshot.scene.defaults,
+            };
+            match NodeSpec::resolve(scene_id, &node.id, &node.config, plugin, &at) {
                 Ok(spec) if spec.plugin_type.as_str() != node.node_type => errors.push(format!(
                     "node {}: type {} doesn't match plugin {} ({})",
                     node.id,
@@ -258,11 +261,20 @@ impl Plan {
                         block_timeout: spec.queue.block_timeout,
                     }
                 });
-                let spill = queue.is_some()
-                    && spec
-                        .queue
-                        .spill_enabled
-                        .unwrap_or(ctx.spill.default_enabled);
+                let durable = spec
+                    .queue
+                    .durable
+                    .or(snapshot.scene.defaults.durable)
+                    .unwrap_or(false);
+                let spill = spec
+                    .queue
+                    .spill_enabled
+                    .unwrap_or(ctx.spill.default_enabled);
+                let kind = match (durable, spill) {
+                    (true, _) => QueueKind::Durable,
+                    (false, true) => QueueKind::Spill,
+                    (false, false) => QueueKind::Memory,
+                };
                 let key = NodeKey {
                     plugin_id: plugin.id.clone(),
                     plugin_version: plugin.version.clone(),
@@ -271,13 +283,13 @@ impl Plan {
                     node_type: node.node_type.clone(),
                     config: node.config.clone(),
                     when_full: queue.as_ref().map(|q| q.when_full),
-                    spill,
+                    kind: queue.is_some().then_some(kind),
                 };
                 PlannedNode {
                     spec,
                     key,
                     queue,
-                    spill,
+                    kind,
                 }
             })
             .collect();
@@ -295,16 +307,11 @@ impl Plan {
             .edges
             .iter()
             .filter(|e| e.source_node_id == node_id)
+            .filter(|e| self.nodes.iter().any(|n| n.spec.node_id == e.target_node_id))
             .filter_map(|e| {
-                let target = self
-                    .nodes
-                    .iter()
-                    .find(|n| n.spec.node_id == e.target_node_id)?;
                 Some(Target {
                     edge_id: e.id.clone(),
                     node_id: e.target_node_id.clone(),
-                    instance_id: target.spec.instance_id.clone(),
-                    plugin_version: target.spec.plugin_version.clone(),
                     queue: queues.get(&e.target_node_id)?.clone(),
                     mapping: self.mappings.get(&e.id).cloned(),
                 })
@@ -329,10 +336,35 @@ struct RunningNode {
     /// The node's routing table, swapped on reload.
     routes: watch::Sender<Arc<Routes>>,
     router: JoinHandle<()>,
-    deliverer: Option<JoinHandle<()>>,
+    deliverer: Option<DelivererHandle>,
     dropped_hops: Arc<AtomicU64>,
     mapping_errors: Arc<AtomicU64>,
     emitted: Arc<AtomicU64>,
+}
+
+/// A running deliverer; stopping it puts its in-flight events back into the
+/// queue (which may outlive the node, e.g. for a changed node on reload).
+struct DelivererHandle {
+    task: JoinHandle<()>,
+    stop: CancellationToken,
+}
+
+impl DelivererHandle {
+    async fn stop(self) {
+        self.stop.cancel();
+        let mut task = self.task;
+        if tokio::time::timeout(ROUTER_DRAIN, &mut task).await.is_err() {
+            task.abort();
+        }
+    }
+}
+
+impl RunningNode {
+    async fn stop_deliverer(&mut self) {
+        if let Some(deliverer) = self.deliverer.take() {
+            deliverer.stop().await;
+        }
+    }
 }
 
 pub(crate) struct RunningScene {
@@ -354,10 +386,6 @@ struct Routes {
 struct Target {
     edge_id: String,
     node_id: String,
-    /// What the target plugin expects in `plugin_id` (its node id, or a
-    /// remote node's `remote_id`).
-    instance_id: String,
-    plugin_version: String,
     queue: Arc<NodeQueue>,
     /// `None`: events pass through unchanged.
     mapping: Option<Arc<dyn Mapping>>,
@@ -383,19 +411,39 @@ impl std::fmt::Display for ReloadSummary {
 }
 
 /// A new inbound queue. Each queue has its own spool file, since a
-/// replaced node's old queue may still be closing.
-fn new_queue(planned: &PlannedNode, scene_id: &str, ctx: &Context) -> Option<Arc<NodeQueue>> {
+/// replaced node's old queue may still be closing. With `adopt` (a fresh
+/// start), a durable queue takes over the node's existing files.
+fn new_queue(
+    planned: &PlannedNode,
+    scene_id: &str,
+    ctx: &Context,
+    adopt: bool,
+) -> Option<Arc<NodeQueue>> {
     let settings = planned.queue.clone()?;
-    let spill = planned.spill.then(|| SpillSettings {
-        spec: planned.spec.queue.spill.clone(),
-        file: ctx.spill.scene_dir(scene_id).join(format!(
-            "{}.{}.db",
-            planned.spec.node_id,
-            Ulid::generate()
-        )),
-        shared: ctx.spill.clone(),
-    });
-    Some(NodeQueue::new(settings, ctx.budget.clone(), spill))
+    let dir = ctx.spill.scene_dir(scene_id);
+    Some(match planned.kind {
+        QueueKind::Durable => NodeQueue::new_durable(
+            settings,
+            ctx.budget.clone(),
+            DurableSettings {
+                spec: planned.spec.queue.spill.clone(),
+                dir,
+                node_id: planned.spec.node_id.clone(),
+                shared: ctx.spill.clone(),
+                adopt,
+            },
+        ),
+        QueueKind::Spill => NodeQueue::new(
+            settings,
+            ctx.budget.clone(),
+            Some(SpillSettings {
+                spec: planned.spec.queue.spill.clone(),
+                file: dir.join(format!("{}.{}.db", planned.spec.node_id, Ulid::generate())),
+                shared: ctx.spill.clone(),
+            }),
+        ),
+        QueueKind::Memory => NodeQueue::new(settings, ctx.budget.clone(), None),
+    })
 }
 
 /// Supervises a node and starts its router (and delivery, if it receives).
@@ -412,6 +460,7 @@ fn launch(
     let dropped_hops = Arc::new(AtomicU64::new(0));
     let mapping_errors = Arc::new(AtomicU64::new(0));
     let emitted = Arc::new(AtomicU64::new(0));
+    let (acks_tx, acks_rx) = mpsc::unbounded_channel();
     let router = tokio::spawn(route(Router {
         tag: spec.tag(),
         node_id: spec.node_id.clone(),
@@ -421,14 +470,21 @@ fn launch(
         mapping_errors: mapping_errors.clone(),
         emitted: emitted.clone(),
         outputs: rx,
+        producer: handle.sender(),
+        acks: queue.is_some().then_some(acks_tx),
     }));
     let deliverer = queue.as_ref().map(|queue| {
-        tokio::spawn(deliver(
-            spec.tag(),
-            queue.clone(),
-            handle.sender(),
-            handle.watch(),
-        ))
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(deliver(Deliverer {
+            tag: spec.tag(),
+            queue: queue.clone(),
+            sender: handle.sender(),
+            status: handle.watch(),
+            acks: acks_rx,
+            delivery: spec.delivery.clone(),
+            stop: stop.clone(),
+        }));
+        DelivererHandle { task, stop }
     });
     RunningNode {
         id: spec.node_id.clone(),
@@ -449,8 +505,10 @@ fn launch(
 }
 
 /// Stops sources first, then transforms, then sinks, so events already on
-/// their way can still drain; then their routing and queues.
-async fn stop_nodes(nodes: Vec<RunningNode>) {
+/// their way can still drain; then their routing and queues. With `remove`
+/// (the nodes are gone), durable queues delete their files too; otherwise
+/// they keep them for the next start.
+async fn stop_nodes(nodes: Vec<RunningNode>, remove: bool) {
     let mut groups: [Vec<NodeHandle>; 3] = Default::default();
     let mut rest = vec![];
     for node in nodes {
@@ -475,11 +533,10 @@ async fn stop_nodes(nodes: Vec<RunningNode>) {
             router.abort();
         }
         if let Some(deliverer) = deliverer {
-            deliverer.abort();
+            deliverer.stop().await;
         }
-        // Spilled events are dropped with the node (at-most-once delivery).
         if let Some(queue) = queue {
-            queue.finish().await;
+            queue.finish(remove).await;
         }
     }
 }
@@ -496,7 +553,8 @@ impl RunningScene {
             scene_id,
             nodes: vec![],
         };
-        scene.apply(plan, ctx).await;
+        scene.clean_spool(&plan).await;
+        scene.apply(plan, ctx, true).await;
         log::info!(
             "[{}] scene started with {} nodes (max_hops {})",
             scene.scene_id,
@@ -515,7 +573,7 @@ impl RunningScene {
         ctx: &Context,
     ) -> Result<ReloadSummary, Vec<String>> {
         let plan = Plan::new(snapshot, ctx)?;
-        let summary = self.apply(plan, ctx).await;
+        let summary = self.apply(plan, ctx, false).await;
         log::info!(
             "[{}] scene reloaded: {summary} (max_hops {})",
             self.scene_id,
@@ -524,7 +582,7 @@ impl RunningScene {
         Ok(summary)
     }
 
-    async fn apply(&mut self, plan: Plan, ctx: &Context) -> ReloadSummary {
+    async fn apply(&mut self, plan: Plan, ctx: &Context, fresh: bool) -> ReloadSummary {
         let mut old: HashMap<String, RunningNode> =
             self.nodes.drain(..).map(|n| (n.id.clone(), n)).collect();
         let mut summary = ReloadSummary::default();
@@ -542,16 +600,27 @@ impl RunningScene {
         summary.kept = kept.len();
         summary.removed = old.len() - summary.restarted;
 
-        // New nodes (added or restarted) get new queues, so producers can
-        // route to them right away; their events wait there until the new
-        // plugin runs.
+        // A changed node keeps its queue (with the new limits), so what's
+        // queued for it survives the restart; unless the queue's kind
+        // changed (spill on or off), which needs a new one. Added nodes get
+        // new queues. Either way producers can route to them right away, and
+        // events wait there until the new plugin runs.
         let mut queues: HashMap<String, Arc<NodeQueue>> = kept
             .values()
             .filter_map(|n| Some((n.id.clone(), n.queue.clone()?)))
             .collect();
         for planned in plan.nodes.iter().filter(|p| !kept.contains_key(&p.spec.node_id)) {
-            if let Some(queue) = new_queue(planned, &self.scene_id, ctx) {
-                queues.insert(planned.spec.node_id.clone(), queue);
+            let id = &planned.spec.node_id;
+            let reusable = old.get_mut(id).filter(|n| {
+                planned.queue.is_some()
+                    && n.queue.as_ref().is_some_and(|q| q.kind() == planned.kind)
+            });
+            if let Some(old_node) = reusable {
+                let queue = old_node.queue.take().expect("checked above");
+                queue.reconfigure(planned.queue.clone().expect("checked above"));
+                queues.insert(id.clone(), queue);
+            } else if let Some(queue) = new_queue(planned, &self.scene_id, ctx, fresh) {
+                queues.insert(id.clone(), queue);
             }
         }
         // Swap the kept producers' routing tables.
@@ -571,14 +640,18 @@ impl RunningScene {
             started.insert(id, node);
         };
         for planned in &plan.nodes {
-            let replaces_remote = old
-                .get(&planned.spec.node_id)
-                .is_some_and(|n| n.remote);
+            let id = &planned.spec.node_id;
+            let replaces_remote = old.get(id).is_some_and(|n| n.remote);
             if replaces_remote && matches!(planned.spec.launch, Launch::Remote { .. }) {
+                // Only one deliverer per queue: the old one goes first.
+                if let Some(old_node) = old.get_mut(id) {
+                    old_node.stop_deliverer().await;
+                }
                 start(planned, &mut started);
             }
         }
-        stop_nodes(old.into_values().collect()).await;
+        // Removed nodes, and changed ones whose queue couldn't be kept.
+        stop_nodes(old.into_values().collect(), true).await;
         for planned in &plan.nodes {
             let id = &planned.spec.node_id;
             if !kept.contains_key(id) && !started.contains_key(id) {
@@ -621,6 +694,7 @@ impl RunningScene {
                                 + q.dropped_oversized
                                 + q.evicted
                                 + q.dropped_disk_error
+                                + q.dead_lettered
                         }),
                     mapping_errors,
                     restarts: status.launches.saturating_sub(1),
@@ -639,20 +713,50 @@ impl RunningScene {
             .collect()
     }
 
-    /// Stops every node (sources, then transforms, then sinks) and removes
-    /// the scene's spool folder.
+    /// Stops every node (sources, then transforms, then sinks). Durable
+    /// queues keep their files (delivered when the scene runs again); the
+    /// scene's spool folder goes if that leaves it empty.
     pub(crate) async fn stop(self) {
-        stop_nodes(self.nodes).await;
-        if self.spool_dir.exists()
-            && let Err(err) = tokio::fs::remove_dir_all(&self.spool_dir).await
-        {
-            log::warn!(
-                "[{}] couldn't remove {}: {err}",
-                self.scene_id,
-                self.spool_dir.display()
-            );
-        }
+        stop_nodes(self.nodes, false).await;
+        // Fails (harmlessly) if durable files are left in it.
+        let _ = tokio::fs::remove_dir(&self.spool_dir).await;
         log::info!("[{}] scene stopped", self.scene_id);
+    }
+
+    /// Drops the queued events of every node (or of `node_id`).
+    pub(crate) async fn purge(&self, node_id: Option<&str>) -> u64 {
+        let mut purged = 0;
+        for node in &self.nodes {
+            if node_id.is_none_or(|id| id == node.id)
+                && let Some(queue) = &node.queue
+            {
+                purged += queue.purge().await;
+            }
+        }
+        purged
+    }
+
+    /// Before a fresh start: leftover files of nodes that aren't durable
+    /// (now) are from an earlier run and go; durable nodes adopt theirs.
+    async fn clean_spool(&self, plan: &Plan) {
+        let Ok(mut entries) = tokio::fs::read_dir(&self.spool_dir).await else {
+            return; // nothing there
+        };
+        let durable: Vec<&str> = plan
+            .nodes
+            .iter()
+            .filter(|n| n.kind == QueueKind::Durable)
+            .map(|n| n.spec.node_id.as_str())
+            .collect();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let node = name.split('.').next().unwrap_or_default();
+            if !durable.contains(&node) && name.ends_with(".db") {
+                log::debug!("[{}] removing leftover spool file {name}", self.scene_id);
+                delete_files(&path).await;
+            }
+        }
     }
 }
 
@@ -665,133 +769,422 @@ struct Router {
     mapping_errors: Arc<AtomicU64>,
     emitted: Arc<AtomicU64>,
     outputs: mpsc::Receiver<NodeOutput>,
+    /// The node's own connection: ACK / NACK and credit for its events.
+    producer: LinkSender,
+    /// The node's own deliverer (sinks, transforms): its acks go there, after
+    /// the events the plugin sent before them have been routed.
+    acks: Option<mpsc::UnboundedSender<AckMsg>>,
 }
 
-/// Routes one producing node's events along its out-edges, filling in the
-/// event metadata (the hub is its authority).
+/// Events routed to durable queues whose commit (and the producer's ack)
+/// is still outstanding.
+type Commits = Vec<JoinHandle<()>>;
+
+/// A consumer's answer to events the hub delivered.
+#[derive(Debug)]
+pub(super) enum AckMsg {
+    Acked {
+        conn_id: u64,
+        up_to: u64,
+        seqs: Vec<u64>,
+    },
+    Nacked {
+        conn_id: u64,
+        seq: u64,
+        reason: String,
+        retry: bool,
+    },
+}
+
+struct RouteLogs {
+    hops: RateLimit,
+    drops: RateLimit,
+    oversized: RateLimit,
+    mapping: RateLimit,
+}
+
+/// Handles one node's plugin output in order: routes its events along the
+/// out-edges (filling in the event metadata: the hub is its authority) and
+/// answers the producer; passes its acks on to its deliverer.
 async fn route(mut r: Router) {
-    let hop_log = RateLimit::new(DROP_LOG_INTERVAL);
-    let drop_log = RateLimit::new(DROP_LOG_INTERVAL);
-    let oversized_log = RateLimit::new(DROP_LOG_INTERVAL);
-    let mapping_log = RateLimit::new(DROP_LOG_INTERVAL);
+    let logs = RouteLogs {
+        hops: RateLimit::new(DROP_LOG_INTERVAL),
+        drops: RateLimit::new(DROP_LOG_INTERVAL),
+        oversized: RateLimit::new(DROP_LOG_INTERVAL),
+        mapping: RateLimit::new(DROP_LOG_INTERVAL),
+    };
+    let mut commits: Commits = vec![];
     while let Some(output) = r.outputs.recv().await {
-        r.emitted.fetch_add(1, Ordering::Relaxed);
-        // One table per event: the one in effect now (a reload swaps it).
-        let routes = r.routes.borrow().clone();
-        let mut meta = if r.is_source {
-            EventMetadata::default()
-        } else {
-            output.event.metadata.clone().unwrap_or_default()
-        };
-        if meta.trace_id.is_empty() {
-            // A new trace: from a source, or emitted by a transform on its own.
-            meta.trace_id = Ulid::generate().to_string();
-            meta.origin_node_id = r.node_id.clone();
-            meta.create_time = Some(now());
-            meta.hops = 0;
-        }
-        meta.hops = meta.hops.saturating_add(1);
-        if meta.hops > routes.max_hops {
-            r.dropped_hops.fetch_add(1, Ordering::Relaxed);
-            if hop_log.allow() {
-                log::error!(
-                    "{} dropped an event of trace {} after {} hops (max_hops = {})",
-                    r.tag,
-                    meta.trace_id,
-                    meta.hops - 1,
-                    routes.max_hops
-                );
-            }
-            continue;
-        }
-        for target in &routes.targets {
-            let (payload, size) = match &target.mapping {
-                None => (output.event.payload.clone(), output.size),
-                Some(mapping) => {
-                    let input = output.event.payload.clone().unwrap_or_default();
-                    match mapping.apply(&input, Some(&meta)) {
-                        // Mapped payloads are re-measured for the queue's limits.
-                        Ok(Some(mapped)) => {
-                            let size = mapped.encoded_len();
-                            (Some(mapped), size)
+        commits.retain(|c| !c.is_finished());
+        let ack = match output.item {
+            Output::Event {
+                conn_id,
+                seq,
+                event,
+                size,
+            } => {
+                r.emitted.fetch_add(1, Ordering::Relaxed);
+                let (outcome, tickets) = route_event(&r, &logs, event, size).await;
+                if tickets.is_empty() {
+                    r.producer.routed(conn_id, seq, outcome).await;
+                } else {
+                    // Stored only once committed; the next event needn't wait.
+                    let producer = r.producer.clone();
+                    commits.push(tokio::spawn(async move {
+                        let mut stored = true;
+                        for (queue, ticket) in tickets {
+                            stored &= queue.committed(ticket).await;
                         }
-                        Ok(None) => continue, // filtered out on this edge
-                        Err(err) => {
-                            r.mapping_errors.fetch_add(1, Ordering::Relaxed);
-                            if mapping_log.allow() {
-                                log::warn!(
-                                    "{} edge {}: couldn't map an event for node {}, skipped: {err}",
-                                    r.tag,
-                                    target.edge_id,
-                                    target.node_id
-                                );
+                        let outcome = if stored {
+                            outcome
+                        } else {
+                            Routed::Rejected {
+                                reason: "couldn't store it".into(),
+                                retry: true,
                             }
-                            continue;
+                        };
+                        producer.routed(conn_id, seq, outcome).await;
+                    }));
+                }
+                continue;
+            }
+            Output::Acked {
+                conn_id,
+                up_to,
+                seqs,
+            } => AckMsg::Acked {
+                conn_id,
+                up_to,
+                seqs,
+            },
+            Output::Nacked {
+                conn_id,
+                seq,
+                reason,
+                retry,
+            } => AckMsg::Nacked {
+                conn_id,
+                seq,
+                reason,
+                retry,
+            },
+        };
+        // A transform's ack of an input takes effect only once the outputs
+        // it sent before it are stored (a crash in between can't lose them).
+        for commit in commits.drain(..) {
+            let _ = commit.await;
+        }
+        if let Some(acks) = &r.acks {
+            let _ = acks.send(ack);
+        }
+    }
+}
+
+/// Routes one event; returns what to tell the producer, and the commits of
+/// durable targets to wait for first.
+async fn route_event(
+    r: &Router,
+    logs: &RouteLogs,
+    event: DataEvent,
+    size: usize,
+) -> (Routed, Vec<(Arc<NodeQueue>, u64)>) {
+    // One table per event: the one in effect now (a reload swaps it).
+    let routes = r.routes.borrow().clone();
+    // A transform's output carries its input's metadata (attached by the hub).
+    let mut meta = if r.is_source {
+        EventMetadata::default()
+    } else {
+        event.metadata.clone().unwrap_or_default()
+    };
+    if meta.trace_id.is_empty() {
+        // A new trace: from a source, or a transform output without an input.
+        meta.trace_id = Ulid::generate().to_string();
+        meta.origin_node_id = r.node_id.clone();
+        meta.create_time = Some(now());
+        meta.hops = 0;
+    }
+    meta.hops = meta.hops.saturating_add(1);
+    if meta.hops > routes.max_hops {
+        r.dropped_hops.fetch_add(1, Ordering::Relaxed);
+        if logs.hops.allow() {
+            log::error!(
+                "{} dropped an event of trace {} after {} hops (max_hops = {})",
+                r.tag,
+                meta.trace_id,
+                meta.hops - 1,
+                routes.max_hops
+            );
+        }
+        let outcome = Routed::Rejected {
+            reason: format!("over the hop limit ({})", routes.max_hops),
+            retry: false,
+        };
+        return (outcome, vec![]);
+    }
+    // Decoded only if an edge maps it.
+    let mut decoded: Option<Result<PluginPayload, String>> = None;
+    let (mut accepted, mut dropped, mut failed) = (0usize, 0usize, 0usize);
+    let mut tickets = vec![];
+    for target in &routes.targets {
+        let (body, size) = match &target.mapping {
+            None => (event.body.clone(), size),
+            Some(mapping) => {
+                let input = decoded
+                    .get_or_insert_with(|| event.payload().map_err(|e| e.to_string()));
+                let mapped = match input {
+                    Ok(input) => mapping.apply(input, Some(&meta)).map_err(|e| e.to_string()),
+                    Err(err) => Err(format!("undecodable event: {err}")),
+                };
+                match mapped {
+                    // Mapped payloads are re-measured for the queue's limits.
+                    Ok(Some(mapped)) => {
+                        let mapped = DataEvent::from_payload(mapped);
+                        let size = mapped.size();
+                        (mapped.body, size)
+                    }
+                    Ok(None) => {
+                        accepted += 1; // filtered out on this edge
+                        continue;
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        r.mapping_errors.fetch_add(1, Ordering::Relaxed);
+                        if logs.mapping.allow() {
+                            log::warn!(
+                                "{} edge {}: couldn't map an event for node {}, skipped: {err}",
+                                r.tag,
+                                target.edge_id,
+                                target.node_id
+                            );
                         }
+                        continue;
                     }
                 }
-            };
-            let event = DataEvent {
-                instance_id: target.instance_id.clone(),
-                plugin_version: target.plugin_version.clone(),
-                payload,
-                metadata: Some(EventMetadata {
-                    event_id: Ulid::generate().to_string(),
-                    ..meta.clone()
-                }),
-            };
-            match target.queue.push(event, size).await {
-                Pushed::Dropped(DropReason::Oversized) if oversized_log.allow() => log::warn!(
-                    "{} dropped an event of {} bytes for node {}: larger than the hub's memory limit ([hub] max_inflight_bytes)",
-                    r.tag,
-                    size,
-                    target.node_id
-                ),
-                Pushed::Dropped(reason)
-                    if reason != DropReason::Closed
-                        && reason != DropReason::Oversized
-                        && drop_log.allow() =>
-                {
+            }
+        };
+        let event = DataEvent {
+            body,
+            metadata: Some(EventMetadata {
+                event_id: Ulid::generate().to_string(),
+                ..meta.clone()
+            }),
+            attempt: 1,
+        };
+        let (pushed, ticket) = target.queue.push_tracked(event, size).await;
+        if let Some(ticket) = ticket {
+            tickets.push((target.queue.clone(), ticket));
+        }
+        match pushed {
+            Pushed::Queued => accepted += 1,
+            Pushed::Dropped(reason) => {
+                dropped += 1;
+                if reason == DropReason::Oversized {
+                    if logs.oversized.allow() {
+                        log::warn!(
+                            "{} dropped an event of {} bytes for node {}: larger than the hub's memory limit ([hub] max_inflight_bytes)",
+                            r.tag,
+                            size,
+                            target.node_id
+                        );
+                    }
+                } else if reason != DropReason::Closed && logs.drops.allow() {
                     log::warn!(
                         "{} dropped an event for node {}: {reason:?}",
                         r.tag,
                         target.node_id
                     );
                 }
-                _ => {}
             }
         }
     }
+    let outcome = if dropped > 0 {
+        Routed::Rejected {
+            reason: format!("dropped by {dropped} of {} targets", routes.targets.len()),
+            retry: true,
+        }
+    } else if failed > 0 && accepted == 0 {
+        Routed::Rejected {
+            reason: "no out-edge's mapping could map it".into(),
+            retry: false,
+        }
+    } else {
+        Routed::Accepted
+    };
+    (outcome, tickets)
 }
 
-/// Hands a node's queued events to its plugin, waiting while it isn't running.
-async fn deliver(
+struct Deliverer {
     tag: String,
     queue: Arc<NodeQueue>,
     sender: LinkSender,
-    mut status: watch::Receiver<NodeStatus>,
-) {
+    status: watch::Receiver<NodeStatus>,
+    acks: mpsc::UnboundedReceiver<AckMsg>,
+    delivery: DeliverySpec,
+    stop: CancellationToken,
+}
+
+/// Events handed to the plugin and not acked yet, on one connection.
+struct InFlight {
+    conn: Option<(u64, Negotiated)>,
+    /// By seq on that connection.
+    items: BTreeMap<u64, Queued>,
+}
+
+/// Hands a node's queued events to its plugin, waiting while it isn't
+/// running. With ACKS, keeps each event until the plugin acks it (at most
+/// `max_unacked` at a time), and redelivers it after a disconnect or a NACK
+/// with retry; without, an event counts as delivered once sent.
+async fn deliver(mut d: Deliverer) {
+    let dead_log = RateLimit::new(DROP_LOG_INTERVAL);
+    let mut flight = InFlight {
+        conn: None,
+        items: BTreeMap::new(),
+    };
+    let mut paused_until: Option<Instant> = None;
     loop {
-        if status
-            .wait_for(|s| s.state == NodeState::Running)
-            .await
-            .is_err()
-        {
-            return; // the node is gone
+        // A new connection (or none): what was in flight comes back first.
+        let current = d.sender.connection();
+        if current.map(|c| c.0) != flight.conn.map(|c| c.0) {
+            requeue_all(&d, &mut flight, &dead_log);
+            flight.conn = current;
         }
-        let Some(item) = queue.pop().await else {
-            return; // closed
+        let running = d.status.borrow().state == NodeState::Running && flight.conn.is_some();
+        let window = match flight.conn {
+            Some((_, n)) if n.acks => flight.items.len() < n.max_unacked.max(1) as usize,
+            _ => true,
         };
-        match sender.send(RuntimeMsg::Event(item.event.clone())).await {
-            Ok(()) => queue.delivered(),
-            Err(HubError::NotConnected) => {
-                // It went away meanwhile: keep the event, wait for a change.
-                queue.requeue(item);
-                let _ = tokio::time::timeout(Duration::from_millis(100), status.changed()).await;
+        let paused = paused_until.is_some_and(|t| Instant::now() < t);
+        let can_send = running && window && !paused;
+        let resume = async {
+            match paused_until {
+                Some(t) => tokio::time::sleep_until(t.into()).await,
+                None => std::future::pending().await,
             }
-            Err(err) => log::error!("{tag} couldn't deliver an event: {err}"),
+        };
+        tokio::select! {
+            _ = d.stop.cancelled() => {
+                requeue_all(&d, &mut flight, &dead_log);
+                return;
+            }
+            Some(ack) = d.acks.recv() => {
+                handle_ack(&d, &mut flight, ack, &mut paused_until, &dead_log);
+            }
+            changed = d.status.changed() => if changed.is_err() {
+                return; // the node is gone
+            },
+            _ = resume, if paused => paused_until = None,
+            item = d.queue.pop(), if can_send => {
+                let Some(item) = item else {
+                    return; // closed
+                };
+                send(&mut d, &mut flight, item, &dead_log).await;
+            }
         }
+        d.queue.set_in_flight(flight.items.len());
     }
+}
+
+async fn send(d: &mut Deliverer, flight: &mut InFlight, item: Queued, dead_log: &RateLimit) {
+    match d.sender.send_event(&item.event).await {
+        Ok((conn_id, seq)) => {
+            if flight.conn.map(|c| c.0) != Some(conn_id) {
+                // It reconnected meanwhile: what was in flight on the old
+                // connection goes back first (behind this one, sadly).
+                requeue_all(d, flight, dead_log);
+                flight.conn = d.sender.connection().filter(|c| c.0 == conn_id);
+            }
+            match flight.conn {
+                Some((_, n)) if n.acks => {
+                    flight.items.insert(seq, item);
+                }
+                _ => d.queue.delivered(item),
+            }
+        }
+        Err(HubError::NotConnected) => {
+            // It went away meanwhile: keep the event, wait for a change.
+            d.queue.requeue(item);
+            let _ = tokio::time::timeout(Duration::from_millis(100), d.status.changed()).await;
+        }
+        Err(err) => log::error!("{} couldn't deliver an event: {err}", d.tag),
+    }
+}
+
+fn handle_ack(
+    d: &Deliverer,
+    flight: &mut InFlight,
+    ack: AckMsg,
+    paused_until: &mut Option<Instant>,
+    dead_log: &RateLimit,
+) {
+    let current = flight.conn.map(|c| c.0);
+    match ack {
+        AckMsg::Acked {
+            conn_id,
+            up_to,
+            seqs,
+        } if Some(conn_id) == current => {
+            let rest = flight.items.split_off(&(up_to + 1));
+            let done = std::mem::replace(&mut flight.items, rest);
+            for (_, item) in done {
+                d.queue.delivered(item);
+            }
+            for seq in seqs {
+                if let Some(item) = flight.items.remove(&seq) {
+                    d.queue.delivered(item);
+                }
+            }
+        }
+        AckMsg::Nacked {
+            conn_id,
+            seq,
+            reason,
+            retry,
+        } if Some(conn_id) == current => {
+            let Some(mut item) = flight.items.remove(&seq) else {
+                return;
+            };
+            d.queue.count_nacked();
+            if retry && item.event.attempt < d.delivery.max_attempts {
+                item.event.attempt += 1;
+                d.queue.count_redelivered();
+                d.queue.requeue(item);
+                *paused_until = Some(Instant::now() + d.delivery.retry_delay);
+            } else {
+                if dead_log.allow() {
+                    log::warn!(
+                        "{} gave up on an event after {} attempts: {reason}",
+                        d.tag,
+                        item.event.attempt
+                    );
+                }
+                d.queue.dead_letter(item);
+            }
+        }
+        // About an earlier connection: its events were requeued already.
+        _ => {}
+    }
+}
+
+/// Puts every in-flight event back at the front of the queue, in order, for
+/// redelivery (or dead-letters it if it's out of attempts).
+fn requeue_all(d: &Deliverer, flight: &mut InFlight, dead_log: &RateLimit) {
+    for (_, mut item) in std::mem::take(&mut flight.items).into_iter().rev() {
+        if item.event.attempt >= d.delivery.max_attempts {
+            if dead_log.allow() {
+                log::warn!(
+                    "{} gave up on an event after {} attempts (connection lost each time)",
+                    d.tag,
+                    item.event.attempt
+                );
+            }
+            d.queue.dead_letter(item);
+            continue;
+        }
+        item.event.attempt += 1;
+        d.queue.count_redelivered();
+        d.queue.requeue(item);
+    }
+    d.queue.set_in_flight(0);
 }
 
 fn now() -> pbjson_types::Timestamp {

@@ -2,7 +2,7 @@
 //! `a["content.type"]`. Bare keys are letters, digits, `_` and `-`.
 
 use super::value::Value;
-use flwrs_plugin::schema::schema::{
+use flwrs_plugin::schema::payload::{
     FieldDefinition, SchemaDefinition, field_type::Enum as FieldType,
 };
 use std::fmt;

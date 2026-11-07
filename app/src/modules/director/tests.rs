@@ -15,11 +15,11 @@ use flwrs_plugin::plugin::core::{
 use flwrs_plugin::plugin::error::{
     InitializeError, ShutdownError, SinkError, SourceError, TransformError,
 };
-use flwrs_plugin::schema::common::log_level::Enum as LogLevel;
-use flwrs_plugin::schema::schema::{
+use flwrs_plugin::schema::protocol::log_level::Enum as LogLevel;
+use flwrs_plugin::schema::payload::{
     Field, FieldValue, PluginPayload, field_type, field_value::Value,
 };
-use flwrs_plugin::schema::{sink, transform};
+use flwrs_plugin::plugin::core::InboundEvent;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -45,10 +45,10 @@ fn text_schema() -> SchemaDefinition {
     )
 }
 
-fn text_of(payload: &Option<PluginPayload>) -> String {
+fn text_of(payload: &PluginPayload) -> String {
     payload
-        .as_ref()
-        .and_then(|p| p.fields.first())
+        .fields
+        .first()
         .and_then(|f| f.value.as_ref())
         .and_then(|v| match &v.value {
             Some(Value::String(s)) => Some(s.clone()),
@@ -157,31 +157,38 @@ impl flwrs_plugin::transform::plugin::Transform for Mapper {
     fn version(&self) -> String {
         "1.0.0".into()
     }
-    fn process_event(
-        &mut self,
-        event: transform::TransformEvent,
-    ) -> Result<transform::TransformEvent, TransformError> {
+    fn process_event(&mut self, event: InboundEvent) -> Result<Vec<PluginPayload>, TransformError> {
         let text = text_of(&event.payload);
         let text = if self.upper {
             text.to_uppercase()
         } else {
             text
         };
-        Ok(transform::TransformEvent {
-            plugin_id: event.plugin_id,
-            plugin_version: event.plugin_version,
-            payload: Some(text_payload(&text)),
-            metadata: None, // the SDK copies the input's
-        })
+        // The hub ties the output to its input (and so to its trace).
+        Ok(vec![text_payload(&text)])
     }
 }
 
-/// Appends `node text hops trace origin` for each event to a file.
+/// Appends `node text hops trace origin attempt` for each event to a file.
 struct Collector {
     id: String,
     out: PathBuf,
     /// Per event, to make the sink slower than its source.
     delay: Duration,
+    misbehave: Misbehave,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Misbehave {
+    No,
+    /// Rejects every event's first delivery (retryable).
+    FailFirst,
+    /// Rejects every delivery (retryable).
+    FailAlways,
+    /// Exits (without acking) on its first event, the first time it runs.
+    CrashOnce,
+    /// Rejects (retryable) every event until the file `out.open` exists.
+    Gated,
 }
 
 impl flwrs_plugin::sink::plugin::Sink for Collector {
@@ -201,21 +208,35 @@ impl flwrs_plugin::sink::plugin::Sink for Collector {
     fn version(&self) -> String {
         "1.0.0".into()
     }
-    fn consume_event(&mut self, event: sink::SinkEvent) -> Result<(), SinkError> {
+    async fn consume_event(&self, event: InboundEvent) -> Result<(), SinkError> {
         use std::io::Write;
-        std::thread::sleep(self.delay);
-        // Like http_sink: events must be addressed to this instance.
-        if event.plugin_id != self.id {
-            return Err(SinkError::new(format!("event for {}", event.plugin_id)));
+        tokio::time::sleep(self.delay).await;
+        match self.misbehave {
+            Misbehave::FailFirst if event.attempt == 1 => {
+                return Err(SinkError::retryable("not yet"));
+            }
+            Misbehave::FailAlways => return Err(SinkError::retryable("never")),
+            Misbehave::Gated if !self.out.with_extension("open").exists() => {
+                return Err(SinkError::retryable("closed"));
+            }
+            Misbehave::CrashOnce => {
+                let marker = self.out.with_extension("crashed");
+                if !marker.exists() {
+                    std::fs::write(&marker, "").unwrap();
+                    std::process::exit(1);
+                }
+            }
+            _ => {}
         }
         let meta = event.metadata.clone().unwrap_or_default();
         let line = format!(
-            "{} {} {} {} {}\n",
+            "{} {} {} {} {} {}\n",
             self.id,
             text_of(&event.payload),
             meta.hops,
             meta.trace_id,
-            meta.origin_node_id
+            meta.origin_node_id,
+            event.attempt
         );
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -269,11 +290,7 @@ async fn test_plugin() {
         }
         "upper" | "pass" => {
             use flwrs_plugin::transform::runner::{TransformRunner, TransformRunnerConfig};
-            let config = TransformRunnerConfig {
-                plugin_id: id,
-                log_level: LogLevel::Info,
-                hub_connection: connection,
-            };
+            let config = TransformRunnerConfig::new(id, LogLevel::Info, connection);
             let mapper = Mapper {
                 upper: mode == "upper",
             };
@@ -283,7 +300,7 @@ async fn test_plugin() {
                 .run()
                 .await
         }
-        "sink" | "slow-sink" => {
+        "sink" | "slow-sink" | "flaky-sink" | "failing-sink" | "crash-sink" | "gated-sink" => {
             use flwrs_plugin::sink::runner::{SinkRunner, SinkRunnerConfig};
             let collector = Collector {
                 id: id.clone(),
@@ -293,12 +310,15 @@ async fn test_plugin() {
                 } else {
                     Duration::ZERO
                 },
+                misbehave: match mode.as_str() {
+                    "flaky-sink" => Misbehave::FailFirst,
+                    "failing-sink" => Misbehave::FailAlways,
+                    "crash-sink" => Misbehave::CrashOnce,
+                    "gated-sink" => Misbehave::Gated,
+                    _ => Misbehave::No,
+                },
             };
-            let config = SinkRunnerConfig {
-                plugin_id: id,
-                log_level: LogLevel::Info,
-                hub_connection: connection,
-            };
+            let config = SinkRunnerConfig::new(id, LogLevel::Info, connection);
             SinkRunner::initialize(collector, config)
                 .await
                 .unwrap()
@@ -354,6 +374,10 @@ async fn register_plugins(f: &Fixture, dir: &Path) {
         ),
         ("t-sink", "SINK", "sink", r#"{"in":"i.json"}"#),
         ("t-slow-sink", "SINK", "slow-sink", r#"{"in":"i.json"}"#),
+        ("t-flaky-sink", "SINK", "flaky-sink", r#"{"in":"i.json"}"#),
+        ("t-failing-sink", "SINK", "failing-sink", r#"{"in":"i.json"}"#),
+        ("t-crash-sink", "SINK", "crash-sink", r#"{"in":"i.json"}"#),
+        ("t-gated-sink", "SINK", "gated-sink", r#"{"in":"i.json"}"#),
     ] {
         let script = format!("{id}.sh");
         let path = dir.join(&script);
@@ -438,10 +462,33 @@ impl Setup {
         self.engine = Some(tokio::spawn(engine.run(commands, self.stop.clone())));
     }
 
+    /// Stops the director (and its hub), as a server shutdown does.
+    async fn stop_director(&mut self) {
+        self.stop.cancel();
+        if let Some(engine) = self.engine.take() {
+            tokio::time::timeout(WAIT, engine)
+                .await
+                .expect("the director stops")
+                .unwrap();
+        }
+        self.hub_stop.cancel();
+        self.stop = CancellationToken::new();
+        self.hub_stop = CancellationToken::new();
+    }
+
     async fn node(&self, scene: &str, plugin: &str) -> String {
         self.f
             .service
             .create_node(scene, node_input(plugin, json!(null)))
+            .await
+            .unwrap()
+            .id
+    }
+
+    async fn node_with(&self, scene: &str, plugin: &str, config: serde_json::Value) -> String {
+        self.f
+            .service
+            .create_node(scene, node_input(plugin, config))
             .await
             .unwrap()
             .id
@@ -530,6 +577,99 @@ fn texts(lines: &[Vec<String>], node: &str) -> Vec<String> {
 }
 
 // --- tests ---
+
+/// A node's queue stats.
+async fn queue_of(s: &Setup, scene: &str, node: &str) -> super::queue::QueueStats {
+    s.status(scene)
+        .await
+        .nodes
+        .into_iter()
+        .find(|n| n.node_id == node)
+        .and_then(|n| n.queue)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn rejected_events_are_redelivered_with_a_higher_attempt() {
+    let mut s = setup().await;
+    s.start_director(32).await;
+    let scene = s.enabled_scene().await;
+    let source = s.node(&scene, "t-source").await;
+    let sink = s
+        .node_with(
+            &scene,
+            "t-flaky-sink",
+            json!({"runtime": {"delivery": {"retry_delay_ms": 20}}}),
+        )
+        .await;
+    s.edge(&scene, &source, &sink).await;
+    s.director.reload(&scene).await.unwrap();
+
+    let lines = s.wait_lines(3).await;
+    assert_eq!(texts(&lines, &sink), ["a", "b", "c"]);
+    // Each was rejected once, then delivered again: same event, attempt 2.
+    assert!(lines.iter().all(|l| l[5] == "2"), "{lines:?}");
+    let queue = queue_of(&s, &scene, &sink).await;
+    assert_eq!((queue.nacked, queue.redelivered, queue.dead_lettered), (3, 3, 0));
+    assert_eq!((queue.delivered, queue.in_flight), (3, 0));
+}
+
+#[tokio::test]
+async fn events_that_keep_failing_are_dead_lettered() {
+    let mut s = setup().await;
+    s.start_director(32).await;
+    let scene = s.enabled_scene().await;
+    let source = s.node(&scene, "t-source").await;
+    let sink = s
+        .node_with(
+            &scene,
+            "t-failing-sink",
+            json!({"runtime": {"delivery": {"retry_delay_ms": 10, "max_attempts": 2}}}),
+        )
+        .await;
+    s.edge(&scene, &source, &sink).await;
+    s.director.reload(&scene).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let queue = queue_of(&s, &scene, &sink).await;
+        if queue.dead_lettered == 3 {
+            // Two attempts each: the first, and one redelivery.
+            assert_eq!((queue.nacked, queue.redelivered, queue.delivered), (6, 3, 0));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{queue:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(s.lines().is_empty());
+    let report = s.status(&scene).await;
+    let sink_report = report.nodes.iter().find(|n| n.node_id == sink).unwrap();
+    assert_eq!(sink_report.counters.dropped, 3, "dead letters count as dropped");
+}
+
+#[tokio::test]
+async fn events_in_flight_when_a_sink_crashes_are_redelivered() {
+    let mut s = setup().await;
+    s.start_director(32).await;
+    let scene = s.enabled_scene().await;
+    let source = s.node(&scene, "t-source").await;
+    let sink = s
+        .node_with(&scene, "t-crash-sink", json!({"runtime": {"restart_delay_ms": 50}}))
+        .await;
+    s.edge(&scene, &source, &sink).await;
+    s.director.reload(&scene).await.unwrap();
+
+    // The first launch crashed on its first event without acking it; every
+    // event in flight then went to the relaunched plugin.
+    let lines = s.wait_lines(3).await;
+    assert_eq!(texts(&lines, &sink), ["a", "b", "c"]);
+    let first = lines.iter().find(|l| l[1] == "a").unwrap();
+    assert_eq!(first[5], "2", "delivered again after the crash: {lines:?}");
+    let report = s.status(&scene).await;
+    let sink_report = report.nodes.iter().find(|n| n.node_id == sink).unwrap();
+    assert_eq!(sink_report.counters.restarts, 1);
+    assert_eq!(sink_report.counters.dropped, 0);
+}
 
 #[tokio::test]
 async fn source_transform_sink_pipeline_with_metadata_status_and_stop() {
@@ -629,6 +769,7 @@ async fn a_cycle_is_stopped_by_the_scenes_hop_limit() {
     let limit = crate::modules::scene::service::SceneInput {
         name: "scene".into(),
         max_hops: Some(6), // the scene's own limit wins
+        ..Default::default()
     };
     s.f.service.update_scene(&scene, &limit).await.unwrap();
     let source = s.node(&scene, "t-source").await;
@@ -721,6 +862,7 @@ async fn a_reload_keeps_unchanged_nodes_and_swaps_edges_mappings_and_hop_limit()
     let limit = crate::modules::scene::service::SceneInput {
         name: "scene".into(),
         max_hops: Some(7),
+        ..Default::default()
     };
     s.f.service.update_scene(&scene, &limit).await.unwrap();
     s.director.reload(&scene).await.unwrap();
@@ -781,6 +923,7 @@ async fn a_changed_node_restarts_alone() {
     assert_eq!(again[&ticker], before[&ticker]);
 }
 
+#[cfg(feature = "remote")] // creates remote nodes
 #[tokio::test]
 async fn a_changed_remote_node_keeps_its_plugin_connected() {
     let mut s = setup().await;
@@ -875,6 +1018,89 @@ async fn a_scene_that_fails_its_checks_doesnt_start() {
 }
 
 #[tokio::test]
+async fn a_durable_scene_keeps_its_events_across_a_restart() {
+    let mut s = setup().await;
+    s.start_director(32).await;
+    let scene = s.f.scene().await.id;
+    let input = crate::modules::scene::service::SceneInput {
+        name: "durable".into(),
+        defaults: crate::modules::node_config::SceneDefaults {
+            durable: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    s.f.service.update_scene(&scene, &input).await.unwrap();
+    let source = s.node(&scene, "t-source").await;
+    let sink = s
+        .node_with(
+            &scene,
+            "t-gated-sink",
+            json!({"runtime": {"delivery": {"retry_delay_ms": 20, "max_attempts": 1000}}}),
+        )
+        .await;
+    s.edge(&scene, &source, &sink).await;
+    s.f.service.set_enabled(&scene, true).await.unwrap();
+    s.director.reload(&scene).await.unwrap();
+
+    // The sink keeps rejecting: the three events wait in its durable queue.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let queue = queue_of(&s, &scene, &sink).await;
+        if queue.durable && queue.disk_len == 3 && queue.nacked >= 3 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{queue:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    s.stop_director().await;
+    assert!(s.lines().is_empty());
+
+    // The server starts again, and the sink now accepts: the kept events
+    // are delivered (marked as possible duplicates), besides the source's
+    // new run.
+    std::fs::write(s.dir.path().join("out.open"), "").unwrap();
+    s.start_director(32).await;
+    let lines = s.wait_lines(6).await;
+    assert_eq!(texts(&lines, &sink), ["a", "a", "b", "b", "c", "c"]);
+    let replayed = lines.iter().filter(|l| l[5] != "1").count();
+    assert!(replayed >= 3, "{lines:?}");
+}
+
+#[tokio::test]
+async fn a_purge_drops_what_a_stopped_durable_scene_kept() {
+    let mut s = setup().await;
+    s.start_director(32).await;
+    let scene = s.f.scene().await.id;
+    let input = crate::modules::scene::service::SceneInput {
+        name: "durable".into(),
+        defaults: crate::modules::node_config::SceneDefaults {
+            durable: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    s.f.service.update_scene(&scene, &input).await.unwrap();
+    let source = s.node(&scene, "t-source").await;
+    let sink = s.node(&scene, "t-gated-sink").await;
+    s.edge(&scene, &source, &sink).await;
+    s.f.service.set_enabled(&scene, true).await.unwrap();
+    s.director.reload(&scene).await.unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while queue_of(&s, &scene, &sink).await.disk_len < 3 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Disabled: the scene stops, its durable queue's file stays.
+    s.f.service.set_enabled(&scene, false).await.unwrap();
+    s.director.reload(&scene).await.unwrap();
+    let spool = s.dir.path().join("spool").join(&scene);
+    assert!(std::fs::read_dir(&spool).unwrap().count() > 0);
+    assert_eq!(s.director.purge(&scene, Some(&sink)).await.unwrap(), 3);
+    assert_eq!(s.director.purge(&scene, None).await.unwrap(), 0);
+}
+
+#[tokio::test]
 async fn enabled_scenes_start_with_the_director_and_stop_with_it() {
     let mut s = setup().await;
     let scene = s.enabled_scene().await;
@@ -896,6 +1122,7 @@ async fn enabled_scenes_start_with_the_director_and_stop_with_it() {
         .unwrap();
 }
 
+#[cfg(feature = "remote")] // creates remote nodes
 #[tokio::test]
 async fn a_remote_node_is_reached_by_its_remote_id() {
     let mut s = setup().await;

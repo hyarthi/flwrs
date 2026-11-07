@@ -19,12 +19,15 @@ At run time the server's host needs the language's runtime: `python3` with `prot
 
 **Payload** (`schema/in.json`, the same in all four): `url`, `method` (default `POST`) and `body`, all strings. Use an edge mapping to fill them in from a source's events.
 
-**What each example does** (see README.md, *Plugin protocol*):
+**What each example does** (the spec is [`docs/protocol.md`](../../docs/protocol.md), protocol version 2):
 
-- reads `--id`, `--host`, `--port` (and `--token`, else `FLWRS_TOKEN`), connects to the hub and sends `Initialize` with the version from `manifest.json` and the schema from `schema/in.json`;
-- frames every message (`u32` LE packet length, `u32` LE header length, `Version` / `Msg-Code` header lines, protobuf body) and checks the `Msg-Code` of what it receives;
-- sends an HTTP request for each `SinkEvent`, one at a time, and reports failures as an `ErrorEvent`;
-- answers `Shutdown` (which is also how the hub rejects a plugin) with `Exit` and exits;
+- reads `--id`, `--host`, `--port` (and `--token`, else `FLWRS_TOKEN`), connects to the hub and sends `Initialize` (type SINK, protocol 2..2, capability `ACKS` with a window of 1) with the version from `manifest.json` and the schema from `schema/in.json`;
+- frames every message (`u32` LE packet length, framing version byte 2, `u32` LE header length, a protobuf `FrameHeader`, the body) and treats anything unexpected (a wrong version, a code a sink can't receive, a gap in the event `seq`s) as a protocol violation: it closes the connection and reconnects;
+- answers `PING` with `PONG`, also while a request is running;
+- sends an HTTP request for each event, one at a time, then `ACK`s it, or on failure sends an `ErrorEvent` and a `NACK` (no retry);
+- answers `Shutdown` with `Exit` once the request in hand is done, and exits; a `Shutdown` before `InitializeResponse` (a rejection) means exit with status 1, without reconnecting;
 - reconnects with the same `Initialize` if the connection drops (1 s, doubling up to 30 s).
 
-Left out on purpose: `LogEvent`s (stdout and stderr already go to the server log), launch arguments, log levels and a proper HTTP client configuration.
+Each passes the conformance suite: `cargo run -p flwrs-trellis -- <unzipped package>` from the repo root (Python needs `protobuf` on the `python3` it runs with).
+
+Left out on purpose: `CREDITS` (a sink produces nothing), `LogEvent`s (stdout and stderr already go to the server log), launch arguments, log levels, TLS, and a proper HTTP client configuration.

@@ -5,21 +5,23 @@
 //!
 //! The spool file is `<spool_dir>/<scene-id>/<node-id>.<ulid>.db`, created on the
 //! first spill (the scene's folder is wiped when the scene launches, so it's
-//! always new) and deleted when the queue finishes. Table: `events(seq, enqueue_time, size, event)`, where
-//! `event` is the encoded protobuf event with its metadata. WAL with
+//! always new) and deleted when the queue finishes. Table:
+//! `events(seq, enqueue_time, size, header, event)`: `header` is a protobuf
+//! `FrameHeader` with the event's metadata and attempt, `event` its encoded
+//! body, as it will go on the wire. WAL with
 //! `synchronous = NORMAL`: delivery is at-most-once, so an fsync per batch
 //! isn't worth it.
 
 use super::{Hold, NodeQueue, Pending, Queued, SoftShare, SpillSettings};
 use crate::modules::hub::wire::DataEvent;
 use crate::modules::rate_limit::RateLimit;
-use flwrs_plugin::schema::transform::TransformEvent;
+use flwrs_plugin::schema::protocol::FrameHeader;
 use prost::Message;
 use sqlx::sqlite::{
     SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
 };
 use sqlx::{Row, SqlitePool};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,6 +41,11 @@ pub(super) async fn run(queue: Arc<NodeQueue>) {
     loop {
         if queue.state().closed {
             break;
+        }
+        let purge = queue.state().purge_disk.take();
+        if let Some(done) = purge {
+            let n = purge_disk(&queue, &spill, store.as_ref()).await;
+            let _ = done.send(n);
         }
         let refilled = refill(&queue, &spill, &mut store).await;
         // Give a burst a moment to fill the batch.
@@ -190,6 +197,7 @@ fn push_memory(spill: &SpillSettings, state: &mut super::State, event: DataEvent
     state.items.push_back(Queued {
         event,
         size,
+        row: None,
         _hold: Hold::Soft(SoftShare {
             gauge: spill.shared.memory.clone(),
             bytes: size as u64,
@@ -301,6 +309,27 @@ async fn flush(
     }
 }
 
+/// Empties the spool file (a purge). Returns how many events were on disk.
+async fn purge_disk(queue: &NodeQueue, spill: &SpillSettings, store: Option<&Store>) -> u64 {
+    let (n, bytes) = {
+        let mut state = queue.state();
+        let n = (state.disk_len, state.disk_bytes);
+        state.disk_len = 0;
+        state.disk_bytes = 0;
+        if state.pending.is_empty() && state.writing == 0 {
+            state.spilling = false;
+        }
+        n
+    };
+    spill.shared.disk.sub(bytes);
+    if let Some(store) = store {
+        let _ = sqlx::query("DELETE FROM events").execute(&store.pool).await;
+        store.vacuum().await;
+    }
+    queue.popped.notify_waiters();
+    n
+}
+
 /// Closes and deletes the spool file; events still on disk are dropped.
 async fn remove(queue: &NodeQueue, spill: &SpillSettings, store: Option<Store>) {
     let (left, left_bytes) = {
@@ -323,13 +352,7 @@ async fn remove(queue: &NodeQueue, spill: &SpillSettings, store: Option<Store>) 
     }
 }
 
-async fn delete_files(file: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut path = file.as_os_str().to_owned();
-        path.push(suffix);
-        let _ = tokio::fs::remove_file(PathBuf::from(path)).await;
-    }
-}
+use super::delete_files;
 
 async fn available_space(dir: &Path) -> std::io::Result<u64> {
     let dir = dir.to_path_buf();
@@ -362,6 +385,7 @@ impl Store {
                 seq          INTEGER PRIMARY KEY AUTOINCREMENT,
                 enqueue_time INTEGER NOT NULL,
                 size         INTEGER NOT NULL,
+                header       BLOB    NOT NULL,
                 event        BLOB    NOT NULL
             )",
         )
@@ -377,10 +401,13 @@ impl Store {
             .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
         let mut tx = self.pool.begin().await?;
         for p in batch {
-            sqlx::query("INSERT INTO events (enqueue_time, size, event) VALUES ($1, $2, $3)")
+            sqlx::query(
+                "INSERT INTO events (enqueue_time, size, header, event) VALUES ($1, $2, $3, $4)",
+            )
                 .bind(now)
                 .bind(i64::try_from(p.size).unwrap_or(i64::MAX))
-                .bind(encode(&p.event))
+                .bind(encode_header(&p.event))
+                .bind(p.event.body.to_vec())
                 .execute(&mut *tx)
                 .await?;
         }
@@ -396,7 +423,7 @@ impl Store {
         at_least_one: bool,
     ) -> Result<Vec<(Option<DataEvent>, usize)>, sqlx::Error> {
         let limit = i64::try_from(max_events.max(1)).unwrap_or(i64::MAX);
-        let rows = sqlx::query("SELECT seq, size, event FROM events ORDER BY seq LIMIT $1")
+        let rows = sqlx::query("SELECT seq, size, header, event FROM events ORDER BY seq LIMIT $1")
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;
@@ -407,10 +434,11 @@ impl Store {
             if !(out.is_empty() && at_least_one) && bytes + size > max_bytes {
                 break;
             }
-            let blob: Vec<u8> = row.get("event");
+            let header: Vec<u8> = row.get("header");
+            let body: Vec<u8> = row.get("event");
             bytes += size;
             last_seq = Some(row.get::<i64, _>("seq"));
-            let event = decode(&blob);
+            let event = decode(&header, body);
             if event.is_none() {
                 // Can't happen for files we wrote; skip rather than stall.
                 log::error!("Spool: skipped an unreadable event");
@@ -433,25 +461,23 @@ impl Store {
     }
 }
 
-/// Events are stored as protobuf (`TransformEvent` has exactly the fields of
-/// every data event), metadata included, so they're delivered unchanged.
-fn encode(event: &DataEvent) -> Vec<u8> {
-    TransformEvent {
-        plugin_id: event.instance_id.clone(),
-        plugin_version: event.plugin_version.clone(),
-        payload: event.payload.clone(),
+/// The event's metadata and attempt, as a `FrameHeader` (the rest of the
+/// header is filled in when it's sent).
+fn encode_header(event: &DataEvent) -> Vec<u8> {
+    FrameHeader {
         metadata: event.metadata.clone(),
+        attempt: event.attempt,
+        ..Default::default()
     }
     .encode_to_vec()
 }
 
-fn decode(bytes: &[u8]) -> Option<DataEvent> {
-    let event = TransformEvent::decode(bytes).ok()?;
+fn decode(header: &[u8], body: Vec<u8>) -> Option<DataEvent> {
+    let header = FrameHeader::decode(header).ok()?;
     Some(DataEvent {
-        instance_id: event.plugin_id,
-        plugin_version: event.plugin_version,
-        payload: event.payload,
-        metadata: event.metadata,
+        body: body.into(),
+        metadata: header.metadata,
+        attempt: header.attempt,
     })
 }
 
@@ -467,7 +493,7 @@ mod tests {
 
     fn event(n: usize) -> DataEvent {
         DataEvent {
-            instance_id: n.to_string(),
+            body: n.to_string().into(),
             ..Default::default()
         }
     }
@@ -530,7 +556,7 @@ mod tests {
             .expect("timed out popping")
             .expect("queue closed")
             .event
-            .instance_id
+            .label()
     }
 
     async fn wait_until(q: &NodeQueue, what: &str, f: impl Fn(&super::super::QueueStats) -> bool) {
@@ -576,7 +602,7 @@ mod tests {
             }
             let stats = q.stats();
             assert!(stats.spilled > 0 && stats.refilled > 0, "{stats:?}");
-            q.finish().await;
+            q.finish(true).await;
         }
         assert_eq!(shared.disk.used(), 0, "disk gauge released");
         assert_eq!(shared.memory.used(), 0, "memory gauge released");
@@ -620,7 +646,7 @@ mod tests {
             (1, 0),
             "back to memory"
         );
-        q.finish().await;
+        q.finish(true).await;
         assert!(!file.exists(), "deleted when the queue finishes");
     }
 
@@ -664,7 +690,7 @@ mod tests {
             for n in expected {
                 assert_eq!(pop(&q).await, *n, "{name}");
             }
-            q.finish().await;
+            q.finish(true).await;
         }
     }
 
@@ -697,7 +723,7 @@ mod tests {
         // What was held in memory is still delivered, in order.
         assert_eq!(pop(&q).await, "0");
         assert_eq!(pop(&q).await, "1");
-        q.finish().await;
+        q.finish(true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -717,8 +743,8 @@ mod tests {
             second.push(event(9), (1 << 30) + 1).await,
             Pushed::Dropped(DropReason::Oversized)
         );
-        first.finish().await;
-        second.finish().await;
+        first.finish(true).await;
+        second.finish(true).await;
         assert_eq!(shared.memory.used(), 0);
     }
 
@@ -747,7 +773,7 @@ mod tests {
             assert_eq!(pop(&q).await, n.to_string());
         }
         wait_until(&q, "memory mode", |s| !s.spilling && s.disk_len == 0).await;
-        q.finish().await;
+        q.finish(true).await;
         assert_eq!((shared.disk.used(), shared.memory.used()), (0, 0));
     }
 
@@ -778,6 +804,6 @@ mod tests {
         wait_until(&q, "memory mode", |s| !s.spilling).await;
         assert_eq!(q.push(event(3), 10).await, Pushed::Queued);
         assert_eq!(pop(&q).await, "3");
-        q.finish().await;
+        q.finish(true).await;
     }
 }

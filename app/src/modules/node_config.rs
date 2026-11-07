@@ -45,6 +45,43 @@ pub(crate) struct NodeConfig {
     /// Free-form launch arguments, shaped by the plugin's manifest (local nodes only).
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub launch_args: Value,
+    /// Remote nodes only: `token` (pre-shared, the default) or `mtls` (a
+    /// client certificate). Unset = the scene's `defaults.remote_auth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<RemoteAuth>,
+    /// Remote nodes with `token` auth only: whether they must connect to the
+    /// TLS listener. Unset = the scene's default, else true when the hub has
+    /// a TLS listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_tls: Option<bool>,
+    /// Remote nodes with `mtls` auth only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<NodeTls>,
+}
+
+/// A remote node's client-certificate settings.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NodeTls {
+    /// Pins the plugin's certificate: its SHA-256 fingerprint (hex, colons
+    /// allowed). Unset = the certificate must chain to `[hub.tls] client_ca`
+    /// and name the node's `remote_id` (SAN or CN).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert_sha256: Option<String>,
+}
+
+/// How the hub checks a remote node's plugin, all defaults applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EffectiveAuth {
+    Token { require_tls: bool },
+    /// `pin`: a normalised (lower-case hex, no colons) SHA-256 fingerprint.
+    Mtls { pin: Option<String> },
+}
+
+/// A SHA-256 fingerprint in hex (colons and case ignored), normalised.
+pub(crate) fn normalize_fingerprint(pin: &str) -> Option<String> {
+    let hex: String = pin.chars().filter(|c| *c != ':').collect::<String>().to_ascii_lowercase();
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hex)
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
@@ -66,6 +103,20 @@ pub(crate) struct RuntimeConfig {
     pub shutdown_grace_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<QueueConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliveryConfig>,
+}
+
+/// Redelivery of events to a plugin that acknowledges them (capability ACKS).
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeliveryConfig {
+    /// Deliveries of one event (the first included) before it's dead-lettered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u64>,
+    /// Wait before redelivering an event the plugin rejected with retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_delay_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
@@ -102,6 +153,10 @@ pub(crate) struct QueueConfig {
     pub block_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spill: Option<SpillConfig>,
+    /// Keep queued events on disk until the plugin acknowledges them, across
+    /// hub restarts. `None` = the scene's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
@@ -122,6 +177,43 @@ pub(crate) struct SpillConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_batch: Option<u64>,
 }
+
+/// How a remote node's plugin authenticates.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteAuth {
+    /// The node's pre-shared token (`config.token`).
+    Token,
+    /// A client certificate on the TLS listener.
+    Mtls,
+}
+
+/// Defaults a scene sets for its nodes (`scenes.defaults`). Every key is
+/// optional, and a node's own setting wins.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SceneDefaults {
+    /// Keep queued events on disk until acknowledged (`runtime.queue.durable`).
+    /// Default: false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<bool>,
+    /// How remote nodes authenticate (a node's `auth`). Default: `token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_auth: Option<RemoteAuth>,
+    /// Whether remote nodes using a token must connect over TLS (a node's
+    /// `require_tls`). Default: true when the hub has a TLS listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_tls: Option<bool>,
+}
+
+impl SceneDefaults {
+    pub(crate) fn parse(json: &str) -> Result<Self, String> {
+        serde_json::from_str(json).map_err(|e| format!("defaults: {e}"))
+    }
+}
+
+/// Upper bound for `runtime.delivery.max_attempts`.
+pub(crate) const MAX_DELIVERY_ATTEMPTS: u64 = 1000;
 
 impl RuntimeConfig {
     fn is_empty(&self) -> bool {
@@ -155,6 +247,9 @@ impl RuntimeConfig {
             positive("restart_backoff.max_delay_ms", backoff.max_delay_ms);
             positive("restart_backoff.reset_after_ms", backoff.reset_after_ms);
         }
+        if let Some(delivery) = &self.delivery {
+            positive("delivery.max_attempts", delivery.max_attempts);
+        }
         if let Some(queue) = &self.queue {
             positive("queue.capacity", queue.capacity);
             positive("queue.max_bytes", queue.max_bytes);
@@ -167,6 +262,13 @@ impl RuntimeConfig {
                 positive("queue.spill.disk_max_bytes", spill.disk_max_bytes);
                 positive("queue.spill.write_batch", spill.write_batch);
             }
+        }
+        if let Some(n) = self.delivery.as_ref().and_then(|d| d.max_attempts)
+            && n > MAX_DELIVERY_ATTEMPTS
+        {
+            errors.push(format!(
+                "{prefix}.delivery.max_attempts can't exceed {MAX_DELIVERY_ATTEMPTS}"
+            ));
         }
         if let Some(t) = self.reconnect_timeout_ms
             && t <= PLUGIN_MAX_RECONNECT_BACKOFF_MS
@@ -221,10 +323,13 @@ impl NodeConfig {
     }
 
     /// Validates the config against the hub's rules and the plugin's manifest.
-    pub(crate) fn validate(&self, plugin: &PluginRules) -> Vec<String> {
+    pub(crate) fn validate(&self, plugin: &PluginRules, defaults: &SceneDefaults) -> Vec<String> {
         let mut errors = self.validate_own();
-        if let Some(missing) = self.missing_token() {
+        if let Some(missing) = self.missing_token(defaults) {
             errors.push(missing);
+        }
+        if let Some(unsupported) = self.unsupported() {
+            errors.push(unsupported);
         }
         if self.launch == LaunchMode::Local {
             errors.extend(
@@ -257,6 +362,11 @@ impl NodeConfig {
                         "config.remote_id is only for remote nodes; a local plugin is started with its node id".into(),
                     );
                 }
+                if self.auth.is_some() || self.require_tls.is_some() || self.tls.is_some() {
+                    errors.push(
+                        "config.auth, config.require_tls and config.tls are only for remote nodes; local plugins use a per-launch token over loopback".into(),
+                    );
+                }
             }
             LaunchMode::Remote => {
                 if let Some(t) = &self.token
@@ -278,15 +388,63 @@ impl NodeConfig {
                         "config.launch_args is only used for local nodes; a remote plugin gets its arguments from whoever starts it".into(),
                     );
                 }
+                if let Some(pin) = self.tls.as_ref().and_then(|t| t.client_cert_sha256.as_ref())
+                    && normalize_fingerprint(pin).is_none()
+                {
+                    errors.push(
+                        "config.tls.client_cert_sha256 must be a SHA-256 fingerprint: 64 hex digits (colons allowed)".into(),
+                    );
+                }
             }
         }
         errors
     }
 
-    /// The problem if this is a remote node without a token.
-    pub(crate) fn missing_token(&self) -> Option<String> {
-        (self.launch == LaunchMode::Remote && self.token.is_none())
-            .then(|| "config.token is required for remote nodes".to_string())
+    /// The problem if this is a remote node with token auth but no token.
+    pub(crate) fn missing_token(&self, defaults: &SceneDefaults) -> Option<String> {
+        (self.launch == LaunchMode::Remote
+            && self.remote_auth(defaults) == RemoteAuth::Token
+            && self.token.is_none())
+        .then(|| "config.token is required for remote nodes with token auth".to_string())
+    }
+
+    /// The problem if this server can't run the node: a remote node on a
+    /// server built without remote support (the `remote` feature).
+    pub(crate) fn unsupported(&self) -> Option<String> {
+        (cfg!(not(feature = "remote")) && self.launch == LaunchMode::Remote).then(|| {
+            "remote nodes aren't supported: this server was built without the remote feature"
+                .to_string()
+        })
+    }
+
+    pub(crate) fn remote_auth(&self, defaults: &SceneDefaults) -> RemoteAuth {
+        self.auth
+            .or(defaults.remote_auth)
+            .unwrap_or(RemoteAuth::Token)
+    }
+
+    /// How the hub checks this remote node's plugin. `tls_available`: the
+    /// hub has a TLS listener (then token auth requires TLS by default).
+    pub(crate) fn effective_auth(
+        &self,
+        defaults: &SceneDefaults,
+        tls_available: bool,
+    ) -> EffectiveAuth {
+        match self.remote_auth(defaults) {
+            RemoteAuth::Token => EffectiveAuth::Token {
+                require_tls: self
+                    .require_tls
+                    .or(defaults.require_tls)
+                    .unwrap_or(tls_available),
+            },
+            RemoteAuth::Mtls => EffectiveAuth::Mtls {
+                pin: self
+                    .tls
+                    .as_ref()
+                    .and_then(|t| t.client_cert_sha256.as_deref())
+                    .and_then(normalize_fingerprint),
+            },
+        }
     }
 
     /// The id the node's plugin sends in `Initialize`: the `remote_id` of a
@@ -318,6 +476,64 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn remote_auth_follows_the_node_then_the_scene_then_the_listener() {
+        let parse = |v: Value| NodeConfig::parse(&v).unwrap();
+        let none = SceneDefaults::default();
+        let mtls_scene = SceneDefaults {
+            remote_auth: Some(RemoteAuth::Mtls),
+            require_tls: Some(false),
+            ..Default::default()
+        };
+        let token_node = parse(json!({"launch": "remote", "token": "a-long-enough-token"}));
+        // Token nodes require TLS once the hub has a TLS listener.
+        assert_eq!(
+            token_node.effective_auth(&none, true),
+            EffectiveAuth::Token { require_tls: true }
+        );
+        assert_eq!(
+            token_node.effective_auth(&none, false),
+            EffectiveAuth::Token { require_tls: false }
+        );
+        // The scene says mtls; a node can say token, and the scene's
+        // require_tls applies to it.
+        assert_eq!(
+            token_node.effective_auth(&mtls_scene, true),
+            EffectiveAuth::Mtls { pin: None }
+        );
+        let back_to_token = parse(json!({"launch": "remote", "auth": "token", "token": "a-long-enough-token"}));
+        assert_eq!(
+            back_to_token.effective_auth(&mtls_scene, true),
+            EffectiveAuth::Token { require_tls: false }
+        );
+        // mtls needs no token; token auth does.
+        let mtls = parse(json!({"launch": "remote", "auth": "mtls",
+            "tls": {"client_cert_sha256": "AB:".repeat(31) + "AB"}}));
+        assert_eq!(mtls.missing_token(&none), None);
+        assert!(parse(json!({"launch": "remote"})).missing_token(&none).is_some());
+        assert!(parse(json!({"launch": "remote"})).missing_token(&mtls_scene).is_none());
+        assert_eq!(
+            mtls.effective_auth(&none, true),
+            EffectiveAuth::Mtls {
+                pin: Some("ab".repeat(32))
+            }
+        );
+    }
+
+    #[test]
+    fn remote_auth_settings_are_checked() {
+        let errors = |v: Value| NodeConfig::parse(&v).unwrap().validate_own();
+        assert!(errors(json!({"auth": "mtls"}))[0].contains("only for remote nodes"));
+        assert!(errors(json!({"require_tls": true}))[0].contains("only for remote nodes"));
+        assert!(
+            errors(json!({"launch": "remote", "tls": {"client_cert_sha256": "nope"}}))[0]
+                .contains("64 hex digits")
+        );
+        assert!(NodeConfig::parse(&json!({"launch": "remote", "auth": "password"})).is_err());
+        assert_eq!(normalize_fingerprint(&"0F".repeat(32)), Some("0f".repeat(32)));
+        assert_eq!(normalize_fingerprint("0f"), None);
+    }
+
     fn no_schema() -> PluginRules<'static> {
         PluginRules {
             launch_args_schema: None,
@@ -343,13 +559,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cfg.runtime.when_full(), Some(WhenFull::DropOldest));
-        assert!(cfg.validate(&no_schema()).is_empty());
+        assert!(cfg.validate(&no_schema(), &SceneDefaults::default()).is_empty());
         assert_eq!(
             NodeConfig::parse(&Value::Null).unwrap(),
             NodeConfig::default()
         );
     }
 
+    #[cfg(feature = "remote")] // creates remote nodes
     #[test]
     fn remote_id_rules_and_the_instance_id() {
         let remote = |extra: serde_json::Value| {
@@ -361,7 +578,7 @@ mod tests {
             NodeConfig::parse(&config).unwrap()
         };
         let cfg = remote(json!({"remote_id": "plant-7:sensor_gw.1"}));
-        assert!(cfg.validate(&no_schema()).is_empty());
+        assert!(cfg.validate(&no_schema(), &SceneDefaults::default()).is_empty());
         assert_eq!(cfg.instance_id("node-1"), "plant-7:sensor_gw.1");
         assert_eq!(
             remote(json!({})).instance_id("node-1"),
@@ -374,22 +591,22 @@ mod tests {
             "ünïcode",
             &"x".repeat(MAX_REMOTE_ID_LEN + 1),
         ] {
-            let errors = remote(json!({"remote_id": bad})).validate(&no_schema());
+            let errors = remote(json!({"remote_id": bad})).validate(&no_schema(), &SceneDefaults::default());
             assert!(
                 errors[0].contains("config.remote_id must be"),
                 "{bad:?}: {errors:?}"
             );
         }
         let local = NodeConfig::parse(&json!({"remote_id": "x"})).unwrap();
-        assert!(local.validate(&no_schema())[0].contains("only for remote nodes"));
+        assert!(local.validate(&no_schema(), &SceneDefaults::default())[0].contains("only for remote nodes"));
         assert_eq!(local.instance_id("node-1"), "node-1");
 
         // An import accepts a remote node without its token; enabling doesn't.
         let tokenless = NodeConfig::parse(&json!({"launch": "remote"})).unwrap();
         assert!(tokenless.validate_own().is_empty());
         assert_eq!(
-            tokenless.validate(&no_schema()),
-            ["config.token is required for remote nodes"]
+            tokenless.validate(&no_schema(), &SceneDefaults::default()),
+            ["config.token is required for remote nodes with token auth"]
         );
     }
 
@@ -416,7 +633,7 @@ mod tests {
             "queue": {"max_event_bytes": 10, "max_bytes": 5, "spill": {"refill_watermark": 1.5, "write_batch": 0}}
         }}))
         .unwrap();
-        let errors = cfg.validate(&no_schema());
+        let errors = cfg.validate(&no_schema(), &SceneDefaults::default());
         for fragment in [
             "runtime.init_timeout_ms must be at least 1",
             "reconnect_timeout_ms must be longer",
@@ -432,17 +649,18 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote")] // creates remote nodes
     #[test]
     fn launch_mode_rules() {
         let local_with_token = NodeConfig::parse(&json!({"token": "x".repeat(20)})).unwrap();
-        assert!(local_with_token.validate(&no_schema())[0].contains("only for remote nodes"));
+        assert!(local_with_token.validate(&no_schema(), &SceneDefaults::default())[0].contains("only for remote nodes"));
 
         let remote = |extra: Value| {
             let mut cfg = json!({"launch": "remote"});
             cfg.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            NodeConfig::parse(&cfg).unwrap().validate(&no_schema())
+            NodeConfig::parse(&cfg).unwrap().validate(&no_schema(), &SceneDefaults::default())
         };
         assert!(remote(json!({}))[0].contains("token is required"));
         assert!(remote(json!({"token": "short"}))[0].contains("at least 16"));
@@ -463,9 +681,9 @@ mod tests {
             launch_args_style: LaunchArgsStyle::Flags,
         };
         let ok = NodeConfig::parse(&json!({"launch_args": {"t": 1}})).unwrap();
-        assert!(ok.validate(&rules).is_empty());
+        assert!(ok.validate(&rules, &SceneDefaults::default()).is_empty());
         let bad = NodeConfig::parse(&json!({"launch_args": {"t": "x", "port": 1}})).unwrap();
-        let errors = bad.validate(&rules);
+        let errors = bad.validate(&rules, &SceneDefaults::default());
         assert!(
             errors.iter().all(|e| e.starts_with("config.launch_args")),
             "{errors:?}"

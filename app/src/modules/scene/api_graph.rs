@@ -398,6 +398,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "remote")] // creates remote nodes
     #[tokio::test]
     async fn graph_over_http() {
         let f = fixture().await;

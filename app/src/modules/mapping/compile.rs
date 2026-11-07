@@ -4,8 +4,8 @@
 use super::path::Path;
 use super::value::{self, Value, convertible};
 use super::{MappingMode, MappingSpec};
-use flwrs_plugin::schema::common::EventMetadata;
-use flwrs_plugin::schema::schema::{PluginPayload, SchemaDefinition};
+use flwrs_plugin::schema::protocol::EventMetadata;
+use flwrs_plugin::schema::payload::{PluginPayload, SchemaDefinition};
 use std::sync::Arc;
 
 /// A compiled mapping: dot-notation rules, plus Lua rules,
@@ -125,7 +125,7 @@ enum Rule {
     #[cfg_attr(not(feature = "mapping-lua"), allow(dead_code))]
     Lua {
         target: Path,
-        target_def: Option<flwrs_plugin::schema::schema::FieldDefinition>,
+        target_def: Option<flwrs_plugin::schema::payload::FieldDefinition>,
         chunk: LuaChunkRef,
     },
 }
@@ -255,7 +255,7 @@ impl LuaParts {
         _chunk: &LuaChunkRef,
         _input: &Value,
         _meta: Option<&EventMetadata>,
-        _def: Option<&flwrs_plugin::schema::schema::FieldDefinition>,
+        _def: Option<&flwrs_plugin::schema::payload::FieldDefinition>,
     ) -> Result<Value, String> {
         Err("no Lua support".into())
     }
@@ -364,7 +364,7 @@ impl LuaParts {
         chunk: &LuaChunkRef,
         input: &Value,
         meta: Option<&EventMetadata>,
-        def: Option<&flwrs_plugin::schema::schema::FieldDefinition>,
+        def: Option<&flwrs_plugin::schema::payload::FieldDefinition>,
     ) -> Result<Value, String> {
         let result = self.runtime().call(chunk, input, meta)?;
         super::lua::from_lua(result, def)
@@ -375,7 +375,7 @@ impl LuaParts {
 mod tests {
     use super::*;
     use flwrs_plugin::schema::rules::parse_json;
-    use flwrs_plugin::schema::schema::{Field, FieldValue, field_value::Value as Pb};
+    use flwrs_plugin::schema::payload::{Field, FieldValue, field_value::Value as Pb};
     use serde_json::json;
 
     fn spec(json: serde_json::Value) -> MappingSpec {
@@ -417,7 +417,7 @@ mod tests {
 
     fn input() -> PluginPayload {
         let reading = |v: f64| FieldValue {
-            value: Some(Pb::Object(flwrs_plugin::schema::schema::MapValue {
+            value: Some(Pb::Object(flwrs_plugin::schema::payload::MapValue {
                 value: [(
                     "value".to_string(),
                     FieldValue {
@@ -433,7 +433,7 @@ mod tests {
                 field("count", Pb::I32(3)),
                 field(
                     "readings",
-                    Pb::Array(flwrs_plugin::schema::schema::ArrayValue {
+                    Pb::Array(flwrs_plugin::schema::payload::ArrayValue {
                         value: vec![reading(1.5), reading(2.5)],
                     }),
                 ),

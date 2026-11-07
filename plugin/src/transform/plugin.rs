@@ -1,13 +1,13 @@
-use crate::plugin::core::InitializeRequest;
+use crate::plugin::core::{InboundEvent, InitializeRequest};
 use crate::plugin::error::{InitializeError, ShutdownError, TransformError};
-use crate::schema::common::log_level::Enum as LogLevel;
-use crate::schema::transform::TransformEvent;
+use crate::schema::payload::PluginPayload;
+use crate::schema::protocol::log_level::Enum as LogLevel;
 use crate::transform::local_sink::LocalSink;
 
-/// A plugin that turns each incoming event into an outgoing event.
+/// A plugin that turns incoming events into outgoing ones.
 pub trait Transform {
-    /// Called once after connecting to the hub. Returns the plugin's identity
-    /// and its input and output schemas.
+    /// Called once before connecting to the hub. Returns the plugin's
+    /// identity and its input and output schemas.
     fn initialize(
         &mut self,
         plugin_id: String,
@@ -19,7 +19,13 @@ pub trait Transform {
 
     fn version(&self) -> String;
 
-    /// Processes one event. The returned event is sent back to the hub;
-    /// errors are reported to the hub and the transform keeps running.
-    fn process_event(&mut self, event: TransformEvent) -> Result<TransformEvent, TransformError>;
+    /// Processes one event and returns its outputs: none (to filter it out),
+    /// one, or several. The runner sends them to the hub tied to this input,
+    /// so they continue its trace, then acknowledges the input.
+    ///
+    /// An error is logged and the input is rejected: the hub delivers it
+    /// again later if the error is [`TransformError::retryable`], and gives
+    /// up on it otherwise. The transform keeps running either way.
+    fn process_event(&mut self, event: InboundEvent)
+    -> Result<Vec<PluginPayload>, TransformError>;
 }

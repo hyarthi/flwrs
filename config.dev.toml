@@ -29,6 +29,15 @@ allow_upload = true
 host = "127.0.0.1"
 port = 7400
 
+# A TLS listener for remote plugins (token or client-certificate auth).
+# Uncomment and point at a certificate to try it; keep the files in .data/.
+# [hub.tls]
+# host = "127.0.0.1"
+# port = 7401
+# cert = ".data/tls/hub.pem"
+# key = ".data/tls/hub.key"
+# client_ca = ".data/tls/clients-ca.pem"
+
 # The director runs the enabled scenes; spill-to-disk files go here.
 [director]
 spool_dir = ".data/scenes"

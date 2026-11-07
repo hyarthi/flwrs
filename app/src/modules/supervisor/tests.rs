@@ -5,15 +5,22 @@
 use super::node::{NodeHandle, NodeOutput, NodeState, NodeStatus, supervise};
 use super::spec::{Backoff, Launch, LocalLaunch, NodeSpec, Timings};
 use crate::modules::hub::{Hub, HubConfig};
+#[cfg_attr(not(feature = "remote"), allow(unused_imports))]
 use crate::modules::node_config::{NodeConfig, RuntimeConfig};
 use crate::modules::plugin::manifest::PluginType;
-use flwrs_plugin::plugin::frame::{read_frame, write_message};
-use flwrs_plugin::schema::common::{Exit, exit_code};
-use flwrs_plugin::schema::schema::{
+use flwrs_plugin::plugin::frame::{
+    PROTOCOL_VERSION, read_frame, write_frame, write_message,
+};
+use flwrs_plugin::schema::protocol::{
+    Event, Exit, FrameHeader, Initialize, exit_code, msg_code::Enum as MsgCode,
+    plugin_type::Enum as PbPluginType,
+};
+use flwrs_plugin::schema::payload::{
     Field, FieldDefinition, FieldValue, PluginPayload, SchemaDefinition, field_type,
     field_value::Value,
 };
-use flwrs_plugin::schema::{sink, source};
+use prost::Message;
+#[cfg_attr(not(feature = "remote"), allow(unused_imports))]
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -135,6 +142,10 @@ impl Env {
                 &RuntimeConfig::default(),
                 &RuntimeConfig::default(),
             ),
+            delivery: super::spec::DeliverySpec::resolve(
+                &RuntimeConfig::default(),
+                &RuntimeConfig::default(),
+            ),
             max_event_bytes: None,
         }
     }
@@ -206,7 +217,7 @@ async fn run_sdk_sink(id: &str, host: &str, port: u16) {
         fn initialize(
             &mut self,
             id: String,
-            _: flwrs_plugin::schema::common::log_level::Enum,
+            _: flwrs_plugin::schema::protocol::log_level::Enum,
         ) -> Result<InitializeRequest, flwrs_plugin::plugin::error::InitializeError> {
             Ok(InitializeRequest::new()
                 .with_id(id)
@@ -225,20 +236,20 @@ async fn run_sdk_sink(id: &str, host: &str, port: u16) {
         fn version(&self) -> String {
             "1.0.0".into()
         }
-        fn consume_event(
-            &mut self,
-            _: sink::SinkEvent,
+        async fn consume_event(
+            &self,
+            _: flwrs_plugin::plugin::core::InboundEvent,
         ) -> Result<(), flwrs_plugin::plugin::error::SinkError> {
             Ok(())
         }
     }
     let mut runner = SinkRunner::initialize(
         Noop,
-        SinkRunnerConfig {
-            plugin_id: id.into(),
-            log_level: flwrs_plugin::schema::common::log_level::Enum::Info,
-            hub_connection: ConnectionConfig::new(host, port),
-        },
+        SinkRunnerConfig::new(
+            id.into(),
+            flwrs_plugin::schema::protocol::log_level::Enum::Info,
+            ConnectionConfig::new(host, port),
+        ),
     )
     .await
     .unwrap();
@@ -255,46 +266,27 @@ async fn run_raw(mode: &str, id: &str, addr: &str, token: &str) {
         "1.0.0"
     };
     let is_source = mode == "source-emit";
-    if is_source {
-        let init = source::SourceMessage {
-            payload: Some(source::source_message::Payload::Initialize(
-                source::Initialize {
-                    plugin_id: id.into(),
-                    plugin_version: version.into(),
-                    schema: Some(text_schema()),
-                    token: token.into(),
-                },
-            )),
-        };
-        write_message(&mut stream, &init).await.unwrap();
+    let (plugin_type, in_schema, out_schema) = if is_source {
+        (PbPluginType::Source, None, Some(text_schema()))
     } else {
-        let init = sink::SinkMessage {
-            payload: Some(sink::sink_message::Payload::Initialize(sink::Initialize {
-                plugin_id: id.into(),
-                plugin_version: version.into(),
-                schema: Some(text_schema()),
-                token: token.into(),
-            })),
-        };
-        write_message(&mut stream, &init).await.unwrap();
-    }
+        (PbPluginType::Sink, Some(text_schema()), None)
+    };
+    let init = Initialize {
+        instance_id: id.into(),
+        plugin_version: version.into(),
+        plugin_type: plugin_type as i32,
+        token: token.into(),
+        in_schema,
+        out_schema,
+        min_protocol_version: PROTOCOL_VERSION,
+        max_protocol_version: PROTOCOL_VERSION,
+        capabilities: vec![],
+        max_unacked: 0,
+    };
+    write_message(&mut stream, &init).await.unwrap();
     // Accept, or Shutdown if rejected (then just exit).
     let reply = read_frame(&mut stream).await.unwrap().unwrap();
-    let accepted = if is_source {
-        matches!(
-            reply
-                .decode::<source::RuntimeSourceMessage>()
-                .unwrap()
-                .payload,
-            Some(source::runtime_source_message::Payload::Initialize(_))
-        )
-    } else {
-        matches!(
-            reply.decode::<sink::RuntimeSinkMessage>().unwrap().payload,
-            Some(sink::runtime_sink_message::Payload::Initialize(_))
-        )
-    };
-    if !accepted {
+    if reply.code() != MsgCode::InitializeResponse {
         return;
     }
 
@@ -304,11 +296,9 @@ async fn run_raw(mode: &str, id: &str, addr: &str, token: &str) {
             std::process::exit(1);
         }
         "exit-msg" => {
-            let exit = sink::SinkMessage {
-                payload: Some(sink::sink_message::Payload::Exit(Exit {
-                    code: exit_code::Enum::Error as i32,
-                    message: "giving up".into(),
-                })),
+            let exit = Exit {
+                code: exit_code::Enum::Error as i32,
+                message: "giving up".into(),
             };
             write_message(&mut stream, &exit).await.unwrap();
             // ...but never actually exits: the supervisor must kill it.
@@ -335,25 +325,24 @@ async fn run_raw(mode: &str, id: &str, addr: &str, token: &str) {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
         "source-emit" => {
-            for text in ["a", "b", "c"] {
-                let event = source::SourceMessage {
-                    payload: Some(source::source_message::Payload::Event(
-                        source::SourceEvent {
-                            plugin_id: id.into(),
-                            plugin_version: version.into(),
-                            payload: Some(PluginPayload {
-                                fields: vec![Field {
-                                    key: "text".into(),
-                                    value: Some(FieldValue {
-                                        value: Some(Value::String(text.into())),
-                                    }),
-                                }],
-                            }),
-                            metadata: None,
-                        },
-                    )),
+            for (seq, text) in ["a", "b", "c"].into_iter().enumerate() {
+                let header = FrameHeader {
+                    code: MsgCode::Event as i32,
+                    seq: seq as u64 + 1,
+                    ..Default::default()
                 };
-                write_message(&mut stream, &event).await.unwrap();
+                let body = Event {
+                    payload: Some(PluginPayload {
+                        fields: vec![Field {
+                            key: "text".into(),
+                            value: Some(FieldValue {
+                                value: Some(Value::String(text.into())),
+                            }),
+                        }],
+                    }),
+                }
+                .encode_to_vec();
+                write_frame(&mut stream, &header, &body).await.unwrap();
             }
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
@@ -501,12 +490,8 @@ async fn sdk_plugin_stops_on_shutdown_without_signals() {
     // The handle's sender reaches the plugin.
     handle
         .sender()
-        .send(crate::modules::hub::wire::RuntimeMsg::Event(
-            crate::modules::hub::wire::DataEvent {
-                instance_id: "node".into(),
-                plugin_version: "1.0.0".into(),
-                ..Default::default()
-            },
+        .send_event(&crate::modules::hub::wire::DataEvent::from_payload(
+            PluginPayload::default(),
         ))
         .await
         .unwrap();
@@ -599,8 +584,11 @@ async fn data_events_are_forwarded_with_the_node_id() {
             .unwrap()
             .unwrap();
         assert_eq!(&*output.node_id, "node");
-        assert!(output.size > 0);
-        let field = &output.event.payload.unwrap().fields[0];
+        let super::node::Output::Event { size, event, .. } = output.item else {
+            panic!("expected an event, got {:?}", output.item);
+        };
+        assert!(size > 0);
+        let field = &event.payload().unwrap().fields[0];
         if let Some(Value::String(s)) = field.value.as_ref().and_then(|v| v.value.clone()) {
             texts.push(s);
         }
@@ -614,19 +602,21 @@ async fn remote_node_waits_runs_and_reports_disconnects() {
     let env = Env::new().await;
     let mut spec = env.spec(PluginType::Sink, PathBuf::new(), timings());
     spec.launch = Launch::Remote {
-        token: "remote-token-0123456789".into(),
+        auth: crate::modules::hub::NodeAuth::local("remote-token-0123456789".into()),
     };
     let (handle, _out) = env.start(spec);
     assert_eq!(handle.status().state, NodeState::Waiting);
 
     let mut stream = TcpStream::connect(env.hub.local_addr()).await.unwrap();
-    let init = sink::SinkMessage {
-        payload: Some(sink::sink_message::Payload::Initialize(sink::Initialize {
-            plugin_id: "node".into(),
-            plugin_version: "1.0.0".into(),
-            schema: Some(text_schema()),
-            token: "remote-token-0123456789".into(),
-        })),
+    let init = Initialize {
+        instance_id: "node".into(),
+        plugin_version: "1.0.0".into(),
+        plugin_type: PbPluginType::Sink as i32,
+        token: "remote-token-0123456789".into(),
+        in_schema: Some(text_schema()),
+        min_protocol_version: PROTOCOL_VERSION,
+        max_protocol_version: PROTOCOL_VERSION,
+        ..Default::default()
     };
     write_message(&mut stream, &init).await.unwrap();
     wait_state(&handle, NodeState::Running).await;
@@ -673,6 +663,7 @@ fn timings_precedence_node_then_manifest_then_builtin() {
     );
 }
 
+#[cfg(feature = "remote")] // creates remote nodes
 #[tokio::test]
 async fn spec_from_an_installed_plugin() {
     let f = crate::modules::plugin::service::tests::fixture(|_| {}).await;
@@ -682,7 +673,20 @@ async fn spec_from_an_installed_plugin() {
         .await
         .unwrap();
     let hub: std::net::SocketAddr = "0.0.0.0:7400".parse().unwrap();
-    let spec = NodeSpec::resolve("s", "n", &NodeConfig::default(), &plugin, hub, "debug").unwrap();
+    let defaults = crate::modules::node_config::SceneDefaults::default();
+    let spec = NodeSpec::resolve(
+        "s",
+        "n",
+        &NodeConfig::default(),
+        &plugin,
+        &super::spec::Surroundings {
+            hub_addr: hub,
+            tls_available: false,
+            log_level: "debug",
+            scene_defaults: &defaults,
+        },
+    )
+    .unwrap();
     let Launch::Local(local) = &spec.launch else {
         panic!("expected a local launch");
     };
@@ -712,12 +716,19 @@ async fn spec_from_an_installed_plugin() {
         )
         .unwrap(),
         &plugin,
-        hub,
-        "debug",
+        &super::spec::Surroundings {
+            hub_addr: hub,
+            tls_available: false,
+            log_level: "debug",
+            scene_defaults: &defaults,
+        },
     )
     .unwrap();
     assert!(
-        matches!(remote.launch, Launch::Remote { token } if token == "remote-token-0123456789")
+        matches!(
+            remote.launch,
+            Launch::Remote { auth: crate::modules::hub::NodeAuth::Token { ref token, .. } } if token == "remote-token-0123456789"
+        )
     );
 
     let errors = NodeSpec::resolve(
@@ -728,8 +739,12 @@ async fn spec_from_an_installed_plugin() {
         )
         .unwrap(),
         &plugin,
-        hub,
-        "debug",
+        &super::spec::Surroundings {
+            hub_addr: hub,
+            tls_available: false,
+            log_level: "debug",
+            scene_defaults: &defaults,
+        },
     )
     .unwrap_err();
     assert_eq!(errors.len(), 2, "{errors:?}");

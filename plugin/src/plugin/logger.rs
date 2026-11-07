@@ -1,9 +1,6 @@
 use crate::plugin::msg_client::{HubClient, Stage};
-use crate::schema::common::{
-    LogEvent, log_level::Enum as LogLevel, plugin_type::Enum as PluginType,
-};
-use crate::schema::schema::{Field, FieldValue, field_value::Value};
-use crate::schema::{sink, source, transform};
+use crate::schema::payload::{Field, FieldValue, field_value::Value};
+use crate::schema::protocol::{LogEvent, log_level::Enum as LogLevel};
 use log::{Level, Metadata, Record, SetLoggerError};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -26,7 +23,6 @@ static LOG_WRAPPER: LogWrapper = LogWrapper;
 /// `Initialize`), and are delivered after the reconnect.
 pub(crate) struct PluginLogger {
     plugin_id: String,
-    plugin_type: PluginType,
     level: Level,
     shared: Arc<Shared>,
 }
@@ -58,20 +54,19 @@ impl LogQueue {
     }
 
     /// The next record, preceded by a WARN about dropped records if any.
-    fn pop(&mut self, template: &LogEvent) -> Vec<LogEvent> {
+    fn pop(&mut self) -> Vec<LogEvent> {
         let Some(event) = self.events.pop_front() else {
             return vec![];
         };
         let mut out = vec![];
         if self.dropped > 0 {
             out.push(LogEvent {
-                log_level: LogLevel::Warn as i32,
+                level: LogLevel::Warn as i32,
                 message: format!(
                     "{} log records were dropped because the log queue was full",
                     self.dropped
                 ),
                 details: vec![],
-                ..template.clone()
             });
             self.dropped = 0;
         }
@@ -91,7 +86,6 @@ impl PluginLogger {
     /// set fails.
     pub(crate) fn initialize(
         id: &str,
-        plugin_type: PluginType,
         log_level: Level,
         client: Arc<HubClient>,
     ) -> Result<(), SetLoggerError> {
@@ -108,15 +102,9 @@ impl PluginLogger {
             idle: Notify::new(),
             closed: CancellationToken::new(),
         });
-        let template = LogEvent {
-            plugin_id: id.to_string(),
-            plugin_type: plugin_type as i32,
-            ..Default::default()
-        };
-        tokio::spawn(forward_logs(shared.clone(), client, plugin_type, template));
+        tokio::spawn(forward_logs(shared.clone(), client));
         *installed = Some(PluginLogger {
             plugin_id: id.to_string(),
-            plugin_type,
             level: log_level,
             shared,
         });
@@ -140,9 +128,7 @@ impl PluginLogger {
         let _ = record.key_values().visit(&mut details);
         let log_level: LogLevel = record.level().into();
         let event = LogEvent {
-            plugin_id: self.plugin_id.clone(),
-            plugin_type: self.plugin_type as i32,
-            log_level: log_level as i32,
+            level: log_level as i32,
             message,
             details: details.0,
         };
@@ -190,16 +176,11 @@ pub(crate) fn close() {
     shared.closed.cancel();
     let mut queue = lock(&shared.queue);
     for event in queue.events.drain(..) {
-        eprintln!("[{}] {}", event.plugin_id, event.message);
+        eprintln!("{}", event.message);
     }
 }
 
-async fn forward_logs(
-    shared: Arc<Shared>,
-    client: Arc<HubClient>,
-    plugin_type: PluginType,
-    template: LogEvent,
-) {
+async fn forward_logs(shared: Arc<Shared>, client: Arc<HubClient>) {
     loop {
         // Logs may only be sent once `Initialize` is on the wire.
         tokio::select! {
@@ -208,7 +189,7 @@ async fn forward_logs(
         }
         let batch = {
             let mut queue = lock(&shared.queue);
-            let batch = queue.pop(&template);
+            let batch = queue.pop();
             queue.sending = !batch.is_empty();
             batch
         };
@@ -220,7 +201,7 @@ async fn forward_logs(
             }
         }
         for event in batch {
-            if let Err(e) = send_log(&client, plugin_type, event.clone()).await {
+            if let Err(e) = client.send(&event, Stage::Initializing).await {
                 // Can't use `log` here: that would loop back into this logger.
                 eprintln!(
                     "Failed to send log message to hub: {e}; message: {}",
@@ -229,33 +210,6 @@ async fn forward_logs(
             }
         }
         lock(&shared.queue).sending = false;
-    }
-}
-
-async fn send_log(
-    client: &HubClient,
-    plugin_type: PluginType,
-    event: LogEvent,
-) -> std::io::Result<()> {
-    match plugin_type {
-        PluginType::Source => {
-            let msg = source::SourceMessage {
-                payload: Some(source::source_message::Payload::Log(event)),
-            };
-            client.send(&msg, Stage::Initializing).await
-        }
-        PluginType::Transform => {
-            let msg = transform::TransformMessage {
-                payload: Some(transform::transform_message::Payload::Log(event)),
-            };
-            client.send(&msg, Stage::Initializing).await
-        }
-        PluginType::Sink | PluginType::Undefined => {
-            let msg = sink::SinkMessage {
-                payload: Some(sink::sink_message::Payload::Log(event)),
-            };
-            client.send(&msg, Stage::Initializing).await
-        }
     }
 }
 
@@ -346,19 +300,18 @@ mod tests {
         for i in 0..5 {
             queue.push(event(&i.to_string()), 3);
         }
-        let template = event("");
-        let first = queue.pop(&template);
+        let first = queue.pop();
         assert_eq!(first.len(), 2);
-        assert_eq!(first[0].log_level, LogLevel::Warn as i32);
+        assert_eq!(first[0].level, LogLevel::Warn as i32);
         assert!(first[0].message.starts_with("2 log records were dropped"));
         assert_eq!(first[1].message, "2");
-        let rest: Vec<String> = [queue.pop(&template), queue.pop(&template)]
+        let rest: Vec<String> = [queue.pop(), queue.pop()]
             .concat()
             .into_iter()
             .map(|e| e.message)
             .collect();
         assert_eq!(rest, ["3", "4"]);
-        assert!(queue.pop(&template).is_empty());
+        assert!(queue.pop().is_empty());
         assert!(queue.is_idle());
     }
 }

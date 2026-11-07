@@ -3,10 +3,10 @@ use crate::schema::{BODY_KEY, HEADERS_KEY, METHOD_KEY, URL_KEY};
 use bytes::Bytes;
 use flwrs_plugin::plugin::core::InitializeRequest;
 use flwrs_plugin::plugin::error::{InitializeError, ShutdownError, SinkError};
-use flwrs_plugin::schema::common::log_level::Enum as LogLevel;
-use flwrs_plugin::schema::schema::field_value::Value;
-use flwrs_plugin::schema::schema::{Field, PluginPayload};
-use flwrs_plugin::schema::sink::SinkEvent;
+use flwrs_plugin::schema::protocol::log_level::Enum as LogLevel;
+use flwrs_plugin::schema::payload::field_value::Value;
+use flwrs_plugin::plugin::core::InboundEvent;
+use flwrs_plugin::schema::payload::{Field, PluginPayload};
 use flwrs_plugin::sink::plugin::Sink;
 use reqwest::{Client, ClientBuilder, Method, RequestBuilder};
 use std::collections::HashMap;
@@ -85,37 +85,37 @@ impl Sink for Plugin {
         VERSION.to_string()
     }
 
-    fn consume_event(&mut self, event: SinkEvent) -> Result<(), SinkError> {
-        if event.plugin_id != self.id {
-            return Err(SinkError::new("Wrong plugin ID"));
-        }
-        if event.plugin_version != VERSION {
-            return Err(SinkError::new("Wrong plugin version"));
-        }
-        let payload = event.payload.ok_or_else(|| SinkError::new("No payload"))?;
-
-        log::trace!("Received event: {:?}", payload);
+    /// Sends the request and waits for the response: the event is
+    /// acknowledged once the server answered with a success status. A
+    /// failure is rejected, and retried when it may go away (see [`classify`]).
+    async fn consume_event(&self, event: InboundEvent) -> Result<(), SinkError> {
+        let payload = event.payload;
+        log::trace!("Received event (attempt {}): {:?}", event.attempt, payload);
         let request = self.build_request(payload)?;
-
-        tokio::task::spawn(send_request(request));
-
+        let response = request.send().await.map_err(classify)?;
+        response.error_for_status().map_err(classify)?;
+        log::trace!("Request sent successfully");
         Ok(())
     }
 }
 
-async fn send_request(request: RequestBuilder) {
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(e) => {
-            log::error!("Error sending request: {}", e);
-            return;
+/// Whether a failed request is worth retrying: network errors, timeouts,
+/// 408, 429 and 5xx are; an invalid request or another 4xx isn't.
+fn classify(err: reqwest::Error) -> SinkError {
+    let retry = match err.status() {
+        Some(status) => {
+            status.is_server_error()
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::REQUEST_TIMEOUT
         }
+        None => !err.is_builder(),
     };
-
-    match response.error_for_status() {
-        Ok(_) => log::trace!("Request sent successfully"),
-        Err(e) => log::error!("Error sending request: {}", e),
-    };
+    let message = format!("HTTP request failed: {err}");
+    if retry {
+        SinkError::retryable(message)
+    } else {
+        SinkError::new(message)
+    }
 }
 
 struct ParsedPayload {
@@ -258,7 +258,7 @@ impl ParsedPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flwrs_plugin::schema::schema::{ArrayValue, FieldValue, MapValue};
+    use flwrs_plugin::schema::payload::{ArrayValue, FieldValue, MapValue};
 
     fn field(key: &str, value: Value) -> Field {
         Field {

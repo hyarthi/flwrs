@@ -22,6 +22,7 @@ crate-type = ["cdylib", "rlib"]
 log.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+futures-util.workspace = true # FuturesUnordered: a sink's concurrent events
 bytes.workspace = true
 thiserror.workspace = true
 prost.workspace = true
@@ -30,6 +31,17 @@ pbjson.workspace = true
 pbjson-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+
+[features]
+default = ["tls"]
+# Connecting to the hub's TLS listener (remote plugins), with an optional
+# client certificate (mTLS). Plugins that only ever run locally can leave it out.
+tls = ["dep:rustls", "dep:tokio-rustls"]
+
+[dev-dependencies]
+rcgen.workspace = true # test certificates
 
 [build-dependencies]
 prost-build.workspace = true

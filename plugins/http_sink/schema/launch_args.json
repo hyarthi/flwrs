@@ -26,6 +26,13 @@
       "description": "Log HTTP connection details.",
       "type": "boolean",
       "default": false
+    },
+    "max_concurrent_requests": {
+      "description": "How many requests may be in flight at once. Each event is acknowledged after its response.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1024,
+      "default": 16
     }
   }
 }

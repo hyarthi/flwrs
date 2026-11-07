@@ -22,6 +22,46 @@ pub(crate) struct HubConfig {
     /// Largest `Initialize` frame accepted from a connection that hasn't been
     /// authenticated yet.
     pub max_handshake_bytes: usize,
+    /// The hub pings every connection this often (announced in
+    /// `InitializeResponse`); a connection silent for three intervals while
+    /// the hub is reading is closed. `0` = no heartbeats.
+    pub heartbeat_interval_ms: u32,
+    /// Credit window for producers with `CREDITS`: events they may have sent
+    /// that the hub hasn't finished routing.
+    pub credit_window: u32,
+    /// Upper bound for a consumer's `max_unacked`.
+    pub max_unacked: u32,
+    /// The window for a consumer that sends `max_unacked = 0`.
+    pub default_max_unacked: u32,
+    /// `[hub.tls]`: a second listener, with TLS, for remote plugins (feature
+    /// `remote`). Local plugins keep using the plain one.
+    pub tls: Option<HubTlsConfig>,
+}
+
+/// `[hub.tls]`: the TLS listener for remote plugins.
+#[derive(Deserialize, Clone, Debug)]
+#[cfg_attr(
+    not(feature = "remote"),
+    allow(dead_code, reason = "read by the TLS listener (feature remote)")
+)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HubTlsConfig {
+    /// Address to listen on (default `0.0.0.0`: remote plugins need to reach it).
+    #[serde(default = "any_host")]
+    pub host: String,
+    /// `0` picks a free port (tests); remote plugins need a fixed one.
+    pub port: u16,
+    /// The hub's certificate chain and private key (PEM files).
+    pub cert: std::path::PathBuf,
+    pub key: std::path::PathBuf,
+    /// CA certificate(s) (PEM) that client certificates of `mtls` nodes
+    /// chain to. Without it, `mtls` nodes need a pinned fingerprint.
+    #[serde(default)]
+    pub client_ca: Option<std::path::PathBuf>,
+}
+
+fn any_host() -> String {
+    "0.0.0.0".into()
 }
 
 impl Default for HubConfig {
@@ -33,6 +73,11 @@ impl Default for HubConfig {
             max_inflight_bytes: 512 * 1024 * 1024,
             handshake_timeout_ms: 10_000,
             max_handshake_bytes: 1024 * 1024,
+            heartbeat_interval_ms: 10_000,
+            credit_window: 64,
+            max_unacked: 1024,
+            default_max_unacked: 64,
+            tls: None,
         }
     }
 }

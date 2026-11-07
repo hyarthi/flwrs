@@ -1,3 +1,4 @@
+use crate::modules::node_config::SceneDefaults;
 use crate::modules::scene::service::{EdgeRow, ListFilters, NodeRow, Scene};
 use chrono::Local;
 use sqlx::{Sqlite, SqliteConnection};
@@ -16,13 +17,15 @@ pub(super) async fn create_scene(
     id: &str,
     name: &str,
     max_hops: Option<u32>,
+    defaults: &SceneDefaults,
 ) -> Result<Scene, sqlx::Error> {
     sqlx::query_as::<Sqlite, Scene>(
-        "INSERT INTO scenes (id, name, max_hops) VALUES ($1, $2, $3) RETURNING *",
+        "INSERT INTO scenes (id, name, max_hops, defaults) VALUES ($1, $2, $3, $4) RETURNING *",
     )
     .bind(id)
     .bind(name)
     .bind(max_hops)
+    .bind(sqlx::types::Json(defaults))
     .fetch_one(conn)
     .await
 }
@@ -32,12 +35,14 @@ pub(super) async fn update_scene(
     id: &str,
     name: &str,
     max_hops: Option<u32>,
+    defaults: &SceneDefaults,
 ) -> Result<Scene, sqlx::Error> {
     sqlx::query_as::<Sqlite, Scene>(
-        "UPDATE scenes SET name = $1, max_hops = $2, update_time = $3 WHERE id = $4 RETURNING *",
+        "UPDATE scenes SET name = $1, max_hops = $2, defaults = $3, update_time = $4 WHERE id = $5 RETURNING *",
     )
     .bind(name)
     .bind(max_hops)
+    .bind(sqlx::types::Json(defaults))
     .bind(Local::now())
     .bind(id)
     .fetch_one(conn)

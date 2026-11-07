@@ -93,6 +93,13 @@ pub(crate) enum DirectorCommand {
         scene_id: String,
         reply: oneshot::Sender<Option<SceneStatus>>,
     },
+    /// Drop the queued events of a scene's nodes (or of one node): in its
+    /// queues if it runs, else in its spool files. Replies with how many.
+    Purge {
+        scene_id: String,
+        node_id: Option<String>,
+        reply: oneshot::Sender<u64>,
+    },
     Overview {
         reply: oneshot::Sender<Overview>,
     },
@@ -153,6 +160,24 @@ impl DirectorHandle {
         self.tx
             .send(DirectorCommand::Status {
                 scene_id: scene_id.to_string(),
+                reply,
+            })
+            .await
+            .map_err(|_| DirectorError::Unavailable)?;
+        wait.await.map_err(|_| DirectorError::Unavailable)
+    }
+
+    /// Drops the queued events of `scene_id`'s nodes, or of `node_id` only.
+    pub(crate) async fn purge(
+        &self,
+        scene_id: &str,
+        node_id: Option<&str>,
+    ) -> Result<u64, DirectorError> {
+        let (reply, wait) = oneshot::channel();
+        self.tx
+            .send(DirectorCommand::Purge {
+                scene_id: scene_id.to_string(),
+                node_id: node_id.map(str::to_string),
                 reply,
             })
             .await

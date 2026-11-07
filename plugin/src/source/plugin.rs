@@ -1,6 +1,6 @@
 use crate::plugin::core::InitializeRequest;
 use crate::plugin::error::{InitializeError, ShutdownError, SourceError};
-use crate::schema::common::log_level::Enum as LogLevel;
+use crate::schema::protocol::log_level::Enum as LogLevel;
 use crate::source::local_sink::LocalSink;
 
 /// A plugin that produces events, e.g. a trigger, a poller or a listener.

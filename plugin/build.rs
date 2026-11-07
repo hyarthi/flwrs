@@ -19,11 +19,8 @@ fn main() {
         .extern_path(".google.protobuf", "::pbjson_types")
         .compile_protos(
             &[
-                Path::new("./schema/schema.proto"),
-                Path::new("./schema/common.proto"),
-                Path::new("./schema/sink.proto"),
-                Path::new("./schema/source.proto"),
-                Path::new("./schema/transform.proto"),
+                Path::new("./schema/payload.proto"),
+                Path::new("./schema/protocol.proto"),
             ],
             &[Path::new("."), well_known_includes.as_path()],
         )
@@ -34,6 +31,6 @@ fn main() {
     pbjson_build::Builder::new()
         .register_descriptors(&descriptors)
         .expect("invalid descriptor set")
-        .build(&[".schema"])
+        .build(&[".flwrs"])
         .expect("pbjson build failed");
 }

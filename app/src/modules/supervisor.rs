@@ -8,5 +8,5 @@ mod spec;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use node::{NodeHandle, NodeOutput, NodeState, NodeStatus, supervise};
-pub(crate) use spec::{Launch, NodeSpec, SpillSpec, server_log_level};
+pub(crate) use node::{NodeHandle, NodeOutput, NodeState, NodeStatus, Output, supervise};
+pub(crate) use spec::{DeliverySpec, Launch, NodeSpec, SpillSpec, Surroundings, server_log_level};
