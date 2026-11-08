@@ -19,7 +19,7 @@ repository = "https://github.com/hyarthi/flwrs"
 # internal crates
 flwrs-core = { path = "core" }
 # Without default features: crates opt into the SDK's TLS client (feature `tls`).
-flwrs-plugin = { path = "plugin", default-features = false }
+flwrs-plugin = { path = "plugin", version = "0.0.3", default-features = false }
 
 # async runtime
 tokio = { version = "1.54.1", features = ["full"] }

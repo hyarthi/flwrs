@@ -1,12 +1,16 @@
 [package]
 name = "flwrs-trellis"
-description = "Checks that a flwrs plugin (in any language) follows the plugin protocol."
-version.workspace = true
+description = "Developer toolkit for flwrs plugins: checks that a plugin (in any language) follows the plugin protocol"
+readme = "README.md"
+homepage = "https://github.com/hyarthi/flwrs"
+documentation = "https://docs.rs/flwrs-trellis"
+keywords = ["flwrs", "plugin", "conformance", "testing", "protocol"]
+categories = ["development-tools::testing", "command-line-utilities"]
+version = "0.0.1" # published on its own, like flwrs-plugin
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [lints]
 workspace = true
