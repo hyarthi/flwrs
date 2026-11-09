@@ -37,6 +37,61 @@ pub const MAX_NESTING_DEPTH: usize = 32;
 /// `packet_len` counts the version byte and `header_len` too.
 const FIXED_LEN: usize = 1 + 4;
 
+/// Numbers one direction's `EVENT` frames on one connection: 1, 2, 3, …
+/// The last usable seq is `u64::MAX`. After it the numbers are used up: a
+/// sender closes the connection and reconnects (numbering starts at 1 again),
+/// and a receiver treats any further event as a protocol violation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqCounter {
+    /// `None`: used up.
+    next: Option<u64>,
+}
+
+impl Default for SeqCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SeqCounter {
+    /// A new connection's counter: the first seq is 1.
+    pub fn new() -> Self {
+        Self { next: Some(1) }
+    }
+
+    /// The seq of the next event to send, or `None` if they're used up (the
+    /// sender must reconnect). Call [`SeqCounter::advance`] once it's sent.
+    pub fn peek(&self) -> Option<u64> {
+        self.next
+    }
+
+    /// The event numbered [`SeqCounter::peek`] was sent.
+    pub fn advance(&mut self) {
+        self.next = self.next.and_then(|seq| seq.checked_add(1));
+    }
+
+    /// Receiver: checks that an incoming event's `seq` is the expected one,
+    /// and moves on to the next.
+    pub fn accept(&mut self, seq: u64) -> Result<(), String> {
+        match self.next {
+            Some(expected) if seq == expected => {
+                self.advance();
+                Ok(())
+            }
+            Some(expected) => Err(format!("event seq {seq}, expected {expected}")),
+            None => Err(format!(
+                "event seq {seq} after the last one ({}): the sender should have reconnected",
+                u64::MAX
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn starting_at(first: u64) -> Self {
+        Self { next: Some(first) }
+    }
+}
+
 /// One frame: its header and the undecoded body.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
@@ -250,6 +305,29 @@ fn invalid_data(msg: impl Into<String>) -> io::Error {
 mod tests {
     use super::*;
     use crate::schema::protocol::EventMetadata;
+
+    #[test]
+    fn seq_counter_numbers_from_one_and_runs_out_after_the_last() {
+        let mut send = SeqCounter::new();
+        let mut receive = SeqCounter::new();
+        for expected in 1..=3 {
+            let seq = send.peek().unwrap();
+            assert_eq!(seq, expected);
+            send.advance();
+            receive.accept(seq).unwrap();
+        }
+        assert!(receive.accept(5).unwrap_err().contains("expected 4"));
+
+        // The last seq is u64::MAX; after it, nothing more on this connection.
+        let mut send = SeqCounter::starting_at(u64::MAX);
+        let mut receive = SeqCounter::starting_at(u64::MAX);
+        assert_eq!(send.peek(), Some(u64::MAX));
+        send.advance();
+        assert_eq!(send.peek(), None, "used up: reconnect");
+        receive.accept(u64::MAX).unwrap();
+        assert!(receive.accept(0).unwrap_err().contains("should have reconnected"));
+        assert!(receive.accept(1).is_err(), "no wrap-around");
+    }
 
     /// Builds a raw frame with an arbitrary version byte and header bytes.
     fn raw_frame(version: u8, header: &[u8], body: &[u8]) -> Vec<u8> {

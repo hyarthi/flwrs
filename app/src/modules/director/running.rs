@@ -259,6 +259,7 @@ impl Plan {
                         max_bytes: spec.queue.max_bytes,
                         when_full: spec.queue.when_full.unwrap_or(default_policy),
                         block_timeout: spec.queue.block_timeout,
+                        max_evictions: spec.queue.max_evictions,
                     }
                 });
                 let durable = spec
@@ -723,7 +724,9 @@ impl RunningScene {
         log::info!("[{}] scene stopped", self.scene_id);
     }
 
-    /// Drops the queued events of every node (or of `node_id`).
+    /// Starts the queues of every node (or of `node_id`) over: queued events
+    /// and those in flight with the plugin are dropped, and spool files are
+    /// replaced by fresh ones (see `NodeQueue::purge`).
     pub(crate) async fn purge(&self, node_id: Option<&str>) -> u64 {
         let mut purged = 0;
         for node in &self.nodes {

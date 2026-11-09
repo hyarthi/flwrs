@@ -225,6 +225,8 @@ An `EVENT` frame carries an `Event { payload }` body. Its routing information is
 
 Every `EVENT` frame has a `seq` in its header: the sender numbers its own events on each connection 1, 2, 3, … in the order it sends them, with no gaps. The two directions are numbered independently. `ACK`, `NACK` and `input_seq` refer to events by `seq`, and a receiver MUST treat a `seq` that isn't the previous one plus 1 as a protocol violation. Numbering starts at 1 again on every new connection.
 
+`seq` never wraps around. The last usable value is 2⁶⁴ − 1 (the largest `uint64`). A sender that has used it MUST NOT send another `EVENT` on that connection: it closes the connection instead. The plugin then reconnects as after any other disconnect ([section 6.5](#65-reconnecting)), whichever side closed, and numbering starts at 1 again. Events that weren't acknowledged are handled as for any lost connection ([section 9.3](#93-redelivery)). A receiver MUST treat an `EVENT` after the one numbered 2⁶⁴ − 1 as a protocol violation. In practice no connection gets there (at a million events per second it takes over 500 000 years), but numbers that wrap to 0 would be ambiguous: `input_seq = 0` means "no input", and acks name events by `seq`.
+
 ### 7.2 Metadata
 
 The hub owns each event's `EventMetadata`, and puts it in the header of every event it delivers:

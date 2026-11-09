@@ -99,6 +99,8 @@ pub(crate) struct QueueSpec {
     /// `None`: the director decides (`block`, or `drop_newest` on a cycle).
     pub when_full: Option<WhenFull>,
     pub block_timeout: Duration,
+    /// `drop_oldest`: the most events one push may evict; `None` = no limit.
+    pub max_evictions: Option<usize>,
     /// `runtime.queue.spill.enabled`; `None` = the director's `spill_default`.
     pub spill_enabled: Option<bool>,
     /// Limits that apply when spill is on.
@@ -175,6 +177,10 @@ impl QueueSpec {
                     .or(d.and_then(|q| q.block_timeout_ms))
                     .unwrap_or(DEFAULT_BLOCK_TIMEOUT_MS),
             ),
+            max_evictions: n
+                .and_then(|q| q.max_evictions)
+                .or(d.and_then(|q| q.max_evictions))
+                .map(to_usize),
             spill_enabled: spill_field(n, d, |s| s.enabled),
             durable: n.and_then(|q| q.durable).or(d.and_then(|q| q.durable)),
             spill: SpillSpec {

@@ -44,7 +44,7 @@ pub(super) async fn run(queue: Arc<NodeQueue>) {
         }
         let purge = queue.state().purge_disk.take();
         if let Some(done) = purge {
-            let n = purge_disk(&queue, &spill, store.as_ref()).await;
+            let n = purge_disk(&queue, &spill, store.take()).await;
             let _ = done.send(n);
         }
         let refilled = refill(&queue, &spill, &mut store).await;
@@ -194,10 +194,12 @@ fn move_pending(
 fn push_memory(spill: &SpillSettings, state: &mut super::State, event: DataEvent, size: usize) {
     spill.shared.memory.add(size as u64);
     state.bytes += size;
+    let epoch = state.epoch;
     state.items.push_back(Queued {
         event,
         size,
         row: None,
+        epoch,
         _hold: Hold::Soft(SoftShare {
             gauge: spill.shared.memory.clone(),
             bytes: size as u64,
@@ -275,42 +277,44 @@ async fn flush(
             None => Err(sqlx::Error::PoolClosed),
         };
         progressed = true;
-        let mut state = queue.state();
-        state.disk_blocked = false;
-        state.writing = 0;
-        state.writing_bytes = 0;
-        match written {
-            Ok(()) => {
-                state.disk_len += batch.len() as u64;
-                state.disk_bytes += bytes as u64;
-                let c = &queue.counters;
-                c.spilled.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                c.disk_bytes_written
-                    .fetch_add(bytes as u64, Ordering::Relaxed);
-                drop(state);
-                // The pending list has room again: wake blocked producers.
-                queue.popped.notify_waiters();
-            }
-            Err(err) => {
-                log::error!(
-                    "Spool {}: couldn't write {} events, dropped: {err}",
-                    spill.file.display(),
-                    batch.len()
-                );
-                spill.shared.disk.sub(bytes as u64);
-                queue
-                    .counters
-                    .dropped_disk_error
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
-                drop(state);
-                queue.popped.notify_waiters(); // room appeared
+        {
+            let mut state = queue.state();
+            state.disk_blocked = false;
+            state.writing = 0;
+            state.writing_bytes = 0;
+            match written {
+                Ok(()) => {
+                    state.disk_len += batch.len() as u64;
+                    state.disk_bytes += bytes as u64;
+                    let c = &queue.counters;
+                    c.spilled.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    c.disk_bytes_written
+                        .fetch_add(bytes as u64, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    log::error!(
+                        "Spool {}: couldn't write {} events, dropped: {err}",
+                        spill.file.display(),
+                        batch.len()
+                    );
+                    spill.shared.disk.sub(bytes as u64);
+                    queue
+                        .counters
+                        .dropped_disk_error
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                }
             }
         }
+        // Either way the pending list has room again (and on an error, the
+        // disk too): wake blocked producers.
+        queue.popped.notify_waiters();
     }
 }
 
-/// Empties the spool file (a purge). Returns how many events were on disk.
-async fn purge_disk(queue: &NodeQueue, spill: &SpillSettings, store: Option<&Store>) -> u64 {
+/// A purge: deletes the spool file whatever state it's in (WAL and
+/// shared-memory files too); the next spill starts a fresh one. Returns how
+/// many events were on disk.
+async fn purge_disk(queue: &NodeQueue, spill: &SpillSettings, store: Option<Store>) -> u64 {
     let (n, bytes) = {
         let mut state = queue.state();
         let n = (state.disk_len, state.disk_bytes);
@@ -323,9 +327,10 @@ async fn purge_disk(queue: &NodeQueue, spill: &SpillSettings, store: Option<&Sto
     };
     spill.shared.disk.sub(bytes);
     if let Some(store) = store {
-        let _ = sqlx::query("DELETE FROM events").execute(&store.pool).await;
-        store.vacuum().await;
+        store.pool.close().await;
     }
+    // Even if it was never opened (or couldn't be): nothing else uses it.
+    delete_files(&spill.file).await;
     queue.popped.notify_waiters();
     n
 }
@@ -509,6 +514,7 @@ mod tests {
         disk_bytes: u64,
         write_batch: usize,
         when_full: WhenFull,
+        max_evictions: Option<usize>,
     }
 
     impl Default for Limits {
@@ -520,6 +526,7 @@ mod tests {
                 disk_bytes: 1 << 20,
                 write_batch: 3,
                 when_full: WhenFull::Block,
+                max_evictions: None,
             }
         }
     }
@@ -531,6 +538,7 @@ mod tests {
                 max_bytes: 0,
                 when_full: limits.when_full,
                 block_timeout: Duration::from_millis(200),
+                max_evictions: limits.max_evictions,
             },
             Budget::new(1 << 30), // the hub-wide hard limit decides "too large"
             Some(SpillSettings {
@@ -692,6 +700,107 @@ mod tests {
             }
             q.finish(true).await;
         }
+    }
+
+    /// Four 10-byte events in memory, two on disk: full, `drop_oldest`.
+    async fn full_spill_queue(
+        shared: &SpillShared,
+        node: &str,
+        max: Option<usize>,
+    ) -> Arc<NodeQueue> {
+        let q = queue(
+            shared,
+            node,
+            Limits {
+                memory_events: 4,
+                disk_events: 2,
+                disk_bytes: 20,
+                when_full: WhenFull::DropOldest,
+                max_evictions: max,
+                ..Limits::default()
+            },
+        );
+        for n in 0..6 {
+            assert_eq!(q.push(event(n), SIZE).await, Pushed::Queued);
+        }
+        q
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_oldest_evicts_enough_memory_for_a_large_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path(), 1 << 30, 0);
+        // 25 bytes over a full disk need 25 bytes freed: three events.
+        for max in [None, Some(3)] {
+            let q = full_spill_queue(&shared, &format!("{max:?}"), max).await;
+            assert_eq!(q.push(event(9), 25).await, Pushed::Queued, "{max:?}");
+            assert_eq!(q.stats().evicted, 3);
+            for n in ["3", "4", "5", "9"] {
+                assert_eq!(pop(&q).await, n);
+            }
+            q.finish(true).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_oldest_refuses_without_evicting_over_the_limit_or_the_hub_wide_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path(), 1 << 30, 0);
+        let q = full_spill_queue(&shared, "limit", Some(2)).await;
+        assert_eq!(
+            q.push(event(9), 25).await,
+            Pushed::Dropped(DropReason::Full)
+        );
+        let stats = q.stats();
+        assert_eq!((stats.evicted, stats.dropped_full), (0, 1));
+        q.finish(true).await;
+
+        // Evicting frees memory, not disk: with no hub-wide disk room for
+        // the event, nothing is evicted.
+        let shared = SpillShared::new(dir.path().join("hub"), true, 1 << 30, 40, 0);
+        let q = full_spill_queue(&shared, "hub", None).await;
+        assert_eq!(
+            q.push(event(9), 25).await,
+            Pushed::Dropped(DropReason::Full)
+        );
+        assert_eq!(q.stats().evicted, 0);
+        for n in 0..6 {
+            assert_eq!(pop(&q).await, n.to_string());
+        }
+        q.finish(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purge_deletes_the_file_and_the_next_spill_starts_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path(), 1 << 30, 0);
+        let q = queue(
+            &shared,
+            "n",
+            Limits {
+                memory_events: 1,
+                ..Limits::default()
+            },
+        );
+        let file = shared.scene_dir("scene").join("n.db");
+        for n in 0..4 {
+            q.push(event(n), SIZE).await;
+        }
+        wait_until(&q, "a disk write", |s| s.spilled > 0).await;
+        assert!(file.exists());
+        assert_eq!(q.purge().await, 4);
+        assert!(!file.exists(), "deleted, not emptied");
+        assert_eq!(shared.disk.used(), 0);
+        // Spilling again starts a fresh file, in order.
+        for n in 5..8 {
+            q.push(event(n), SIZE).await;
+        }
+        wait_until(&q, "a disk write", |s| s.disk_len > 0 && s.spilled > 3).await;
+        assert!(file.exists());
+        for n in 5..8 {
+            assert_eq!(pop(&q).await, n.to_string());
+        }
+        q.finish(true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

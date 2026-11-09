@@ -18,7 +18,7 @@ use super::wire::{self, DataEvent, InitInfo, Negotiated};
 use crate::modules::plugin::manifest::PluginType;
 use crate::modules::rate_limit::RateLimit;
 use flwrs_plugin::plugin::frame::{
-    Frame, LimitedFrame, PROTOCOL_VERSION, WireMessage, encode_frame, encode_message,
+    Frame, LimitedFrame, PROTOCOL_VERSION, SeqCounter, WireMessage, encode_frame, encode_message,
     read_frame_limited,
 };
 use flwrs_plugin::schema::payload::{Field, SchemaDefinition, field_value::Value};
@@ -224,7 +224,7 @@ struct ConnShared {
     plugin_type: PluginType,
     /// Next seq of an event the hub sends; held while the frame is queued, so
     /// frames go out in seq order.
-    next_seq: tokio::sync::Mutex<u64>,
+    seqs: tokio::sync::Mutex<SeqCounter>,
     /// Transforms: metadata of the inputs the hub sent.
     memory: Option<Mutex<InputMemory>>,
     /// Producers with CREDITS.
@@ -491,8 +491,15 @@ impl LinkSender {
         if conn.shared.plugin_type == PluginType::Source {
             return Err(HubError::Invalid("a source doesn't receive events".into()));
         }
-        let mut next_seq = conn.shared.next_seq.lock().await;
-        let seq = *next_seq;
+        let mut seqs = conn.shared.seqs.lock().await;
+        let Some(seq) = seqs.peek() else {
+            // Used every seq this connection has: close it. The plugin
+            // reconnects (numbering starts at 1 again), and the event is
+            // delivered on the new connection.
+            log::warn!("Hub: used up the event seqs of a connection; closing it");
+            conn.close.cancel();
+            return Err(HubError::NotConnected);
+        };
         let header = FrameHeader {
             code: MsgCode::Event as i32,
             seq,
@@ -508,7 +515,7 @@ impl LinkSender {
             .send(frame)
             .await
             .map_err(|_| HubError::NotConnected)?;
-        *next_seq += 1;
+        seqs.advance();
         Ok((conn.id, seq))
     }
 
@@ -728,7 +735,7 @@ fn authenticate(
         negotiated,
         shared: Arc::new(ConnShared {
             plugin_type,
-            next_seq: tokio::sync::Mutex::new(1),
+            seqs: tokio::sync::Mutex::new(SeqCounter::new()),
             memory: (plugin_type == PluginType::Transform)
                 .then(|| Mutex::new(InputMemory::default())),
             credit,
@@ -1008,7 +1015,7 @@ async fn serve_connection(
         plugin_type: expected.plugin_type,
         conn: conn.clone(),
         events: events.clone(),
-        next_seq: 1,
+        seqs: SeqCounter::new(),
         exited: false,
         max_event_bytes,
     };
@@ -1077,8 +1084,8 @@ struct Running {
     plugin_type: PluginType,
     conn: ConnHandle,
     events: mpsc::Sender<HubEvent>,
-    /// The seq the plugin's next event must have.
-    next_seq: u64,
+    /// Checks the seq of each event from the plugin.
+    seqs: SeqCounter,
     /// After Exit, the plugin closing the connection is expected.
     exited: bool,
     max_event_bytes: usize,
@@ -1204,13 +1211,7 @@ impl Running {
 
     /// Checks an EVENT frame's seq and credit. Returns its seq.
     fn data_frame(&mut self, header: &FrameHeader) -> Result<u64, String> {
-        if header.seq != self.next_seq {
-            return Err(format!(
-                "event seq {}, expected {}",
-                header.seq, self.next_seq
-            ));
-        }
-        self.next_seq += 1;
+        self.seqs.accept(header.seq)?;
         if let Some(credit) = &self.conn.shared.credit {
             let received = credit.received.fetch_add(1, Ordering::AcqRel) + 1;
             if received > credit.granted.load(Ordering::Acquire) {

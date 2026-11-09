@@ -54,7 +54,7 @@ pub(crate) struct PurgeResponse {
     path = "/by-id/{id}/spool",
     operation_id = "scene-purge-spool",
     summary = "Drop every event queued for the scene's nodes",
-    description = "Empties the inbound queues of all the scene's nodes: memory and spool files. For a disabled scene, that's the events its durable queues kept for when it runs again. Events already handed to a plugin and not acknowledged yet aren't affected.",
+    description = "Starts the inbound queues of all the scene's nodes over, for when they're corrupted, filling the disk or not keeping up: every queued event goes, including those already handed to a plugin and not acknowledged yet (they aren't delivered again), and spool files are deleted (a running scene's queues start fresh ones). For a disabled scene, that's the events its durable queues kept for when it runs again. Also how a durable queue whose file couldn't be opened gets going again.",
     params(("id" = String, Path, description = "Scene ID")),
     responses(
         (status = 200, description = "Purged", body = PurgeResponse),

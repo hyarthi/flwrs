@@ -151,6 +151,11 @@ pub(crate) struct QueueConfig {
     pub when_full: Option<WhenFull>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub block_timeout_ms: Option<u64>,
+    /// `drop_oldest` only: the most queued events one incoming event may
+    /// evict. If fitting it would take more, nothing is evicted and the
+    /// incoming event is dropped instead. `None` = no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_evictions: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spill: Option<SpillConfig>,
     /// Keep queued events on disk until the plugin acknowledges them, across
@@ -255,6 +260,7 @@ impl RuntimeConfig {
             positive("queue.max_bytes", queue.max_bytes);
             positive("queue.max_event_bytes", queue.max_event_bytes);
             positive("queue.block_timeout_ms", queue.block_timeout_ms);
+            positive("queue.max_evictions", queue.max_evictions);
             if let Some(spill) = &queue.spill {
                 positive("queue.spill.memory_max_events", spill.memory_max_events);
                 positive("queue.spill.memory_max_bytes", spill.memory_max_bytes);
@@ -550,7 +556,7 @@ mod tests {
                 "restart_backoff": {"multiplier": 2.0, "max_delay_ms": 300000, "reset_after_ms": 300000},
                 "kill_grace_ms": 2000, "max_restarts": null, "shutdown_grace_ms": 10000,
                 "queue": {"capacity": 1024, "max_bytes": 67108864, "max_event_bytes": 16777216,
-                          "when_full": "drop_oldest", "block_timeout_ms": 30000,
+                          "when_full": "drop_oldest", "block_timeout_ms": 30000, "max_evictions": 16,
                           "spill": {"enabled": true, "memory_max_events": 256, "memory_max_bytes": 8388608,
                                     "disk_max_events": 1000000, "disk_max_bytes": 1073741824,
                                     "refill_watermark": 0.25, "write_batch": 256}}
@@ -630,7 +636,7 @@ mod tests {
         let cfg = NodeConfig::parse(&json!({"runtime": {
             "init_timeout_ms": 0, "reconnect_timeout_ms": 30000,
             "restart_backoff": {"multiplier": 1.0},
-            "queue": {"max_event_bytes": 10, "max_bytes": 5, "spill": {"refill_watermark": 1.5, "write_batch": 0}}
+            "queue": {"max_event_bytes": 10, "max_bytes": 5, "max_evictions": 0, "spill": {"refill_watermark": 1.5, "write_batch": 0}}
         }}))
         .unwrap();
         let errors = cfg.validate(&no_schema(), &SceneDefaults::default());
@@ -641,6 +647,7 @@ mod tests {
             "max_event_bytes can't exceed",
             "refill_watermark must be between 0 and 1",
             "spill.write_batch must be at least 1",
+            "queue.max_evictions must be at least 1",
         ] {
             assert!(
                 errors.iter().any(|e| e.contains(fragment)),

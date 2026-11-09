@@ -142,7 +142,7 @@ A **scene** is a workflow: a directed graph whose **nodes** are plugin instances
 | `GET /api/scenes/by-id/{id}/export`, `POST /api/scenes/import` | Move a scene to another server as a `.flwr` file (see below). |
 | `GET /api/scenes/by-id/{id}/check` | Whether the scene can run here: `launchable`, `problems` (block enabling), `warnings`. |
 | `GET /api/scenes/by-id/{id}/status` | What the scene is doing right now (see *Status*, below). |
-| `DELETE /api/scenes/by-id/{id}/spool`, `…/nodes/by-id/{node_id}/spool` | Drop the events queued for the scene's nodes, or one node's (memory and spool files). For a disabled scene, that's what its durable queues kept. Returns `purged_events`. |
+| `DELETE /api/scenes/by-id/{id}/spool`, `…/nodes/by-id/{node_id}/spool` | Start the queues of the scene's nodes over, or one node's: the lever for corrupted, overflowing or lagging spool files. Every queued event goes, including those handed to a plugin and not acknowledged yet (they aren't delivered again), and spool files are deleted (running queues start fresh ones). For a disabled scene, that's what its durable queues kept. Also brings back a durable queue whose file couldn't be opened. Returns `purged_events`. |
 
 Invalid requests return **422** with every problem listed in `details`.
 
@@ -171,7 +171,7 @@ Invalid requests return **422** with every problem listed in `details`.
 - **`launch_args`:** checked against the plugin's launch-args schema and argument rules. Local nodes only.
 - **`runtime`:** timeouts, restarts, the event queue and redelivery (`delivery`: `max_attempts`, 5, and `retry_delay_ms`, 1 000). Unknown keys are rejected. A node on a cycle can't use `"when_full": "block"`, because blocking can deadlock there.
 
-**Event queues.** Every node that receives events has an inbound queue. By default it holds up to 1 024 events or 64 MiB in memory; when it's full, `when_full` decides: `block` (the default: the producer waits, up to `block_timeout_ms`), `drop_newest` or `drop_oldest`. All queues share a hub-wide budget (`[hub] max_inflight_bytes`, 512 MiB).
+**Event queues.** Every node that receives events has an inbound queue. By default it holds up to 1 024 events or 64 MiB in memory; when it's full, `when_full` decides: `block` (the default: the producer waits, up to `block_timeout_ms`), `drop_newest` (the incoming event is dropped) or `drop_oldest` (as many of the oldest queued events as needed are evicted to fit it). `max_evictions` caps how many one incoming event may evict: if fitting it would take more, nothing is evicted and the incoming event is dropped instead, so one unexpectedly large event can't empty the queue (no limit by default). All queues share a hub-wide budget (`[hub] max_inflight_bytes`, 512 MiB); when it's used up, a `drop_oldest` queue evicts its own oldest events to make room (within `max_evictions`), never another queue's.
 
 With **spill to disk** (`"queue": {"spill": {"enabled": true}}`, or `[director] spill_default = true`), a queue keeps up to `memory_max_events` / `memory_max_bytes` (256 / 8 MiB) in memory, and puts the rest in a per-node SQLite file under `[director] spool_dir`, up to `disk_max_events` / `disk_max_bytes` (1 000 000 / 1 GiB). The order is kept exactly. A spilling queue's file is deleted when its node or scene stops. A free-space guard (`spill_min_free_bytes`, 1 GiB) keeps a burst from filling the disk. Spill is for bursts: on SD cards and cheap flash, a permanently slow consumer wears the storage out.
 

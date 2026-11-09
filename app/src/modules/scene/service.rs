@@ -525,9 +525,11 @@ impl Service {
         Ok((scene, status))
     }
 
-    /// Drops the queued events of the scene's nodes, or of one node: in
-    /// their queues while the scene runs, else in its spool files (durable
-    /// queues of a disabled scene keep theirs). Returns how many went.
+    /// Starts the queues of the scene's nodes (or of one node) over: while the
+    /// scene runs, their queued and in-flight events go and their spool files
+    /// are replaced by fresh ones; otherwise its spool files are deleted
+    /// (durable queues of a disabled scene keep theirs until then). Returns
+    /// how many events went.
     pub(crate) async fn purge_spool(
         &self,
         scene_id: &str,

@@ -14,8 +14,14 @@
 //! durable queue started fresh adopts every file of its node (oldest first;
 //! the others are merged into it). WAL with `synchronous = FULL`: a commit
 //! survives power loss.
+//!
+//! A purge is the "start over" lever (corruption, a full disk, a file that
+//! keeps growing): it drops everything the queue holds, including the events
+//! in flight with the plugin, deletes the file whatever state it's in, and
+//! opens a fresh one. It's also how a queue whose file wouldn't open (it
+//! refuses every event meanwhile) gets going again.
 
-use super::{Hold, Queued, SoftShare, SpillShared};
+use super::{Counters, Evictions, Hold, Next, Queued, SoftShare, SpillShared, evict_oldest};
 use crate::modules::hub::wire::DataEvent;
 use crate::modules::node_config::WhenFull;
 use crate::modules::rate_limit::RateLimit;
@@ -28,7 +34,6 @@ use sqlx::sqlite::{
 use sqlx::{Row, SqlitePool};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,6 +89,9 @@ struct State {
     replay_until: i64,
     /// Rows to delete (acked, dead-lettered, evicted), with their sizes.
     deletes: Vec<(i64, usize)>,
+    /// Bumped by every purge (see `Queued`): events from an earlier epoch
+    /// were in a file that's gone.
+    epoch: u64,
     /// Tickets whose write failed.
     failed: HashSet<u64>,
     next_ticket: u64,
@@ -93,16 +101,8 @@ struct State {
     delete_on_close: bool,
     purge: Option<tokio::sync::oneshot::Sender<u64>>,
     disk_blocked: bool,
-}
-
-/// Totals since the queue started (read into the queue's stats).
-#[derive(Default)]
-pub(super) struct Counters {
-    pub spilled: AtomicU64,
-    pub refilled: AtomicU64,
-    pub disk_bytes_written: AtomicU64,
-    pub dropped_disk_error: AtomicU64,
-    pub evicted: AtomicU64,
+    /// Files this queue couldn't open (or create): a purge deletes them.
+    unopened: Vec<PathBuf>,
 }
 
 pub(super) struct DurableCore {
@@ -117,7 +117,8 @@ pub(super) struct DurableCore {
     /// The highest ticket whose write has finished (committed or failed).
     committed: watch::Sender<u64>,
     task: Mutex<Option<JoinHandle<()>>>,
-    pub(super) counters: Counters,
+    /// The owning `NodeQueue`'s counters.
+    counters: Arc<Counters>,
 }
 
 /// What a durable push did.
@@ -130,7 +131,7 @@ pub(super) enum Push {
 }
 
 impl DurableCore {
-    pub(super) fn new(settings: DurableSettings) -> Arc<Self> {
+    pub(super) fn new(settings: DurableSettings, counters: Arc<Counters>) -> Arc<Self> {
         Arc::new(Self {
             settings,
             state: Mutex::new(State {
@@ -142,7 +143,7 @@ impl DurableCore {
             work: Notify::new(),
             committed: watch::Sender::new(0),
             task: Mutex::new(None),
-            counters: Counters::default(),
+            counters,
         })
     }
 
@@ -174,12 +175,32 @@ impl DurableCore {
             && self.settings.shared.disk.used() + size as u64 <= self.settings.shared.disk.limit
     }
 
+    /// How many cached events `drop_oldest` must evict for one more of
+    /// `size` to fit this queue's disk limits and the hub-wide one. Rows
+    /// already waiting to be deleted (acked or evicted) count as gone, so
+    /// pushes right after an eviction don't evict again for the same room.
+    fn evictions_for(&self, state: &State, size: usize, max: Option<usize>) -> Option<Evictions> {
+        let spec = self.spec();
+        let disk = &self.settings.shared.disk;
+        let gone = state.deletes.len() as u64;
+        let gone_bytes: u64 = state.deletes.iter().map(|(_, size)| *size as u64).sum();
+        let events = state.rows + (state.writing + state.pending.len()) as u64;
+        let bytes = state.rows_bytes + (state.writing_bytes + state.pending_bytes) as u64;
+        let size = size as u64;
+        super::evictions_needed(&state.items, max, |n, freed| {
+            events < spec.disk_max_events + gone + n
+                && bytes + size <= spec.disk_max_bytes + gone_bytes + freed
+                && disk.used() + size <= disk.limit + gone_bytes + freed
+        })
+    }
+
     pub(super) async fn push(
         &self,
         event: DataEvent,
         size: usize,
         when_full: WhenFull,
         block_timeout: Duration,
+        max_evictions: Option<usize>,
     ) -> Push {
         let deadline = Instant::now() + block_timeout;
         let mut event = Some(event);
@@ -187,27 +208,37 @@ impl DurableCore {
             let room = self.room.notified();
             tokio::pin!(room);
             room.as_mut().enable();
-            {
+            // Decide under the lock (`None`: wait for room); act after releasing it.
+            let decided = 'locked: {
+                // Declared before the lock, so it's dropped after it.
+                let evicted: Vec<Queued>;
                 let mut state = self.state();
                 if state.closed {
-                    return Push::Closed;
+                    break 'locked Some(Push::Closed);
                 }
-                let mut fits = self.has_room(&state, size);
-                if !fits
+                let disk = &self.settings.shared.disk;
+                let mut reserved = self.has_room(&state, size) && disk.try_add(size as u64);
+                if !reserved
                     && when_full == WhenFull::DropOldest
-                    && let Some(old) = state.items.pop_front()
+                    && !state.disk_blocked
+                    && state.pending.len() < pending_cap(self.spec())
+                    && let Some(plan) = self.evictions_for(&state, size, max_evictions)
                 {
-                    // The oldest undelivered event is in memory: evict it.
-                    state.bytes -= old.size;
-                    if let Some(row) = old.row {
-                        state.deletes.push((row, old.size));
-                    }
-                    self.counters.evicted.fetch_add(1, Relaxed);
-                    fits = self.has_room(&state, size)
-                        || (!state.disk_blocked && state.pending.len() < pending_cap(self.spec()));
-                    self.work.notify_one();
+                    // The oldest undelivered events are in memory (each with
+                    // its row): evict them. Their rows, and their bytes in the
+                    // hub-wide gauge, go when the task deletes them; the plan
+                    // already counted them as gone, so take the bytes without
+                    // the limit check (the gauge is over its limit until then).
+                    evicted = evict_oldest(&mut state.items, plan, &self.counters.evicted);
+                    state.bytes -= plan.bytes as usize;
+                    let rows = evicted
+                        .iter()
+                        .map(|q| (q.row.expect("cached events have a row"), q.size));
+                    state.deletes.extend(rows);
+                    disk.add(size as u64);
+                    reserved = true;
                 }
-                if fits && self.settings.shared.disk.try_add(size as u64) {
+                if reserved {
                     let ticket = state.next_ticket;
                     state.next_ticket += 1;
                     state.pending_bytes += size;
@@ -216,13 +247,19 @@ impl DurableCore {
                         size,
                         ticket,
                     });
-                    drop(state);
-                    self.work.notify_one();
-                    return Push::Queued(ticket);
+                    break 'locked Some(Push::Queued(ticket));
                 }
                 if when_full != WhenFull::Block {
-                    return Push::Full;
+                    break 'locked Some(Push::Full);
                 }
+                None
+            };
+            if let Some(result) = decided {
+                if matches!(result, Push::Queued(_)) {
+                    // The task writes it (and deletes what was evicted).
+                    self.work.notify_one();
+                }
+                return result;
             }
             if tokio::time::timeout_at(deadline, room).await.is_err() {
                 return Push::Timeout;
@@ -254,25 +291,30 @@ impl DurableCore {
             let pushed = self.pushed.notified();
             tokio::pin!(pushed);
             pushed.as_mut().enable();
-            {
+            // Decide under the lock; act after releasing it.
+            let (next, wake_task) = {
                 let mut state = self.state();
                 if state.closed {
-                    return None;
-                }
-                if let Some(item) = state.items.pop_front() {
+                    (Next::Closed, false)
+                } else if let Some(item) = state.items.pop_front() {
                     state.bytes -= item.size;
+                    // Memory below the watermark: the task loads more.
                     let refill = self.needs_refill(&state);
-                    drop(state);
-                    if refill {
-                        self.work.notify_one();
-                    }
-                    return Some(item);
+                    (Next::Item(item), refill)
+                } else {
+                    // Empty: the task loads rows still on disk, if any.
+                    (Next::Wait, state.not_loaded > 0)
                 }
-                if state.not_loaded > 0 {
-                    self.work.notify_one();
-                }
+            };
+            // The lock is released, so the task doesn't wake up just to wait for it.
+            if wake_task {
+                self.work.notify_one();
             }
-            pushed.await;
+            match next {
+                Next::Closed => return None,
+                Next::Item(item) => return Some(item),
+                Next::Wait => pushed.await,
+            }
         }
     }
 
@@ -284,22 +326,30 @@ impl DurableCore {
     }
 
     pub(super) fn requeue(&self, item: Queued) {
-        let mut state = self.state();
-        if state.closed {
-            return;
+        {
+            let mut state = self.state();
+            if state.closed || item.epoch != state.epoch {
+                // Closed, or purged while it was in flight: it's not coming back.
+                return;
+            }
+            state.bytes += item.size;
+            state.items.push_front(item);
         }
-        state.bytes += item.size;
-        state.items.push_front(item);
-        drop(state);
         self.pushed.notify_waiters();
     }
 
     /// The event is done with (acked or dead-lettered): its row goes.
     pub(super) fn remove(&self, item: Queued) {
-        if let Some(row) = item.row {
-            self.state().deletes.push((row, item.size));
-            self.work.notify_one();
+        let Some(row) = item.row else { return };
+        {
+            let mut state = self.state();
+            if item.epoch != state.epoch {
+                // Its file was purged: nothing to delete.
+                return;
+            }
+            state.deletes.push((row, item.size));
         }
+        self.work.notify_one();
     }
 
     pub(super) fn stats(&self) -> DurableStats {
@@ -313,9 +363,8 @@ impl DurableCore {
         }
     }
 
-    /// Drops every queued event (memory and file); events handed to the
-    /// plugin and not acked yet stay until they're acked. Returns how many
-    /// were dropped.
+    /// Starts over (see the module docs): drops every event, in flight too,
+    /// and replaces the file with a fresh one. Returns how many were dropped.
     pub(super) async fn purge(&self) -> u64 {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.state().purge = Some(tx);
@@ -359,50 +408,69 @@ fn pending_cap(spec: &SpillSpec) -> usize {
 
 async fn run(core: Arc<DurableCore>) {
     let s = &core.settings;
-    let store = match Store::open(&s.dir, &s.node_id, s.adopt).await {
-        Ok(store) => store,
+    // A fresh start takes over the node's files (the oldest one is kept, the
+    // others are merged into it); otherwise a new file.
+    let existing = if s.adopt { node_files(&s.dir, &s.node_id) } else { vec![] };
+    let file = existing.first().cloned().unwrap_or_else(|| new_file(&core));
+    let merge = existing.get(1..).unwrap_or_default();
+    let mut store = match Store::open(&s.dir, &file, merge).await {
+        Ok(store) => {
+            {
+                let mut state = core.state();
+                state.rows = store.rows;
+                state.rows_bytes = store.rows_bytes;
+                state.not_loaded = store.rows;
+                state.replay_until = store.max_seq;
+                state.ready = true;
+            }
+            s.shared.disk.add(store.rows_bytes);
+            if store.rows > 0 {
+                log::info!(
+                    "Spool {}: replaying {} events kept for node {}",
+                    store.file.display(),
+                    store.rows,
+                    s.node_id
+                );
+            }
+            Some(store)
+        }
         Err(err) => {
             log::error!(
-                "Spool {}: couldn't open the durable queue of node {}: {err}",
-                s.dir.display(),
+                "Spool {}: couldn't open the durable queue of node {}: {err}; \
+                 every event is refused until the queue is purged",
+                file.display(),
                 s.node_id
             );
-            // Nothing can be stored: fail every write until the queue closes.
-            fail_forever(&core).await;
-            return;
+            // A purge deletes what it couldn't open, too.
+            let mut broken = existing;
+            if broken.is_empty() {
+                broken.push(file);
+            }
+            for f in &broken {
+                core.state().unopened.push(f.clone());
+            }
+            None
         }
     };
-    {
-        let mut state = core.state();
-        state.rows = store.rows;
-        state.rows_bytes = store.rows_bytes;
-        state.not_loaded = store.rows;
-        state.replay_until = store.max_seq;
-        state.ready = true;
-    }
-    s.shared.disk.add(store.rows_bytes);
-    if store.rows > 0 {
-        log::info!(
-            "Spool {}: replaying {} events kept for node {}",
-            store.file.display(),
-            store.rows,
-            s.node_id
-        );
-    }
     let guard_log = RateLimit::new(Duration::from_secs(60));
     loop {
         if core.state().closed {
             break;
         }
-        let mut progressed = false;
         let purge_requested = core.state().purge.take();
         if let Some(done) = purge_requested {
-            let n = purge(&core, &store).await;
-            let _ = done.send(n);
-            progressed = true;
+            store = purge(&core, store.take(), done).await;
+            continue;
         }
-        progressed |= delete(&core, &store).await;
-        progressed |= refill(&core, &store).await;
+        let Some(store) = store.as_ref() else {
+            // No file: refuse every write until a purge starts a fresh one.
+            refuse_pending(&core);
+            core.work.notified().await;
+            continue;
+        };
+        let mut progressed = false;
+        progressed |= delete(&core, store).await;
+        progressed |= refill(&core, store).await;
         let partial = {
             let state = core.state();
             !state.pending.is_empty()
@@ -412,7 +480,7 @@ async fn run(core: Arc<DurableCore>) {
         if partial {
             tokio::time::sleep(BATCH_WINDOW).await;
         }
-        progressed |= write(&core, &store, &guard_log).await;
+        progressed |= write(&core, store, &guard_log).await;
         if progressed {
             continue;
         }
@@ -423,43 +491,51 @@ async fn run(core: Arc<DurableCore>) {
         }
     }
     // Acks that came in until the end still count.
-    delete(&core, &store).await;
+    if let Some(store) = &store {
+        delete(&core, store).await;
+    }
     let (delete_file, rows_bytes, pending_bytes) = {
         let mut state = core.state();
         // Unwritten events are lost; their producers get no ack (at-least-once).
+        // Mark them failed before `committed` jumps to the end below, or a
+        // producer asking later would read "committed".
         let pending_bytes = state.pending_bytes;
-        state.pending.clear();
+        let pending: Vec<Pending> = state.pending.drain(..).collect();
+        for p in &pending {
+            state.failed.insert(p.ticket);
+        }
         state.pending_bytes = 0;
         (state.delete_on_close, state.rows_bytes, pending_bytes)
     };
     s.shared.disk.sub(rows_bytes + pending_bytes as u64);
     core.committed.send_replace(u64::MAX);
-    store.close(delete_file).await;
+    if let Some(store) = store {
+        store.close(delete_file).await;
+    }
 }
 
-async fn fail_forever(core: &DurableCore) {
-    loop {
-        {
-            let mut state = core.state();
-            let pending: Vec<Pending> = state.pending.drain(..).collect();
-            state.pending_bytes = 0;
-            for p in &pending {
-                state.failed.insert(p.ticket);
-                core.settings.shared.disk.sub(p.size as u64);
-            }
-            if let Some(last) = pending.last() {
-                core.committed.send_replace(last.ticket);
-            }
-            if let Some(done) = state.purge.take() {
-                let _ = done.send(0);
-            }
-            if state.closed {
-                return;
-            }
+/// A new spool file name for this node.
+fn new_file(core: &DurableCore) -> PathBuf {
+    let s = &core.settings;
+    s.dir.join(format!("{}.{}.db", s.node_id, ulid::Ulid::generate()))
+}
+
+/// Without a file: every event waiting to be written is refused (its
+/// producer is told it wasn't stored).
+fn refuse_pending(core: &DurableCore) {
+    {
+        let mut state = core.state();
+        let pending: Vec<Pending> = state.pending.drain(..).collect();
+        state.pending_bytes = 0;
+        for p in &pending {
+            state.failed.insert(p.ticket);
+            core.settings.shared.disk.sub(p.size as u64);
         }
-        core.room.notify_waiters();
-        core.work.notified().await;
+        if let Some(last) = pending.last() {
+            core.committed.send_replace(last.ticket);
+        }
     }
+    core.room.notify_waiters();
 }
 
 /// Writes pending events in batches (free space permitting).
@@ -562,10 +638,12 @@ fn push_memory(core: &DurableCore, state: &mut State, event: DataEvent, size: us
     gauge.add(size as u64);
     state.bytes += size;
     state.last_loaded = state.last_loaded.max(row);
+    let epoch = state.epoch;
     state.items.push_back(Queued {
         event,
         size,
         row: Some(row),
+        epoch,
         _hold: Hold::Soft(SoftShare {
             gauge,
             bytes: size as u64,
@@ -661,46 +739,81 @@ async fn delete(core: &DurableCore, store: &Store) -> bool {
 }
 
 /// Drops what's queued: memory, pending writes, and the rows not handed out.
-async fn purge(core: &DurableCore, store: &Store) -> u64 {
-    let (cached, pending, after) = {
+/// Starts over: everything the queue holds is dropped (cached, on disk only,
+/// waiting to be written, and in flight with the plugin), the file is
+/// deleted whatever state it's in, and a fresh one is opened. Answers `done`
+/// with how many events were dropped. `None` if no fresh file could be
+/// opened: then events are refused until the next purge.
+async fn purge(
+    core: &DurableCore,
+    old: Option<Store>,
+    done: tokio::sync::oneshot::Sender<u64>,
+) -> Option<Store> {
+    let s = &core.settings;
+    let (purged, held_bytes, unopened) = {
+        // Declared before the lock, so it's dropped after it: freeing the
+        // cached events gives back their share of the memory limit.
+        let _cached: VecDeque<Queued>;
         let mut state = core.state();
-        let cached: Vec<(i64, usize)> = state
-            .items
-            .drain(..)
-            .filter_map(|q| q.row.map(|r| (r, q.size)))
-            .collect();
-        state.bytes = 0;
         let pending: Vec<Pending> = state.pending.drain(..).collect();
-        state.pending_bytes = 0;
         for p in &pending {
             // Their producers are told the write failed.
             state.failed.insert(p.ticket);
         }
-        (cached, pending, state.last_loaded)
-    };
-    let pending_bytes: u64 = pending.iter().map(|p| p.size as u64).sum();
-    core.settings.shared.disk.sub(pending_bytes);
-    if let Some(last) = pending.last() {
-        core.committed.send_replace(last.ticket);
-    }
-    let cached_rows: Vec<i64> = cached.iter().map(|(r, _)| *r).collect();
-    let mut purged = (cached.len() + pending.len()) as u64;
-    let _ = store.delete(&cached_rows).await;
-    match store.delete_after(after).await {
-        Ok((n, bytes)) => {
-            purged += n;
-            let cached_bytes: u64 = cached.iter().map(|(_, s)| *s as u64).sum();
-            let mut state = core.state();
-            state.rows = state.rows.saturating_sub(n + cached.len() as u64);
-            state.rows_bytes = state.rows_bytes.saturating_sub(bytes + cached_bytes);
-            state.not_loaded = 0;
-            drop(state);
-            core.settings.shared.disk.sub(bytes + cached_bytes);
+        if let Some(last) = pending.last() {
+            core.committed.send_replace(last.ticket);
         }
-        Err(err) => log::error!("Spool {}: couldn't purge: {err}", core.settings.dir.display()),
+        // Every row counts: cached, on disk only, and in flight.
+        let purged = state.rows + pending.len() as u64;
+        let held_bytes = state.rows_bytes + state.pending_bytes as u64;
+        _cached = std::mem::take(&mut state.items);
+        state.bytes = 0;
+        state.pending_bytes = 0;
+        state.rows = 0;
+        state.rows_bytes = 0;
+        state.not_loaded = 0;
+        state.deletes.clear();
+        // The old file's rows are gone, in flight or not: a new epoch, so a
+        // late ack or requeue of one is ignored (the fresh file numbers its
+        // rows from 1 again).
+        state.epoch += 1;
+        state.last_loaded = 0;
+        state.replay_until = 0;
+        (purged, held_bytes, std::mem::take(&mut state.unopened))
+    };
+    s.shared.disk.sub(held_bytes);
+    // The old file goes whatever state it's in (WAL and shared-memory files too).
+    if let Some(old) = old {
+        old.close(true).await;
     }
+    for file in &unopened {
+        delete_files(file).await;
+    }
+    let file = new_file(core);
+    let fresh = match Store::open(&s.dir, &file, &[]).await {
+        Ok(store) => {
+            log::warn!(
+                "Spool {}: purged node {}'s queue ({purged} events dropped); started a fresh file",
+                file.display(),
+                s.node_id
+            );
+            Some(store)
+        }
+        Err(err) => {
+            log::error!(
+                "Spool {}: purged node {}'s queue, but couldn't start a fresh file: {err}; \
+                 every event is refused until the next purge",
+                file.display(),
+                s.node_id
+            );
+            core.state().unopened.push(file);
+            None
+        }
+    };
+    let _ = done.send(purged);
+    core.pushed.notify_waiters();
     core.room.notify_waiters();
-    purged
+    fresh
 }
 
 async fn available_space(dir: &Path) -> std::io::Result<u64> {
@@ -747,15 +860,12 @@ struct Store {
 }
 
 impl Store {
-    async fn open(dir: &Path, node_id: &str, adopt: bool) -> Result<Self, sqlx::Error> {
+    /// Opens (or creates) `file` and merges `merge` into it.
+    async fn open(dir: &Path, file: &Path, merge: &[PathBuf]) -> Result<Self, sqlx::Error> {
         tokio::fs::create_dir_all(dir)
             .await
             .map_err(sqlx::Error::Io)?;
-        let existing = if adopt { node_files(dir, node_id) } else { vec![] };
-        let file = match existing.first() {
-            Some(oldest) => oldest.clone(),
-            None => dir.join(format!("{node_id}.{}.db", ulid::Ulid::generate())),
-        };
+        let file = file.to_path_buf();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(
@@ -780,7 +890,7 @@ impl Store {
         .await?;
         // Newer files of the same node (e.g. a queue replaced by a reload
         // before a crash) are merged in after the oldest one's rows.
-        for other in existing.iter().skip(1) {
+        for other in merge {
             let merged = async {
                 let mut conn = pool.acquire().await?;
                 sqlx::query("ATTACH DATABASE $1 AS other")
@@ -899,24 +1009,6 @@ impl Store {
         tx.commit().await
     }
 
-    /// Deletes every row after `after`; returns how many, and their bytes.
-    async fn delete_after(&self, after: i64) -> Result<(u64, u64), sqlx::Error> {
-        let row = sqlx::query(
-            "SELECT count(*) AS n, coalesce(sum(size), 0) AS bytes FROM events WHERE seq > $1",
-        )
-        .bind(after)
-        .fetch_one(&self.pool)
-        .await?;
-        sqlx::query("DELETE FROM events WHERE seq > $1")
-            .bind(after)
-            .execute(&self.pool)
-            .await?;
-        Ok((
-            u64::try_from(row.get::<i64, _>("n")).unwrap_or(0),
-            u64::try_from(row.get::<i64, _>("bytes")).unwrap_or(0),
-        ))
-    }
-
     async fn vacuum(&self) {
         let _ = sqlx::query("PRAGMA incremental_vacuum")
             .execute(&self.pool)
@@ -992,6 +1084,7 @@ mod tests {
                 max_bytes: 0,
                 when_full: WhenFull::DropNewest,
                 block_timeout: Duration::from_millis(200),
+                max_evictions: None,
             },
             Budget::new(1 << 30),
             DurableSettings {
@@ -1079,7 +1172,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn requeued_events_come_back_first_and_purge_spares_what_is_in_flight() {
+    async fn requeued_events_come_back_first() {
         let dir = tempfile::tempdir().unwrap();
         let shared = shared(dir.path());
         let q = queue(&shared, 8, true);
@@ -1091,20 +1184,73 @@ mod tests {
         // A disconnect: both go back, in order.
         q.requeue(one);
         q.requeue(zero);
-        assert_eq!(pop(&q).await.event.label(), "0");
-        let one = pop(&q).await;
-        assert_eq!(one.event.label(), "1");
+        assert_eq!(labels(&q, 4).await, ["0", "1", "2", "3"]);
+        q.finish(true).await;
+    }
 
-        // "0" is lost in flight (never acked), "1" is in flight; the purge
-        // drops "2" and "3".
-        assert_eq!(q.purge().await, 2);
-        wait_rows(&q, 2).await;
-        q.delivered(one);
-        wait_rows(&q, 1).await;
-        q.finish(false).await;
-        // "0" was never acked: still there after a restart.
+    fn files(shared: &SpillShared) -> Vec<PathBuf> {
+        node_files(&shared.scene_dir("scene"), "node")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purge_starts_over_with_a_fresh_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
         let q = queue(&shared, 8, true);
-        assert_eq!(pop(&q).await.event.label(), "0");
+        for n in 0..4 {
+            push(&q, n).await;
+        }
+        let old_file = files(&shared);
+        assert_eq!(old_file.len(), 1);
+        // "0" and "1" are in flight with the plugin, "2" and "3" queued:
+        // all four go.
+        let zero = pop(&q).await;
+        let one = pop(&q).await;
+        assert_eq!(q.purge().await, 4);
+        assert_eq!((q.stats().len, q.stats().disk_len), (0, 0));
+        assert_eq!(shared.disk.used(), 0);
+        let new_file = files(&shared);
+        assert_eq!(new_file.len(), 1, "{new_file:?}");
+        assert_ne!(new_file, old_file, "a fresh file, the old one deleted");
+
+        // The fresh file numbers from 1 again; a late ack of a purged event
+        // (its row was 2) doesn't touch it, and a requeue doesn't bring one back.
+        push(&q, 9).await;
+        q.delivered(one);
+        q.requeue(zero);
+        wait_rows(&q, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(q.stats().disk_len, 1, "the new event's row is still there");
+        q.finish(false).await;
+
+        // After a restart, only what came after the purge is replayed.
+        let q = queue(&shared, 8, true);
+        let item = pop(&q).await;
+        assert_eq!(item.event.label(), "9");
+        q.delivered(item);
+        wait_rows(&q, 0).await;
+        q.finish(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purge_replaces_a_file_that_wont_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        let scene = shared.scene_dir("scene");
+        std::fs::create_dir_all(&scene).unwrap();
+        let broken = scene.join(format!("node.{}.db", ulid::Ulid::generate()));
+        std::fs::write(&broken, vec![0xAB; 8192]).unwrap(); // not a database
+        let q = queue(&shared, 8, true);
+        // Nothing can be stored meanwhile.
+        let (pushed, ticket) = q.push_tracked(event(0), SIZE).await;
+        assert_eq!(pushed, Pushed::Queued);
+        let stored = tokio::time::timeout(WAIT, q.committed(ticket.unwrap()));
+        assert!(!stored.await.expect("timed out"), "refused without a file");
+
+        q.purge().await;
+        assert!(!broken.exists(), "the broken file is gone");
+        push(&q, 1).await;
+        assert_eq!(labels(&q, 1).await, ["1"]);
         q.finish(true).await;
     }
 
@@ -1167,6 +1313,7 @@ mod tests {
                 max_bytes: 0,
                 when_full: WhenFull::DropNewest,
                 block_timeout: Duration::from_millis(100),
+                max_evictions: None,
             },
             Budget::new(1 << 30),
             DurableSettings {
@@ -1194,6 +1341,145 @@ mod tests {
         q.delivered(item);
         wait_rows(&q, 1).await;
         push(&q, 3).await;
+        q.finish(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_dropped_unwritten_at_finish_is_never_reported_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        // The free-space guard always trips, so the event stays unwritten.
+        let shared = SpillShared::new(dir.path().join("spool"), false, 1 << 30, 1 << 30, u64::MAX);
+        let q = queue(&shared, 8, true);
+        let (pushed, ticket) = q.push_tracked(event(0), SIZE).await;
+        assert_eq!(pushed, Pushed::Queued);
+        let deadline = std::time::Instant::now() + WAIT;
+        while !q.stats().disk_blocked {
+            assert!(std::time::Instant::now() < deadline, "guard never tripped");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        q.finish(false).await;
+        // The producer asks only now, after the task dropped the event: it
+        // must hear "not stored", or it would ACK an event that was lost.
+        let committed = tokio::time::timeout(WAIT, q.committed(ticket.expect("durable")));
+        assert!(
+            !committed.await.expect("timed out"),
+            "dropped, not committed"
+        );
+    }
+
+    /// A `drop_oldest` durable queue holding four committed 10-byte events,
+    /// all cached in memory.
+    async fn full_durable(
+        shared: &SpillShared,
+        disk_events: u64,
+        disk_bytes: u64,
+        max_evictions: Option<usize>,
+    ) -> Arc<NodeQueue> {
+        let q = NodeQueue::new_durable(
+            QueueSettings {
+                capacity: 0,
+                max_bytes: 0,
+                when_full: WhenFull::DropOldest,
+                block_timeout: Duration::from_millis(100),
+                max_evictions,
+            },
+            Budget::new(1 << 30),
+            DurableSettings {
+                spec: SpillSpec {
+                    memory_max_events: 8,
+                    memory_max_bytes: 1 << 20,
+                    disk_max_events: disk_events,
+                    disk_max_bytes: disk_bytes,
+                    refill_watermark: 0.25,
+                    write_batch: 4,
+                },
+                dir: shared.scene_dir("scene"),
+                node_id: "node".into(),
+                shared: shared.clone(),
+                adopt: false,
+            },
+        );
+        for n in 0..4 {
+            push(&q, n).await;
+        }
+        assert_eq!(q.stats().len, 4, "all cached");
+        q
+    }
+
+    async fn labels(q: &NodeQueue, n: usize) -> Vec<String> {
+        let mut out = vec![];
+        for _ in 0..n {
+            let item = pop(q).await;
+            out.push(item.event.label());
+            q.delivered(item);
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_oldest_evicts_as_many_as_a_large_event_needs() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        // 25 bytes on a full 40-byte disk need three events gone.
+        let q = full_durable(&shared, 100, 40, Some(3)).await;
+        let (pushed, ticket) = q.push_tracked(event(9), 25).await;
+        assert_eq!(pushed, Pushed::Queued);
+        assert!(q.committed(ticket.unwrap()).await);
+        assert_eq!(q.stats().evicted, 3);
+        wait_rows(&q, 2).await;
+        assert_eq!(labels(&q, 2).await, ["3", "9"]);
+        q.finish(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_oldest_over_the_eviction_limit_evicts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        let q = full_durable(&shared, 100, 40, Some(2)).await;
+        let (pushed, ticket) = q.push_tracked(event(9), 25).await;
+        assert_eq!(pushed, Pushed::Dropped(super::super::DropReason::Full));
+        assert!(ticket.is_none());
+        assert_eq!(q.stats().evicted, 0);
+        assert_eq!(labels(&q, 4).await, ["0", "1", "2", "3"]);
+        q.finish(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_oldest_never_evicts_and_then_refuses_at_the_hub_wide_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        // 40 bytes of spool for the whole hub; this queue's own limits are wide.
+        let shared = SpillShared::new(dir.path().join("spool"), false, 1 << 30, 40, 0);
+        let q = full_durable(&shared, 100, 1 << 20, None).await;
+        // 50 bytes can't fit even with everything evicted: nothing goes.
+        let (pushed, _) = q.push_tracked(event(9), 50).await;
+        assert_eq!(pushed, Pushed::Dropped(super::super::DropReason::Full));
+        assert_eq!(q.stats().evicted, 0);
+        // 25 bytes fit once three are evicted (their rows free hub-wide room).
+        let (pushed, ticket) = q.push_tracked(event(8), 25).await;
+        assert_eq!(pushed, Pushed::Queued);
+        assert!(q.committed(ticket.unwrap()).await);
+        assert_eq!(q.stats().evicted, 3);
+        wait_rows(&q, 2).await;
+        assert_eq!(shared.disk.used(), 35);
+        assert_eq!(labels(&q, 2).await, ["3", "8"]);
+        q.finish(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn back_to_back_pushes_evict_one_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        // Room for four events: each new one needs one gone, even while the
+        // previous eviction's row isn't deleted yet.
+        let q = full_durable(&shared, 4, 1 << 20, None).await;
+        for n in [8, 9] {
+            let (pushed, ticket) = q.push_tracked(event(n), SIZE).await;
+            assert_eq!(pushed, Pushed::Queued);
+            assert!(q.committed(ticket.unwrap()).await);
+        }
+        assert_eq!(q.stats().evicted, 2);
+        wait_rows(&q, 4).await;
+        assert_eq!(labels(&q, 4).await, ["2", "3", "8", "9"]);
         q.finish(true).await;
     }
 }

@@ -18,7 +18,7 @@
 //! sees acceptance, `Shutdown` and incoming data events.
 
 use crate::plugin::frame::{
-    Frame, FrameError, WireMessage, encode_frame, encode_message, read_frame,
+    Frame, FrameError, SeqCounter, WireMessage, encode_frame, encode_message, read_frame,
 };
 use crate::plugin::core::{InboundEvent, InputRef};
 use crate::schema::payload::PluginPayload;
@@ -65,8 +65,8 @@ pub(crate) type Confirmation = Result<(), String>;
 struct Conn {
     id: u64,
     writer: BoxedWriter,
-    /// Next seq for an outgoing EVENT.
-    next_seq: u64,
+    /// Seqs for outgoing EVENTs.
+    seqs: SeqCounter,
     /// Remaining credit, if the hub enabled CREDITS on this connection.
     credit: Option<u64>,
     /// The hub enabled ACKS on this connection.
@@ -152,7 +152,7 @@ impl HubClient {
         *conn = Some(Conn {
             id,
             writer,
-            next_seq: 1,
+            seqs: SeqCounter::new(),
             credit: None,
             acks: false,
             confirms: HashMap::new(),
@@ -239,7 +239,13 @@ impl HubClient {
                 }
                 let conn = guard.as_mut().ok_or_else(not_connected)?;
                 if conn.credit != Some(0) {
-                    let seq = conn.next_seq;
+                    let Some(seq) = conn.seqs.peek() else {
+                        // Used every seq this connection has: reconnect
+                        // (numbering starts at 1 again), as on a write error.
+                        log::warn!("Used up the event seqs of this connection; reconnecting");
+                        self.drop_conn(&mut guard);
+                        return Err(not_connected());
+                    };
                     // seq numbers are per connection: an input from an
                     // earlier connection can't be referred to any more.
                     let input_seq = input.filter(|i| i.conn_id == conn.id).map_or(0, |i| i.seq);
@@ -254,7 +260,7 @@ impl HubClient {
                         self.drop_conn(&mut guard);
                         return Err(err);
                     }
-                    conn.next_seq += 1;
+                    conn.seqs.advance();
                     if let Some(credit) = conn.credit.as_mut() {
                         *credit -= 1;
                     }
@@ -465,7 +471,7 @@ async fn read_loop(
     tx: &mpsc::Sender<Incoming>,
 ) -> Result<(), String> {
     let mut heartbeat: Option<Duration> = None;
-    let mut next_seq = 1u64;
+    let mut seqs = SeqCounter::new();
     let mut accepted = false;
     loop {
         // Only time spent waiting to read counts as silence; time spent
@@ -540,13 +546,8 @@ async fn read_loop(
                 None
             }
             MsgCode::Event => {
-                if frame.header.seq != next_seq {
-                    return Err(format!(
-                        "protocol violation by the hub: event seq {}, expected {next_seq}",
-                        frame.header.seq
-                    ));
-                }
-                next_seq += 1;
+                seqs.accept(frame.header.seq)
+                    .map_err(|err| format!("protocol violation by the hub: {err}"))?;
                 let event: Event = decode(&frame)?;
                 Some(Incoming::Event(InboundEvent {
                     seq: frame.header.seq,

@@ -93,8 +93,9 @@ pub(crate) enum DirectorCommand {
         scene_id: String,
         reply: oneshot::Sender<Option<SceneStatus>>,
     },
-    /// Drop the queued events of a scene's nodes (or of one node): in its
-    /// queues if it runs, else in its spool files. Replies with how many.
+    /// Start a scene's queues (or one node's) over: if it runs, its queued and
+    /// in-flight events go and spool files are replaced; else its spool files
+    /// are deleted. Replies with how many events went.
     Purge {
         scene_id: String,
         node_id: Option<String>,
