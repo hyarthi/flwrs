@@ -22,6 +22,15 @@ pub(crate) struct HubConfig {
     /// Largest `Initialize` frame accepted from a connection that hasn't been
     /// authenticated yet.
     pub max_handshake_bytes: usize,
+    /// Connections still in their handshake (both listeners together); more
+    /// are closed as soon as they're accepted. Each node has at most one
+    /// connection past the handshake, so this also bounds the total. `0` =
+    /// no limit.
+    pub max_pending_connections: usize,
+    /// The same, per source address, so one address can't take every slot.
+    /// Loopback isn't counted (local plugins all connect from it). `0` = no
+    /// limit.
+    pub max_pending_per_ip: usize,
     /// The hub pings every connection this often (announced in
     /// `InitializeResponse`); a connection silent for three intervals while
     /// the hub is reading is closed. `0` = no heartbeats.
@@ -73,6 +82,8 @@ impl Default for HubConfig {
             max_inflight_bytes: 512 * 1024 * 1024,
             handshake_timeout_ms: 10_000,
             max_handshake_bytes: 1024 * 1024,
+            max_pending_connections: 256,
+            max_pending_per_ip: 8,
             heartbeat_interval_ms: 10_000,
             credit_window: 64,
             max_unacked: 1024,

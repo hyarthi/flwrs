@@ -176,6 +176,8 @@ plugin                                   hub
 
 The plugin's first frame MUST be `INITIALIZE`, within 10 seconds of connecting and at most 1 MiB in size. Otherwise the hub closes the connection without a reply.
 
+The hub may also close a new connection right away, before reading anything, when too many connections are still in their handshake (overall or from the plugin's address). A plugin treats this like any other lost connection and reconnects with backoff ([section 6.5](#65-reconnecting)).
+
 `Initialize` carries:
 
 - `instance_id`, `plugin_version`, `plugin_type` and `token` (empty when the node uses a client certificate instead, [section 14](#14-security));
@@ -389,6 +391,7 @@ Every implementation enforces the same limits, so a frame accepted by one side i
 | Frame (`packet_len`) | at most 256 MiB |
 | Header (`header_len`) | at most 4 KiB |
 | First frame (`Initialize`) | at most 1 MiB, within 10 s of connecting |
+| Connections still in their handshake | 256 at once, 8 per address (loopback not counted) by default; configurable. More are closed at once (section 6.1). |
 | Event body, as accepted by the hub | 16 MiB by default (configurable, and lower per node). Larger events are skipped without being buffered, and NACKed (`retry = false`) to producers with `ACKS`. |
 | Nesting depth of payload values and schemas | at most 32 levels |
 

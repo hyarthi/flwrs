@@ -12,7 +12,7 @@ use super::queue::{
     Queued, SpillSettings, SpillShared, delete_files,
 };
 use crate::modules::hub::wire::{DataEvent, Negotiated};
-use crate::modules::hub::{Hub, HubError, LinkSender, Routed};
+use crate::modules::hub::{Hub, HubError, LinkReport, LinkSender, Routed};
 use crate::modules::mapping::{self, Mapping, MappingSpec, Schemas};
 use crate::modules::node_config::WhenFull;
 use crate::modules::plugin::manifest::PluginType;
@@ -72,6 +72,8 @@ pub(crate) struct NodeReport {
     /// Events from this node that an out-edge's mapping couldn't map (they
     /// weren't sent along that edge).
     pub mapping_errors: u64,
+    /// The plugin's link: heartbeat round trips and how its connections went.
+    pub link: LinkReport,
 }
 
 /// Per-node totals since the scene started.
@@ -709,6 +711,7 @@ impl RunningScene {
                     queue,
                     dropped_hops,
                     mapping_errors,
+                    link: n.handle.sender().link_report(),
                 }
             })
             .collect()

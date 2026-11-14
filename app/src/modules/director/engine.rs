@@ -287,6 +287,7 @@ async fn gather(
     let (spill_disk_used, spill_disk_limit) = engine.ctx.spill.disk_usage();
     let overview = Overview {
         hub_address: engine.ctx.hub.local_addr().to_string(),
+        hub_connections: engine.ctx.hub.connections(),
         queued_memory: Usage {
             used_bytes: (budget.total() - budget.available()) as u64,
             limit_bytes: budget.total() as u64,

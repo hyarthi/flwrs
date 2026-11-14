@@ -14,6 +14,8 @@
 //! to the director in the order they arrived.
 
 use super::config::HubConfig;
+use super::link_stats::{HubConnections, LinkReport, LinkStats, Lost, Pings};
+use super::pending::{PendingLimits, PendingSlot};
 use super::wire::{self, DataEvent, InitInfo, Negotiated};
 use crate::modules::plugin::manifest::PluginType;
 use crate::modules::rate_limit::RateLimit;
@@ -199,6 +201,12 @@ struct Inner {
     shutdown: CancellationToken,
     /// For handshake failures that aren't tied to an expected node.
     stranger_log: RateLimit,
+    /// Connections still in their handshake.
+    pending: Arc<PendingLimits>,
+    /// Connections closed at once for the pending limits.
+    refused_busy: AtomicU64,
+    /// Handshakes that failed before reaching a node ([`stranger`]).
+    failed_handshakes: AtomicU64,
 }
 
 struct NodeEntry {
@@ -207,6 +215,8 @@ struct NodeEntry {
     events: mpsc::Sender<HubEvent>,
     conn: Option<ConnHandle>,
     reject_log: RateLimit,
+    /// Heartbeats and connections, across the node's connections.
+    stats: Arc<LinkStats>,
 }
 
 #[derive(Clone)]
@@ -229,6 +239,8 @@ struct ConnShared {
     memory: Option<Mutex<InputMemory>>,
     /// Producers with CREDITS.
     credit: Option<Credits>,
+    /// The hub's pings waiting for their PONG.
+    pings: Pings,
 }
 
 /// Metadata of the inputs sent to a transform: every unacked one, plus the
@@ -318,6 +330,7 @@ impl Hub {
             }
             None
         };
+        let pending = PendingLimits::new(config.max_pending_connections, config.max_pending_per_ip);
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
@@ -330,12 +343,27 @@ impl Hub {
                 next_id: AtomicU64::new(1),
                 shutdown: CancellationToken::new(),
                 stranger_log: RateLimit::new(Duration::from_secs(10)),
+                pending,
+                refused_busy: AtomicU64::new(0),
+                failed_handshakes: AtomicU64::new(0),
             }),
         })
     }
 
     pub(crate) fn config(&self) -> &HubConfig {
         &self.inner.config
+    }
+
+    /// Connections now, and refusals so far.
+    pub(crate) fn connections(&self) -> HubConnections {
+        let inner = &self.inner;
+        let connected = inner.nodes().values().filter(|e| e.conn.is_some()).count();
+        HubConnections {
+            connected: connected as u64,
+            pending: inner.pending.pending() as u64,
+            refused_busy: inner.refused_busy.load(Ordering::Relaxed),
+            failed_handshakes: inner.failed_handshakes.load(Ordering::Relaxed),
+        }
     }
 
     /// The address plugins connect to (with the actual port if `port = 0`).
@@ -355,6 +383,7 @@ impl Hub {
         let (tx, rx) = mpsc::channel(capacity);
         let link_id = self.inner.next_id();
         let node_id = node.node_id.clone();
+        let stats = Arc::new(LinkStats::default());
         let old = self.inner.nodes().insert(
             node_id.clone(),
             NodeEntry {
@@ -363,6 +392,7 @@ impl Hub {
                 events: tx,
                 conn: None,
                 reject_log: RateLimit::new(REJECT_LOG_INTERVAL),
+                stats: stats.clone(),
             },
         );
         if let Some(conn) = old.and_then(|old| old.conn) {
@@ -373,6 +403,7 @@ impl Hub {
                 node_id: node_id.into(),
                 link_id,
                 inner: self.inner.clone(),
+                stats,
             },
             events: rx,
         }
@@ -416,9 +447,14 @@ impl Hub {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 accepted = listener.accept() => match accepted {
-                    Ok((stream, peer)) => {
-                        tokio::spawn(serve_tcp(self.inner.clone(), stream, peer));
-                    }
+                    // Over the pending limits, `stream` is dropped: closed
+                    // before anything is read.
+                    Ok((stream, peer)) => match self.inner.pending.admit(peer.ip()) {
+                        Ok(slot) => {
+                            tokio::spawn(serve_tcp(self.inner.clone(), stream, peer, slot));
+                        }
+                        Err(reason) => refuse_busy(&self.inner, peer, reason),
+                    },
                     // E.g. out of file descriptors: keep going after a pause.
                     Err(err) => {
                         log::error!("Hub: accept failed: {err}");
@@ -427,9 +463,12 @@ impl Hub {
                 },
                 accepted = tls_accept => match accepted {
                     #[cfg(feature = "remote")]
-                    Ok(((stream, peer), tls)) => {
-                        tokio::spawn(serve_tls(self.inner.clone(), tls, stream, peer));
-                    }
+                    Ok(((stream, peer), tls)) => match self.inner.pending.admit(peer.ip()) {
+                        Ok(slot) => {
+                            tokio::spawn(serve_tls(self.inner.clone(), tls, stream, peer, slot));
+                        }
+                        Err(reason) => refuse_busy(&self.inner, peer, reason),
+                    },
                     #[cfg(not(feature = "remote"))]
                     Ok(_) => {}
                     Err(err) => {
@@ -459,6 +498,7 @@ pub(crate) struct LinkSender {
     node_id: Arc<str>,
     link_id: u64,
     inner: Arc<Inner>,
+    stats: Arc<LinkStats>,
 }
 
 impl LinkSender {
@@ -476,6 +516,12 @@ impl LinkSender {
 
     pub(crate) fn is_connected(&self) -> bool {
         self.current_conn().is_some()
+    }
+
+    /// Heartbeat round trips and how connections went, across the plugin's
+    /// connections.
+    pub(crate) fn link_report(&self) -> LinkReport {
+        self.stats.report()
     }
 
     /// The current connection's id and what it negotiated.
@@ -711,6 +757,7 @@ fn authenticate(
     let entry = nodes.get_mut(&node_id).expect("found above");
     let reasons = check_declaration(&entry.expected, init);
     if !reasons.is_empty() {
+        entry.stats.rejected();
         return Verdict::Mismatch {
             reasons,
             events: entry.events.clone(),
@@ -739,6 +786,7 @@ fn authenticate(
             memory: (plugin_type == PluginType::Transform)
                 .then(|| Mutex::new(InputMemory::default())),
             credit,
+            pings: Pings::new(entry.stats.clone()),
         }),
     };
     let superseded = match entry.conn.replace(conn.clone()) {
@@ -748,6 +796,7 @@ fn authenticate(
         }
         None => false,
     };
+    entry.stats.accepted(superseded);
     Verdict::Accepted {
         expected: entry.expected.clone(),
         events: entry.events.clone(),
@@ -839,7 +888,7 @@ fn describe(transport: &Transport) -> String {
     }
 }
 
-async fn serve_tcp(inner: Arc<Inner>, stream: TcpStream, peer: SocketAddr) {
+async fn serve_tcp(inner: Arc<Inner>, stream: TcpStream, peer: SocketAddr, slot: PendingSlot) {
     let _ = stream.set_nodelay(true);
     let (reader, writer) = stream.into_split();
     serve_connection(
@@ -848,6 +897,7 @@ async fn serve_tcp(inner: Arc<Inner>, stream: TcpStream, peer: SocketAddr) {
         Box::new(writer),
         peer,
         Transport::default(),
+        slot,
     )
     .await;
 }
@@ -858,6 +908,7 @@ async fn serve_tls(
     tls: Arc<super::tls::TlsListener>,
     stream: TcpStream,
     peer: SocketAddr,
+    slot: PendingSlot,
 ) {
     let _ = stream.set_nodelay(true);
     let timeout = Duration::from_millis(inner.config.handshake_timeout_ms);
@@ -872,7 +923,54 @@ async fn serve_tls(
         tls: true,
         client_cert,
     };
-    serve_connection(inner, Box::new(reader), Box::new(writer), peer, transport).await;
+    serve_connection(inner, Box::new(reader), Box::new(writer), peer, transport, slot).await;
+}
+
+/// The handshake's first frame: an `Initialize` within the timeout and size
+/// limit. `None` (after logging why) if the connection should just close.
+async fn read_initialize(
+    inner: &Inner,
+    reader: &mut BoxedReader,
+    peer: SocketAddr,
+) -> Option<InitInfo> {
+    let timeout = Duration::from_millis(inner.config.handshake_timeout_ms);
+    let first = tokio::select! {
+        _ = inner.shutdown.cancelled() => return None,
+        first = tokio::time::timeout(
+            timeout,
+            read_frame_limited(reader, inner.config.max_handshake_bytes),
+        ) => first,
+    };
+    let frame = match first {
+        Ok(Ok(Some(LimitedFrame::Frame(frame)))) => frame,
+        Ok(Ok(Some(LimitedFrame::Oversized { body_len, .. }))) => {
+            stranger(inner, peer, format!("first frame too large ({body_len} bytes)"));
+            return None;
+        }
+        Ok(Ok(None)) => {
+            log::debug!("Hub: {peer} closed the connection before Initialize");
+            return None;
+        }
+        Ok(Err(err)) => {
+            stranger(inner, peer, format!("invalid first frame: {err}"));
+            return None;
+        }
+        Err(_) => {
+            stranger(inner, peer, format!("no Initialize within {} ms", timeout.as_millis()));
+            return None;
+        }
+    };
+    if frame.code() != MsgCode::Initialize {
+        stranger(inner, peer, format!("first frame is {:?}, not Initialize", frame.code()));
+        return None;
+    }
+    match frame.decode::<Initialize>() {
+        Ok(init) => Some(init.into()),
+        Err(err) => {
+            stranger(inner, peer, format!("invalid Initialize: {err}"));
+            None
+        }
+    }
 }
 
 async fn serve_connection(
@@ -881,50 +979,19 @@ async fn serve_connection(
     mut writer: BoxedWriter,
     peer: SocketAddr,
     transport: Transport,
+    slot: PendingSlot,
 ) {
-    // --- handshake: the first frame must be an Initialize ---
-    let timeout = Duration::from_millis(inner.config.handshake_timeout_ms);
-    let first = tokio::select! {
-        _ = inner.shutdown.cancelled() => return,
-        first = tokio::time::timeout(
-            timeout,
-            read_frame_limited(&mut reader, inner.config.max_handshake_bytes),
-        ) => first,
-    };
-    let frame = match first {
-        Ok(Ok(Some(LimitedFrame::Frame(frame)))) => frame,
-        Ok(Ok(Some(LimitedFrame::Oversized { body_len, .. }))) => {
-            return stranger(
-                &inner,
-                peer,
-                format!("first frame too large ({body_len} bytes)"),
-            );
-        }
-        Ok(Ok(None)) => return log::debug!("Hub: {peer} closed the connection before Initialize"),
-        Ok(Err(err)) => return stranger(&inner, peer, format!("invalid first frame: {err}")),
-        Err(_) => {
-            return stranger(
-                &inner,
-                peer,
-                format!("no Initialize within {} ms", timeout.as_millis()),
-            );
-        }
-    };
-    if frame.code() != MsgCode::Initialize {
-        return stranger(
-            &inner,
-            peer,
-            format!("first frame is {:?}, not Initialize", frame.code()),
-        );
-    }
-    let init: InitInfo = match frame.decode::<Initialize>() {
-        Ok(init) => init.into(),
-        Err(err) => return stranger(&inner, peer, format!("invalid Initialize: {err}")),
-    };
-
     let (out_tx, out_rx) = mpsc::channel(OUTBOUND_CAPACITY);
-    let (expected, events, conn, superseded) = match authenticate(&inner, &init, &transport, out_tx)
-    {
+    // The connection counts as pending until the handshake has its answer.
+    let (init, verdict) = {
+        let _slot = slot;
+        let Some(init) = read_initialize(&inner, &mut reader, peer).await else {
+            return;
+        };
+        let verdict = authenticate(&inner, &init, &transport, out_tx);
+        (init, verdict)
+    };
+    let (expected, events, conn, superseded) = match verdict {
         Verdict::Refused(reason) => {
             stranger(&inner, peer, reason);
             // The plugin learns only that it's not welcome here.
@@ -995,6 +1062,7 @@ async fn serve_connection(
         conn.close.clone(),
         write_failed.clone(),
         heartbeat,
+        conn.shared.clone(),
     ));
     let _ = events
         .send(HubEvent::Connected {
@@ -1035,15 +1103,17 @@ async fn serve_connection(
         };
         let read = tokio::select! {
             _ = conn.close.cancelled() => break None,
-            _ = write_failed.cancelled() => break Some("writing to the plugin failed".to_string()),
+            _ = write_failed.cancelled() => {
+                break Some((Lost::IoError, "writing to the plugin failed".to_string()));
+            }
             read = read => read,
         };
         let frame = match read {
-            Err(silence) => break Some(silence),
+            Err(silence) => break Some((Lost::TimedOut, silence)),
             Ok(Ok(Some(LimitedFrame::Frame(frame)))) => Ok(frame),
             Ok(Ok(Some(LimitedFrame::Oversized { header, body_len }))) => Err((header, body_len)),
-            Ok(Ok(None)) => break Some("closed by the plugin".into()),
-            Ok(Err(err)) => break Some(format!("read error: {err}")),
+            Ok(Ok(None)) => break Some((Lost::ClosedByPlugin, "closed by the plugin".into())),
+            Ok(Err(err)) => break Some((Lost::IoError, format!("read error: {err}"))),
         };
         let handled = match frame {
             Ok(frame) => session.handle(frame).await,
@@ -1054,20 +1124,21 @@ async fn serve_connection(
             Ok(false) => break None, // nobody's listening any more
             Err(violation) => {
                 log::error!("Hub: {tag} protocol violation: {violation}; closing the connection");
-                break Some(format!("protocol violation: {violation}"));
+                break Some((Lost::ProtocolViolation, format!("protocol violation: {violation}")));
             }
         }
     };
 
     conn.close.cancel(); // stops the writer
     let was_current = unregister(&inner, &expected.node_id, conn.id);
-    if let Some(reason) = lost
+    if let Some((cause, reason)) = lost
         && was_current
     {
         if session.exited {
             log::debug!("Hub: {tag} connection closed after Exit: {reason}");
         } else {
             log::warn!("Hub: {tag} connection lost: {reason}");
+            conn.shared.pings.stats().lost(cause);
         }
         let _ = events
             .send(HubEvent::Disconnected {
@@ -1177,7 +1248,11 @@ impl Running {
                 return Ok(true);
             }
             MsgCode::Pong => {
-                let _: Pong = decode(&frame)?;
+                let pong: Pong = decode(&frame)?;
+                self.conn
+                    .shared
+                    .pings
+                    .answered(pong.nonce, std::time::Instant::now());
                 return Ok(true);
             }
             _ => unreachable!("checked by plugin_may_send"),
@@ -1273,8 +1348,20 @@ fn unregister(inner: &Inner, node_id: &str, conn_id: u64) -> bool {
     }
 }
 
-/// Logs a failed handshake from a connection that isn't (yet) tied to a node.
+/// Logs and counts a connection closed at accept for the pending limits.
+fn refuse_busy(inner: &Inner, peer: SocketAddr, reason: String) {
+    inner.refused_busy.fetch_add(1, Ordering::Relaxed);
+    let message = format!("Hub: refused connection from {peer}: {reason}");
+    if inner.stranger_log.allow() {
+        log::warn!("{message}");
+    } else {
+        log::debug!("{message}");
+    }
+}
+
+/// Logs and counts a failed handshake from a connection that isn't (yet) tied to a node.
 fn stranger(inner: &Inner, peer: SocketAddr, reason: String) {
+    inner.failed_handshakes.fetch_add(1, Ordering::Relaxed);
     let message = format!("Hub: refused connection from {peer}: {reason}");
     if inner.stranger_log.allow() {
         log::warn!("{message}");
@@ -1303,6 +1390,7 @@ async fn write_frames(
     close: CancellationToken,
     failed: CancellationToken,
     heartbeat: Option<Duration>,
+    shared: Arc<ConnShared>,
 ) {
     let mut ticker = heartbeat.map(|interval| {
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
@@ -1325,6 +1413,9 @@ async fn write_frames(
             },
             _ = tick => {
                 nonce += 1;
+                // Noted before it's written, so even an instant answer matches.
+                let horizon = heartbeat.unwrap_or_default() * MISSED_HEARTBEATS;
+                shared.pings.sent(nonce, std::time::Instant::now(), horizon);
                 encode_message(&Ping { nonce })
             }
         };

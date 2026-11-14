@@ -55,7 +55,22 @@ metrics! {
     QUEUE_BYTES = "flwrs.node.queue.size", Gauge, "By", "Bytes in the node's inbound queue (memory and disk)";
     QUEUE_BLOCKED = "flwrs.node.queue.blocked_time", Counter, "ms", "Time producers waited for room in the node's queue";
     QUEUE_SPILLED = "flwrs.node.queue.spilled", Counter, "{event}", "Events the node's queue wrote to disk";
+    HEARTBEAT_RTT = "flwrs.node.heartbeat.rtt", Gauge, "ms", "The latest round trip of the hub's PING to the node's plugin";
+    HEARTBEAT_ANSWERED = "flwrs.node.heartbeat.answered", Counter, "{ping}", "The hub's pings the plugin answered with their nonce";
+    HEARTBEAT_MISSED = "flwrs.node.heartbeat.missed", Counter, "{ping}", "The hub's pings not answered within three heartbeat intervals";
+    HEARTBEAT_UNEXPECTED = "flwrs.node.heartbeat.unexpected", Counter, "{pong}", "PONGs with a nonce the hub wasn't waiting for";
+    CONNECTIONS_ACCEPTED = "flwrs.node.connections.accepted", Counter, "{connection}", "The plugin's connections that passed the handshake";
+    CONNECTIONS_REJECTED = "flwrs.node.connections.rejected", Counter, "{connection}", "Handshakes refused: declarations that don't match the node";
+    CONNECTIONS_REPLACED = "flwrs.node.connections.replaced", Counter, "{connection}", "Connections closed for a newer one from the plugin";
+    CONNECTIONS_CLOSED_BY_PLUGIN = "flwrs.node.connections.lost.closed_by_plugin", Counter, "{connection}", "Connections the plugin closed without sending Exit";
+    CONNECTIONS_TIMED_OUT = "flwrs.node.connections.lost.timed_out", Counter, "{connection}", "Connections closed after three heartbeat intervals of silence";
+    CONNECTIONS_IO_ERRORS = "flwrs.node.connections.lost.io_errors", Counter, "{connection}", "Connections lost to a read or write error (e.g. a reset)";
+    CONNECTIONS_VIOLATIONS = "flwrs.node.connections.lost.protocol_violations", Counter, "{connection}", "Connections closed for a protocol violation";
     SCENE_UP = "flwrs.scene.up", Gauge, "1", "1 if the scene is running, else 0";
+    HUB_CONNECTIONS_OPEN = "flwrs.hub.connections.open", Gauge, "{connection}", "Plugin connections past the handshake";
+    HUB_CONNECTIONS_PENDING = "flwrs.hub.connections.pending", Gauge, "{connection}", "Connections still in their handshake";
+    HUB_CONNECTIONS_REFUSED_BUSY = "flwrs.hub.connections.refused_busy", Counter, "{connection}", "Connections closed at once: too many in their handshake";
+    HUB_HANDSHAKES_FAILED = "flwrs.hub.handshakes.failed", Counter, "{handshake}", "Handshakes that failed before reaching a node (bad or late Initialize, TLS, unknown id, credentials)";
     HUB_QUEUED_MEMORY = "flwrs.hub.queued_memory.usage", Gauge, "By", "Bytes of the hub-wide queue budget in use";
     HUB_QUEUED_MEMORY_LIMIT = "flwrs.hub.queued_memory.limit", Gauge, "By", "The hub-wide queue budget";
     SPILL_MEMORY = "flwrs.spill.memory.usage", Gauge, "By", "Memory used by spilling queues";
@@ -79,18 +94,27 @@ pub(crate) struct Samples {
 
 pub(crate) fn from_snapshot(snapshot: &StatsSnapshot, time: SystemTime) -> Samples {
     let mut samples = vec![];
-    let mut push = |metric: Metric, labels: Vec<(&'static str, String)>, value: u64| {
+    let mut push_f64 = |metric: Metric, labels: Vec<(&'static str, String)>, value: f64| {
         samples.push(Sample {
             metric,
             labels,
-            value: value as f64,
+            value,
         });
+    };
+    let mut rtts = vec![];
+    let mut push = |metric: Metric, labels: Vec<(&'static str, String)>, value: u64| {
+        push_f64(metric, labels, value as f64);
     };
     let o = &snapshot.overview;
     push(HUB_QUEUED_MEMORY, vec![], o.queued_memory.used_bytes);
     push(HUB_QUEUED_MEMORY_LIMIT, vec![], o.queued_memory.limit_bytes);
     push(SPILL_MEMORY, vec![], o.spill_memory.used_bytes);
     push(SPILL_DISK, vec![], o.spill_disk.used_bytes);
+    let hc = &o.hub_connections;
+    push(HUB_CONNECTIONS_OPEN, vec![], hc.connected);
+    push(HUB_CONNECTIONS_PENDING, vec![], hc.pending);
+    push(HUB_CONNECTIONS_REFUSED_BUSY, vec![], hc.refused_busy);
+    push(HUB_HANDSHAKES_FAILED, vec![], hc.failed_handshakes);
     for (scene_id, status) in &snapshot.scenes {
         let scene = vec![("scene.id", scene_id.clone())];
         push(
@@ -116,6 +140,21 @@ pub(crate) fn from_snapshot(snapshot: &StatsSnapshot, time: SystemTime) -> Sampl
                 labels.clone(),
                 u64::from(node.status.state == NodeState::Running),
             );
+            let h = &node.link.heartbeats;
+            if let Some(rtt) = h.last_rtt_ms {
+                rtts.push((labels.clone(), rtt));
+            }
+            push(HEARTBEAT_ANSWERED, labels.clone(), h.answered);
+            push(HEARTBEAT_MISSED, labels.clone(), h.missed);
+            push(HEARTBEAT_UNEXPECTED, labels.clone(), h.unexpected);
+            let c = &node.link.connections;
+            push(CONNECTIONS_ACCEPTED, labels.clone(), c.accepted);
+            push(CONNECTIONS_REJECTED, labels.clone(), c.rejected);
+            push(CONNECTIONS_REPLACED, labels.clone(), c.replaced);
+            push(CONNECTIONS_CLOSED_BY_PLUGIN, labels.clone(), c.closed_by_plugin);
+            push(CONNECTIONS_TIMED_OUT, labels.clone(), c.timed_out);
+            push(CONNECTIONS_IO_ERRORS, labels.clone(), c.io_errors);
+            push(CONNECTIONS_VIOLATIONS, labels.clone(), c.protocol_violations);
             if let Some(q) = &node.queue {
                 push(QUEUE_DEPTH, labels.clone(), q.len as u64 + q.disk_len);
                 push(QUEUE_BYTES, labels.clone(), q.bytes as u64 + q.disk_bytes);
@@ -126,6 +165,10 @@ pub(crate) fn from_snapshot(snapshot: &StatsSnapshot, time: SystemTime) -> Sampl
             }
         }
     }
+    // Only nodes whose plugin answered a ping have a round trip.
+    for (labels, rtt) in rtts {
+        push_f64(HEARTBEAT_RTT, labels, rtt);
+    }
     Samples { time, samples }
 }
 
@@ -135,6 +178,7 @@ mod tests {
     use crate::modules::director::handle::{Overview, SceneStatus, Usage};
     use crate::modules::director::queue::QueueStats;
     use crate::modules::director::running::{NodeCounters, NodeReport};
+    use crate::modules::hub::{ConnectionStats, HeartbeatStats, HubConnections, LinkReport};
     use crate::modules::supervisor::NodeStatus;
 
     #[test]
@@ -182,10 +226,29 @@ mod tests {
             }),
             dropped_hops: 0,
             mapping_errors: 0,
+            link: LinkReport {
+                heartbeats: HeartbeatStats {
+                    last_rtt_ms: Some(1.5),
+                    answered: 9,
+                    missed: 1,
+                    unexpected: 0,
+                },
+                connections: ConnectionStats {
+                    accepted: 3,
+                    timed_out: 2,
+                    ..Default::default()
+                },
+            },
         };
         let snapshot = StatsSnapshot {
             overview: Overview {
                 hub_address: "127.0.0.1:7400".into(),
+                hub_connections: HubConnections {
+                    connected: 1,
+                    pending: 2,
+                    refused_busy: 3,
+                    failed_handshakes: 4,
+                },
                 queued_memory: usage(10),
                 spill_memory: usage(0),
                 spill_disk: usage(0),
@@ -230,5 +293,13 @@ mod tests {
         assert_eq!(value("flwrs.node.queue.size").unwrap().1, 50.0);
         assert_eq!(value("flwrs.node.up").unwrap().1, 1.0);
         assert!(value("flwrs.node.queue.spilled").is_none(), "spill is off");
+        assert_eq!(value("flwrs.node.heartbeat.rtt").unwrap().1, 1.5);
+        assert_eq!(value("flwrs.node.heartbeat.missed").unwrap().1, 1.0);
+        assert_eq!(value("flwrs.node.connections.accepted").unwrap().1, 3.0);
+        assert_eq!(value("flwrs.node.connections.lost.timed_out").unwrap().1, 2.0);
+        assert_eq!(value("flwrs.hub.connections.open"), Some((vec![], 1.0)));
+        assert_eq!(value("flwrs.hub.connections.pending").unwrap().1, 2.0);
+        assert_eq!(value("flwrs.hub.connections.refused_busy").unwrap().1, 3.0);
+        assert_eq!(value("flwrs.hub.handshakes.failed").unwrap().1, 4.0);
     }
 }

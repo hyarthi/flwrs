@@ -461,6 +461,56 @@ async fn bad_first_frames_are_closed_without_reply() {
     assert_quiet(&mut link).await;
 }
 
+#[tokio::test]
+async fn connections_over_the_pending_limit_are_closed_at_once() {
+    let hub = start_hub(HubConfig {
+        max_pending_connections: 2,
+        handshake_timeout_ms: 10_000,
+        ..config()
+    })
+    .await;
+    let mut link = hub.hub.expect(expected("sink", PluginType::Sink));
+    let closed_at_once = |mut plugin: FakePlugin| async move {
+        let started = std::time::Instant::now();
+        assert!(plugin.recv().await.is_none());
+        // Long before the handshake timeout.
+        assert!(started.elapsed() < Duration::from_secs(2));
+    };
+
+    // Two connections that never send anything take both slots (connections
+    // are admitted in the order they arrive).
+    let mut idle = FakePlugin::connect(&hub.hub).await;
+    let _idle_too = FakePlugin::connect(&hub.hub).await;
+    closed_at_once(FakePlugin::connect(&hub.hub).await).await;
+
+    // Closing one frees its slot, once the hub has seen it close: a real
+    // plugin gets in.
+    idle.stream.shutdown().await.unwrap();
+    let mut plugin = tokio::time::timeout(WAIT, async {
+        loop {
+            let mut plugin = FakePlugin::connect(&hub.hub).await;
+            plugin.send(&sink_init("sink", TOKEN)).await;
+            if let Some(frame) = plugin.recv().await {
+                assert_eq!(frame.code(), MsgCode::InitializeResponse);
+                break plugin;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the freed slot was never reused");
+    assert!(matches!(next(&mut link).await, HubEvent::Connected { .. }));
+
+    // Past its handshake, the plugin holds no slot: one more idle connection
+    // fits next to the remaining one, a third doesn't.
+    let _idle_again = FakePlugin::connect(&hub.hub).await;
+    closed_at_once(FakePlugin::connect(&hub.hub).await).await;
+
+    // The accepted plugin is unaffected.
+    plugin.send(&Ping::default()).await;
+    let _: Pong = plugin.recv_msg().await;
+}
+
 // --- running ---
 
 #[tokio::test]
@@ -676,9 +726,78 @@ async fn heartbeats_ping_answer_and_time_out() {
         HubEvent::Disconnected { reason, .. } => {
             assert!(reason.contains("nothing from the plugin for 300 ms"), "{reason}");
             assert!(silent.elapsed() >= Duration::from_millis(250));
+            assert_eq!(link.sender().link_report().connections.timed_out, 1);
         }
         other => panic!("expected Disconnected, got {other:?}"),
     }
+}
+
+/// Waits (up to `WAIT`) until `ok` holds.
+async fn eventually(what: &str, ok: impl Fn() -> bool) {
+    let started = std::time::Instant::now();
+    while !ok() {
+        assert!(started.elapsed() < WAIT, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn heartbeat_round_trips_and_connections_are_counted() {
+    let hub = start_hub(HubConfig {
+        heartbeat_interval_ms: 50,
+        ..config()
+    })
+    .await;
+    let mut link = hub.hub.expect(expected("sink", PluginType::Sink));
+    let sender = link.sender();
+    let report = || sender.link_report();
+
+    // Declarations that don't match: rejected, counted for the node.
+    let mut wrong = FakePlugin::connect(&hub.hub).await;
+    wrong.send(&init(PbPluginType::Source, "sink", TOKEN)).await;
+    wrong.expect_shutdown().await;
+    assert!(matches!(next(&mut link).await, HubEvent::Rejected { .. }));
+    // An unknown instance: a failed handshake, counted for the hub.
+    let mut stranger = FakePlugin::connect(&hub.hub).await;
+    stranger.send(&sink_init("nobody", TOKEN)).await;
+    stranger.expect_shutdown().await;
+
+    let (mut plugin, _) = connected_sink(&hub.hub, &mut link).await;
+    let connections = hub.hub.connections();
+    assert_eq!((connections.connected, connections.pending), (1, 0));
+    assert_eq!((connections.failed_handshakes, connections.refused_busy), (1, 0));
+
+    // One ping answered right, one with a nonce the hub never sent.
+    let ping: Ping = plugin.recv_msg().await;
+    plugin.send(&Pong { nonce: ping.nonce }).await;
+    let ping: Ping = plugin.recv_msg().await;
+    plugin.send(&Pong { nonce: ping.nonce + 1000 }).await;
+    eventually("the answers", || {
+        let h = report().heartbeats;
+        h.answered == 1 && h.unexpected == 1
+    })
+    .await;
+    assert!(report().heartbeats.last_rtt_ms.is_some());
+    // Pings left unanswered (while other frames keep the connection alive)
+    // are missed after three intervals.
+    let silent = async {
+        loop {
+            plugin.send(&LogEvent::default()).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(400), silent).await;
+    assert!(report().heartbeats.missed >= 1, "{:?}", report());
+    assert!(link.is_connected());
+
+    // A newer connection replaces it; closing that one is a loss.
+    let (mut newer, _) = connected_sink(&hub.hub, &mut link).await;
+    newer.stream.shutdown().await.unwrap();
+    assert!(matches!(next(&mut link).await, HubEvent::Disconnected { .. }));
+    let c = report().connections;
+    assert_eq!((c.accepted, c.rejected, c.replaced), (2, 1, 1));
+    assert_eq!((c.closed_by_plugin, c.timed_out, c.io_errors, c.protocol_violations), (1, 0, 0, 0));
+    eventually("the hub to see it close", || hub.hub.connections().connected == 0).await;
 }
 
 #[tokio::test]

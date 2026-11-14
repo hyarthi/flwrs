@@ -85,6 +85,8 @@ port = 7400          # 0 = pick a free port
 # heartbeat_interval_ms = 10000    # PING every connection this often (0 = never)
 # credit_window = 64               # events a producer with CREDITS may have in flight
 # max_unacked = 1024               # upper bound for a consumer's window (default_max_unacked = 64)
+# max_pending_connections = 256    # connections still in their handshake; more are closed at once (0 = no limit)
+# max_pending_per_ip = 8           # the same per source address; loopback not counted (0 = no limit)
 
 [hub.tls]            # optional: a second listener, with TLS, for remote plugins (remote feature)
 port = 7401
@@ -118,7 +120,7 @@ It keeps everything the server writes at run time (database, installed plugins, 
 
 The protocol is the contract between the server and a plugin, so plugins can be written in any language. **The specification is [`docs/protocol.md`](docs/protocol.md)**; the messages are in [`plugin/schema/`](plugin/schema). The Rust SDK in `plugin/` is one implementation of it. In short:
 
-- The server starts a local plugin with `--id <instance id> --host <hub host> --port <hub port> --log-level <level>` (plus the node's launch arguments) and a per-launch token in `FLWRS_TOKEN`. A remote plugin is started by an operator, and authenticates with the node's pre-shared token or a client certificate. Every plugin opens one TCP connection to the hub, or a TLS connection to its TLS listener.
+- The server starts a local plugin with `--id <instance id> --host <hub host> --port <hub port> --log-level <level>` (plus the node's launch arguments) and a per-launch token in `FLWRS_TOKEN`. A remote plugin is started by an operator, and authenticates with the node's pre-shared token or a client certificate. Every plugin opens one TCP connection to the hub, or a TLS connection to its TLS listener. Until its handshake is done, a connection counts against `[hub] max_pending_connections` (256) and `max_pending_per_ip` (8; loopback isn't counted); over either, the hub closes new connections at once, so a flood of connections that never authenticate can't use up the server's file descriptors or memory. A flood from many addresses still needs a firewall or proxy in front of the hub.
 - Every message is a frame: `u32 LE length | u8 framing version (2) | u32 LE header length | FrameHeader | body`. The protobuf `FrameHeader` names the body's message (`MsgCode`), and carries the routing metadata of data events, so the hub forwards bodies without decoding them.
 - The first frame is the plugin's `Initialize` (instance id, token, type, version, payload schemas, protocol versions, capabilities). The hub answers `InitializeResponse` or, to reject it, `Shutdown`. Then data events flow, `PING` is answered with `PONG`, and `Shutdown` is answered with `Exit`. A plugin that loses its connection reconnects with backoff (at most 30 s).
 - Optional capabilities: **`ACKS`** (acknowledgements and redelivery: at-least-once delivery) and **`CREDITS`** (credit-based flow control for what a plugin produces). A plugin without them still works, with TCP backpressure and at-most-once delivery on its hops.
@@ -223,8 +225,9 @@ The output is then shaped to the target node's input schema. Conversions that lo
 - **`GET /api/scenes/by-id/{id}/status`**: the scene's `state` (`RUNNING`, `STOPPED`, or `FAILED` with `errors`), its hop limit, and per node:
   - the plugin's state (`LAUNCHING`, `WAITING`, `RUNNING`, `DISCONNECTED`, `UNHEALTHY`, `STOPPING`, `STOPPED`, `FAILED`), its pid, launches and last error;
   - `counters`: `emitted` (events the plugin produced), `received` (events delivered to it), `dropped`, `mapping_errors`, `restarts`;
-  - the inbound `queue`: depth in events and bytes, drops by reason, time producers spent blocked (`blocked_ms`), delivery (`in_flight`, `redelivered`, `nacked`, `dead_lettered`), and disk details (`spill`, `durable`, on disk, written, refilled, whether the free-space guard is holding writes).
-- **`GET /api/status`**: the server at a glance: every scene the director has handled since it started (state, node counts), the hub's address, and memory and disk in use against their limits (the hub-wide queue budget, spill memory, spool files).
+  - the inbound `queue`: depth in events and bytes, drops by reason, time producers spent blocked (`blocked_ms`), delivery (`in_flight`, `redelivered`, `nacked`, `dead_lettered`), and disk details (`spill`, `durable`, on disk, written, refilled, whether the free-space guard is holding writes);
+  - the plugin's `link`, for spotting slow links and setup problems: `heartbeats` (`last_rtt_ms`, the latest round trip of the hub's `PING`; `answered`; `missed`, not answered within three heartbeat intervals; `unexpected`, `PONG`s with a nonce the hub didn't send) and `connections` (`accepted`; `rejected`, declarations that don't match the node; `replaced` by a newer connection, e.g. two plugins started with the same id; and lost ones by cause: `closed_by_plugin` without `Exit`, `timed_out`, `io_errors` such as resets, `protocol_violations`). Closes the hub asks for (stop, reload, token renewal) aren't counted.
+- **`GET /api/status`**: the server at a glance: every scene the director has handled since it started (state, node counts), the hub's address and `hub_connections` (open now, still in their handshake, closed at once for the pending limits, handshakes that failed before reaching a node: bad or late `Initialize`, TLS, unknown id, wrong credentials), and memory and disk in use against their limits (the hub-wide queue budget, spill memory, spool files).
 
 Counters start at zero when a node starts: when its scene starts, or when a reload restarts that node. Nodes a reload leaves running keep counting.
 
@@ -242,7 +245,7 @@ The same stats can be exported continuously. Sinks are configured in `[telemetry
   # service_name = "flwrs"; service_instance_id = "plant-7"; resource = { "deployment.environment" = "edge" }
   ```
 
-  Unset keys fall back to the standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `…_HEADERS`, `…_TIMEOUT`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`). Metrics are named `flwrs.node.events.emitted`, `flwrs.node.queue.depth`, `flwrs.hub.queued_memory.usage` and so on, labelled `scene.id`, `node.id`, `plugin.id`, `plugin.version`; counters are monotonic sums, gauges are gauges. A collector that's unreachable only produces warnings; the server keeps running. gRPC isn't supported (use the collector's HTTP port, 4318).
+  Unset keys fall back to the standard `OTEL_*` environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `…_HEADERS`, `…_TIMEOUT`, `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`). Metrics are named `flwrs.node.events.emitted`, `flwrs.node.queue.depth`, `flwrs.node.heartbeat.rtt`, `flwrs.node.connections.lost.timed_out`, `flwrs.hub.connections.open`, `flwrs.hub.queued_memory.usage` and so on (the full list is `ALL` in `app/src/modules/telemetry/samples.rs`), labelled `scene.id`, `node.id`, `plugin.id`, `plugin.version`; counters are monotonic sums, gauges are gauges. A collector that's unreachable only produces warnings; the server keeps running. gRPC isn't supported (use the collector's HTTP port, 4318).
 - **Local files** (`[[telemetry.file]]`, the `telemetry-file` feature): stats written to a folder, one file per time partition (a day by default), in a format that common tools read. Add one entry per format you want; several formats can share a folder.
 
   ```toml

@@ -66,6 +66,7 @@ mod tests {
                 Some(DirectorCommand::Overview { reply }) => {
                     let _ = reply.send(Overview {
                         hub_address: "127.0.0.1:7400".into(),
+                        hub_connections: Default::default(),
                         queued_memory: Usage {
                             used_bytes: 10,
                             limit_bytes: 100,

@@ -3,6 +3,8 @@
 //! uses it through [`Hub::expect`] and [`NodeLink`].
 
 mod config;
+mod link_stats;
+mod pending;
 mod service;
 #[cfg(feature = "remote")]
 mod tls;
@@ -13,6 +15,9 @@ mod tls_tests;
 pub(crate) mod wire;
 
 pub(crate) use config::HubConfig;
+pub(crate) use link_stats::{HubConnections, LinkReport};
+#[cfg(test)]
+pub(crate) use link_stats::{ConnectionStats, HeartbeatStats};
 pub(crate) use service::{
     ExpectedNode, Hub, HubError, HubEvent, LinkSender, NodeAuth, NodeLink, Routed,
 };

@@ -2,6 +2,7 @@
 //! ask it to (re)load or stop a scene's workflow.
 
 use super::running::NodeReport;
+use crate::modules::hub::HubConnections;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -42,6 +43,8 @@ pub(crate) enum SceneState {
 pub(crate) struct Overview {
     /// Where plugins connect.
     pub hub_address: String,
+    /// The hub's connections now, and its refusals so far.
+    pub hub_connections: HubConnections,
     /// The hub-wide budget for queued events (`[hub] max_inflight_bytes`).
     pub queued_memory: Usage,
     /// Spilling queues' memory (`[director] memory_soft_inflight_bytes`, a soft limit).
