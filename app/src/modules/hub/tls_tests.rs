@@ -41,7 +41,9 @@ impl Pki {
     fn new() -> Self {
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.distinguished_name.push(DnType::CommonName, "flwrs test CA");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "flwrs test CA");
         let ca = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("ca.pem"), ca.pem()).unwrap();

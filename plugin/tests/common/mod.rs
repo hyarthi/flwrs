@@ -104,7 +104,11 @@ impl FakeHub {
     }
 
     /// Sends a data event with the next seq; returns the seq.
-    pub async fn send_event(&mut self, payload: PluginPayload, metadata: Option<EventMetadata>) -> u64 {
+    pub async fn send_event(
+        &mut self,
+        payload: PluginPayload,
+        metadata: Option<EventMetadata>,
+    ) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
         let header = FrameHeader {

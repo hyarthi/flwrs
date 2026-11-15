@@ -88,7 +88,9 @@ impl DataEvent {
 
     /// Decodes the payload (for a mapping).
     pub(crate) fn payload(&self) -> Result<PluginPayload, prost::DecodeError> {
-        Ok(Event::decode(self.body.clone())?.payload.unwrap_or_default())
+        Ok(Event::decode(self.body.clone())?
+            .payload
+            .unwrap_or_default())
     }
 
     /// The body size, which queue limits count.

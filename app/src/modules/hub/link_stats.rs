@@ -214,7 +214,10 @@ impl Pings {
         }
         outstanding.push_back((nonce, now));
         if missed > 0 {
-            self.node.heartbeats.missed.fetch_add(missed, Ordering::Relaxed);
+            self.node
+                .heartbeats
+                .missed
+                .fetch_add(missed, Ordering::Relaxed);
         }
     }
 
@@ -232,11 +235,20 @@ impl Pings {
             Some(sent) => {
                 let rtt = now.saturating_duration_since(sent);
                 let micros = u64::try_from(rtt.as_micros()).unwrap_or(NO_RTT - 1);
-                self.node.heartbeats.last_rtt.store(micros, Ordering::Relaxed);
-                self.node.heartbeats.answered.fetch_add(1, Ordering::Relaxed);
+                self.node
+                    .heartbeats
+                    .last_rtt
+                    .store(micros, Ordering::Relaxed);
+                self.node
+                    .heartbeats
+                    .answered
+                    .fetch_add(1, Ordering::Relaxed);
             }
             None => {
-                self.node.heartbeats.unexpected.fetch_add(1, Ordering::Relaxed);
+                self.node
+                    .heartbeats
+                    .unexpected
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }

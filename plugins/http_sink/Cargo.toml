@@ -20,3 +20,4 @@ bytes.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+flwrs-trellis.workspace = true # tests/trellis.rs: audit and behaviour tests

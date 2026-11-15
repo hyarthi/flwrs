@@ -26,6 +26,5 @@ pub trait Transform {
     /// An error is logged and the input is rejected: the hub delivers it
     /// again later if the error is [`TransformError::retryable`], and gives
     /// up on it otherwise. The transform keeps running either way.
-    fn process_event(&mut self, event: InboundEvent)
-    -> Result<Vec<PluginPayload>, TransformError>;
+    fn process_event(&mut self, event: InboundEvent) -> Result<Vec<PluginPayload>, TransformError>;
 }

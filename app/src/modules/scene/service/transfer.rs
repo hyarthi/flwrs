@@ -3,10 +3,10 @@
 //! this server lacks the plugins it names: those show up as problems in
 //! [`Service::check`] until they're installed.
 
-use crate::modules::node_config::SceneDefaults;
 use super::query_sqlite::{self, EdgeValues, NodeValues};
 use super::*;
 use crate::modules::node_config::LaunchMode;
+use crate::modules::node_config::SceneDefaults;
 use crate::modules::plugin::manifest::is_valid_id;
 use crate::modules::scene::scene_file::{self, pb};
 use std::collections::HashSet;

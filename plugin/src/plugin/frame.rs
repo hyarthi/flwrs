@@ -170,9 +170,7 @@ pub fn encode_frame(header: &FrameHeader, body: &[u8]) -> Vec<u8> {
     packet.extend_from_slice(&(packet_len as u32).to_le_bytes());
     packet.push(FRAMING_VERSION);
     packet.extend_from_slice(&(header_len as u32).to_le_bytes());
-    header
-        .encode(&mut packet)
-        .expect("a Vec grows as needed");
+    header.encode(&mut packet).expect("a Vec grows as needed");
     packet.extend_from_slice(body);
     packet
 }
@@ -221,7 +219,10 @@ pub enum LimitedFrame {
     Frame(Frame),
     /// The body was larger than the limit. It was read and discarded without
     /// being buffered, so the stream stays in sync.
-    Oversized { header: FrameHeader, body_len: usize },
+    Oversized {
+        header: FrameHeader,
+        body_len: usize,
+    },
 }
 
 /// Reads one frame, but skips bodies larger than `max_body` bytes instead of
@@ -325,7 +326,12 @@ mod tests {
         send.advance();
         assert_eq!(send.peek(), None, "used up: reconnect");
         receive.accept(u64::MAX).unwrap();
-        assert!(receive.accept(0).unwrap_err().contains("should have reconnected"));
+        assert!(
+            receive
+                .accept(0)
+                .unwrap_err()
+                .contains("should have reconnected")
+        );
         assert!(receive.accept(1).is_err(), "no wrap-around");
     }
 
@@ -436,13 +442,34 @@ mod tests {
         }
         .encode_to_vec();
         let cases: Vec<(Vec<u8>, &str)> = vec![
-            (raw_frame(1, &[0x08, 0x0b], b""), "unsupported framing version 1"),
-            (raw_frame(3, &[0x08, 0x0b], b""), "unsupported framing version 3"),
-            (raw_frame(FRAMING_VERSION, &[], b""), "without a message code"),
-            (raw_frame(FRAMING_VERSION, &[0x08, 0x00], b""), "without a message code"),
-            (raw_frame(FRAMING_VERSION, &[0x08, 0x63], b""), "unknown message code 99"),
-            (raw_frame(FRAMING_VERSION, &[0xff, 0xff], b""), "invalid frame header"),
-            (raw_frame(FRAMING_VERSION, &flags, b""), "unknown frame flags"),
+            (
+                raw_frame(1, &[0x08, 0x0b], b""),
+                "unsupported framing version 1",
+            ),
+            (
+                raw_frame(3, &[0x08, 0x0b], b""),
+                "unsupported framing version 3",
+            ),
+            (
+                raw_frame(FRAMING_VERSION, &[], b""),
+                "without a message code",
+            ),
+            (
+                raw_frame(FRAMING_VERSION, &[0x08, 0x00], b""),
+                "without a message code",
+            ),
+            (
+                raw_frame(FRAMING_VERSION, &[0x08, 0x63], b""),
+                "unknown message code 99",
+            ),
+            (
+                raw_frame(FRAMING_VERSION, &[0xff, 0xff], b""),
+                "invalid frame header",
+            ),
+            (
+                raw_frame(FRAMING_VERSION, &flags, b""),
+                "unknown frame flags",
+            ),
         ];
         for (bytes, expected) in cases {
             let err = rejected(&bytes).await;
@@ -458,7 +485,11 @@ mod tests {
         let mut bytes = ((4 + header.len()) as u32).to_le_bytes().to_vec();
         bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
         bytes.extend_from_slice(header);
-        assert!(rejected(&bytes).await.contains("unsupported framing version"));
+        assert!(
+            rejected(&bytes)
+                .await
+                .contains("unsupported framing version")
+        );
     }
 
     #[tokio::test]
@@ -511,7 +542,9 @@ mod tests {
     #[tokio::test]
     async fn truncated_frame_is_an_error_not_a_clean_close() {
         let frame = encode_frame(&header(MsgCode::Event), b"body");
-        let err = read_frame(&mut &frame[..frame.len() - 1]).await.unwrap_err();
+        let err = read_frame(&mut &frame[..frame.len() - 1])
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

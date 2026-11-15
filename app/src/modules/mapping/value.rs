@@ -586,7 +586,9 @@ mod tests {
     #[test]
     fn packed_arrays_round_trip_and_convert() {
         let packed = Value::Packed(Packed::F32(vec![0.5, -2.0]));
-        let payload = Value::Object(vec![("v".into(), packed.clone())]).into_payload().unwrap();
+        let payload = Value::Object(vec![("v".into(), packed.clone())])
+            .into_payload()
+            .unwrap();
         assert_eq!(
             Value::from_payload(&payload),
             Value::Object(vec![("v".into(), packed.clone())])
@@ -607,7 +609,10 @@ mod tests {
             coerce(ints.clone(), &def(FieldType::PackedI32)).unwrap(),
             Value::Packed(Packed::I32(vec![1, -3]))
         );
-        assert!(coerce(ints, &def(FieldType::PackedU32)).is_err(), "-3 isn't a u32");
+        assert!(
+            coerce(ints, &def(FieldType::PackedU32)).is_err(),
+            "-3 isn't a u32"
+        );
         assert_eq!(
             from_json(&json!([1, 2.5]), Some(&def(FieldType::PackedF64))).unwrap(),
             Value::Packed(Packed::F64(vec![1.0, 2.5]))

@@ -174,4 +174,3 @@ impl ClientCertVerifier for AnyClientCert {
         self.algorithms.supported_schemes()
     }
 }
-

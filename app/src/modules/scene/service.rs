@@ -11,8 +11,8 @@ use crate::modules::plugin::service::{
 use crate::modules::scene::graph;
 use chrono::Local;
 use flwrs_core::db::{Database, DbError};
-use flwrs_plugin::schema::rules;
 use flwrs_plugin::schema::payload::SchemaDefinition;
+use flwrs_plugin::schema::rules;
 use query_sqlite::{EdgeValues, NodeValues};
 use serde_json::Value;
 use sqlx::Connection;
@@ -399,10 +399,13 @@ impl Service {
                     ));
                     // What doesn't depend on the plugin can still be listed.
                     check.problems.extend(
-                        [node.config.missing_token(&defaults), node.config.unsupported()]
-                            .into_iter()
-                            .flatten()
-                            .map(|p| format!("{label}: {p}")),
+                        [
+                            node.config.missing_token(&defaults),
+                            node.config.unsupported(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .map(|p| format!("{label}: {p}")),
                     );
                     continue;
                 }
@@ -1299,7 +1302,9 @@ pub(crate) mod tests {
             panic!("expected Invalid, got {err:?}");
         };
         assert!(
-            problems.iter().any(|p| p.contains("built without the remote feature")),
+            problems
+                .iter()
+                .any(|p| p.contains("built without the remote feature")),
             "{problems:?}"
         );
     }

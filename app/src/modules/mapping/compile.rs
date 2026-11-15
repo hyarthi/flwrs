@@ -4,8 +4,8 @@
 use super::path::Path;
 use super::value::{self, Value, convertible};
 use super::{MappingMode, MappingSpec};
-use flwrs_plugin::schema::protocol::EventMetadata;
 use flwrs_plugin::schema::payload::{PluginPayload, SchemaDefinition};
+use flwrs_plugin::schema::protocol::EventMetadata;
 use std::sync::Arc;
 
 /// A compiled mapping: dot-notation rules, plus Lua rules,
@@ -374,8 +374,8 @@ impl LuaParts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flwrs_plugin::schema::rules::parse_json;
     use flwrs_plugin::schema::payload::{Field, FieldValue, field_value::Value as Pb};
+    use flwrs_plugin::schema::rules::parse_json;
     use serde_json::json;
 
     fn spec(json: serde_json::Value) -> MappingSpec {

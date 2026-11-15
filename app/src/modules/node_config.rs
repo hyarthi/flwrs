@@ -73,14 +73,22 @@ pub(crate) struct NodeTls {
 /// How the hub checks a remote node's plugin, all defaults applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EffectiveAuth {
-    Token { require_tls: bool },
+    Token {
+        require_tls: bool,
+    },
     /// `pin`: a normalised (lower-case hex, no colons) SHA-256 fingerprint.
-    Mtls { pin: Option<String> },
+    Mtls {
+        pin: Option<String>,
+    },
 }
 
 /// A SHA-256 fingerprint in hex (colons and case ignored), normalised.
 pub(crate) fn normalize_fingerprint(pin: &str) -> Option<String> {
-    let hex: String = pin.chars().filter(|c| *c != ':').collect::<String>().to_ascii_lowercase();
+    let hex: String = pin
+        .chars()
+        .filter(|c| *c != ':')
+        .collect::<String>()
+        .to_ascii_lowercase();
     (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hex)
 }
 
@@ -394,7 +402,10 @@ impl NodeConfig {
                         "config.launch_args is only used for local nodes; a remote plugin gets its arguments from whoever starts it".into(),
                     );
                 }
-                if let Some(pin) = self.tls.as_ref().and_then(|t| t.client_cert_sha256.as_ref())
+                if let Some(pin) = self
+                    .tls
+                    .as_ref()
+                    .and_then(|t| t.client_cert_sha256.as_ref())
                     && normalize_fingerprint(pin).is_none()
                 {
                     errors.push(
@@ -507,7 +518,8 @@ mod tests {
             token_node.effective_auth(&mtls_scene, true),
             EffectiveAuth::Mtls { pin: None }
         );
-        let back_to_token = parse(json!({"launch": "remote", "auth": "token", "token": "a-long-enough-token"}));
+        let back_to_token =
+            parse(json!({"launch": "remote", "auth": "token", "token": "a-long-enough-token"}));
         assert_eq!(
             back_to_token.effective_auth(&mtls_scene, true),
             EffectiveAuth::Token { require_tls: false }
@@ -516,8 +528,16 @@ mod tests {
         let mtls = parse(json!({"launch": "remote", "auth": "mtls",
             "tls": {"client_cert_sha256": "AB:".repeat(31) + "AB"}}));
         assert_eq!(mtls.missing_token(&none), None);
-        assert!(parse(json!({"launch": "remote"})).missing_token(&none).is_some());
-        assert!(parse(json!({"launch": "remote"})).missing_token(&mtls_scene).is_none());
+        assert!(
+            parse(json!({"launch": "remote"}))
+                .missing_token(&none)
+                .is_some()
+        );
+        assert!(
+            parse(json!({"launch": "remote"}))
+                .missing_token(&mtls_scene)
+                .is_none()
+        );
         assert_eq!(
             mtls.effective_auth(&none, true),
             EffectiveAuth::Mtls {
@@ -536,7 +556,10 @@ mod tests {
                 .contains("64 hex digits")
         );
         assert!(NodeConfig::parse(&json!({"launch": "remote", "auth": "password"})).is_err());
-        assert_eq!(normalize_fingerprint(&"0F".repeat(32)), Some("0f".repeat(32)));
+        assert_eq!(
+            normalize_fingerprint(&"0F".repeat(32)),
+            Some("0f".repeat(32))
+        );
         assert_eq!(normalize_fingerprint("0f"), None);
     }
 
@@ -565,7 +588,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cfg.runtime.when_full(), Some(WhenFull::DropOldest));
-        assert!(cfg.validate(&no_schema(), &SceneDefaults::default()).is_empty());
+        assert!(
+            cfg.validate(&no_schema(), &SceneDefaults::default())
+                .is_empty()
+        );
         assert_eq!(
             NodeConfig::parse(&Value::Null).unwrap(),
             NodeConfig::default()
@@ -584,7 +610,10 @@ mod tests {
             NodeConfig::parse(&config).unwrap()
         };
         let cfg = remote(json!({"remote_id": "plant-7:sensor_gw.1"}));
-        assert!(cfg.validate(&no_schema(), &SceneDefaults::default()).is_empty());
+        assert!(
+            cfg.validate(&no_schema(), &SceneDefaults::default())
+                .is_empty()
+        );
         assert_eq!(cfg.instance_id("node-1"), "plant-7:sensor_gw.1");
         assert_eq!(
             remote(json!({})).instance_id("node-1"),
@@ -597,14 +626,18 @@ mod tests {
             "ünïcode",
             &"x".repeat(MAX_REMOTE_ID_LEN + 1),
         ] {
-            let errors = remote(json!({"remote_id": bad})).validate(&no_schema(), &SceneDefaults::default());
+            let errors =
+                remote(json!({"remote_id": bad})).validate(&no_schema(), &SceneDefaults::default());
             assert!(
                 errors[0].contains("config.remote_id must be"),
                 "{bad:?}: {errors:?}"
             );
         }
         let local = NodeConfig::parse(&json!({"remote_id": "x"})).unwrap();
-        assert!(local.validate(&no_schema(), &SceneDefaults::default())[0].contains("only for remote nodes"));
+        assert!(
+            local.validate(&no_schema(), &SceneDefaults::default())[0]
+                .contains("only for remote nodes")
+        );
         assert_eq!(local.instance_id("node-1"), "node-1");
 
         // An import accepts a remote node without its token; enabling doesn't.
@@ -660,14 +693,19 @@ mod tests {
     #[test]
     fn launch_mode_rules() {
         let local_with_token = NodeConfig::parse(&json!({"token": "x".repeat(20)})).unwrap();
-        assert!(local_with_token.validate(&no_schema(), &SceneDefaults::default())[0].contains("only for remote nodes"));
+        assert!(
+            local_with_token.validate(&no_schema(), &SceneDefaults::default())[0]
+                .contains("only for remote nodes")
+        );
 
         let remote = |extra: Value| {
             let mut cfg = json!({"launch": "remote"});
             cfg.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            NodeConfig::parse(&cfg).unwrap().validate(&no_schema(), &SceneDefaults::default())
+            NodeConfig::parse(&cfg)
+                .unwrap()
+                .validate(&no_schema(), &SceneDefaults::default())
         };
         assert!(remote(json!({}))[0].contains("token is required"));
         assert!(remote(json!({"token": "short"}))[0].contains("at least 16"));

@@ -443,7 +443,8 @@ impl Hub {
                 }
             };
             #[cfg(not(feature = "remote"))]
-            let tls_accept = std::future::pending::<std::io::Result<((TcpStream, SocketAddr), ())>>();
+            let tls_accept =
+                std::future::pending::<std::io::Result<((TcpStream, SocketAddr), ())>>();
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 accepted = listener.accept() => match accepted {
@@ -709,10 +710,13 @@ fn credentials_match(expected: &ExpectedNode, init: &InitInfo, transport: &Trans
         NodeAuth::Token { token, require_tls } => {
             (transport.tls || !require_tls) && tokens_match(token, &init.token)
         }
-        NodeAuth::Mtls { pin } => transport.client_cert.as_ref().is_some_and(|cert| match pin {
-            Some(pin) => tokens_match(pin, &cert.sha256),
-            None => cert.ca_verified && cert.names.contains(&expected.instance_id),
-        }),
+        NodeAuth::Mtls { pin } => transport
+            .client_cert
+            .as_ref()
+            .is_some_and(|cert| match pin {
+                Some(pin) => tokens_match(pin, &cert.sha256),
+                None => cert.ca_verified && cert.names.contains(&expected.instance_id),
+            }),
     }
 }
 
@@ -883,7 +887,11 @@ fn describe(transport: &Transport) -> String {
             "TLS, client certificate {} for {:?}{}",
             cert.sha256,
             cert.names,
-            if cert.ca_verified { "" } else { ", not from the client CA" }
+            if cert.ca_verified {
+                ""
+            } else {
+                ", not from the client CA"
+            }
         ),
     }
 }
@@ -923,7 +931,15 @@ async fn serve_tls(
         tls: true,
         client_cert,
     };
-    serve_connection(inner, Box::new(reader), Box::new(writer), peer, transport, slot).await;
+    serve_connection(
+        inner,
+        Box::new(reader),
+        Box::new(writer),
+        peer,
+        transport,
+        slot,
+    )
+    .await;
 }
 
 /// The handshake's first frame: an `Initialize` within the timeout and size
@@ -944,7 +960,11 @@ async fn read_initialize(
     let frame = match first {
         Ok(Ok(Some(LimitedFrame::Frame(frame)))) => frame,
         Ok(Ok(Some(LimitedFrame::Oversized { body_len, .. }))) => {
-            stranger(inner, peer, format!("first frame too large ({body_len} bytes)"));
+            stranger(
+                inner,
+                peer,
+                format!("first frame too large ({body_len} bytes)"),
+            );
             return None;
         }
         Ok(Ok(None)) => {
@@ -956,12 +976,20 @@ async fn read_initialize(
             return None;
         }
         Err(_) => {
-            stranger(inner, peer, format!("no Initialize within {} ms", timeout.as_millis()));
+            stranger(
+                inner,
+                peer,
+                format!("no Initialize within {} ms", timeout.as_millis()),
+            );
             return None;
         }
     };
     if frame.code() != MsgCode::Initialize {
-        stranger(inner, peer, format!("first frame is {:?}, not Initialize", frame.code()));
+        stranger(
+            inner,
+            peer,
+            format!("first frame is {:?}, not Initialize", frame.code()),
+        );
         return None;
     }
     match frame.decode::<Initialize>() {
@@ -1096,7 +1124,9 @@ async fn serve_connection(
                     let limit = interval * MISSED_HEARTBEATS;
                     tokio::time::timeout(limit, read_frame_limited(&mut reader, max_event_bytes))
                         .await
-                        .map_err(|_| format!("nothing from the plugin for {} ms", limit.as_millis()))
+                        .map_err(|_| {
+                            format!("nothing from the plugin for {} ms", limit.as_millis())
+                        })
                 }
                 None => Ok(read_frame_limited(&mut reader, max_event_bytes).await),
             }
@@ -1124,7 +1154,10 @@ async fn serve_connection(
             Ok(false) => break None, // nobody's listening any more
             Err(violation) => {
                 log::error!("Hub: {tag} protocol violation: {violation}; closing the connection");
-                break Some((Lost::ProtocolViolation, format!("protocol violation: {violation}")));
+                break Some((
+                    Lost::ProtocolViolation,
+                    format!("protocol violation: {violation}"),
+                ));
             }
         }
     };
@@ -1262,7 +1295,8 @@ impl Running {
 
     /// A data frame larger than the event size limit: its body was skipped.
     async fn oversized(&mut self, header: FrameHeader, body_len: usize) -> Result<bool, String> {
-        if header.code() != MsgCode::Event || !wire::plugin_may_send(self.plugin_type, MsgCode::Event)
+        if header.code() != MsgCode::Event
+            || !wire::plugin_may_send(self.plugin_type, MsgCode::Event)
         {
             return Err(format!(
                 "{:?} of {body_len} bytes (limit {})",
@@ -1280,7 +1314,15 @@ impl Running {
             "event too large: {body_len} bytes, limit {}",
             self.max_event_bytes
         );
-        send_routed(&self.conn, seq, Routed::Rejected { reason, retry: false }).await;
+        send_routed(
+            &self.conn,
+            seq,
+            Routed::Rejected {
+                reason,
+                retry: false,
+            },
+        )
+        .await;
         Ok(true)
     }
 
@@ -1533,9 +1575,15 @@ mod unit_tests {
         };
         let both = vec![Capability::Acks, Capability::Credits];
         let sink = negotiate(&config, PluginType::Sink, &init(both.clone(), 0));
-        assert_eq!((sink.acks, sink.credits, sink.max_unacked), (true, false, 64));
+        assert_eq!(
+            (sink.acks, sink.credits, sink.max_unacked),
+            (true, false, 64)
+        );
         let source = negotiate(&config, PluginType::Source, &init(both.clone(), 5));
-        assert_eq!((source.acks, source.credits, source.max_unacked), (true, true, 0));
+        assert_eq!(
+            (source.acks, source.credits, source.max_unacked),
+            (true, true, 0)
+        );
         let transform = negotiate(&config, PluginType::Transform, &init(both, 100_000));
         assert_eq!(transform.max_unacked, 1024);
         let plain = negotiate(&config, PluginType::Transform, &init(vec![], 8));

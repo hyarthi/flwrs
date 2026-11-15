@@ -16,8 +16,8 @@
 mod durable;
 mod spill;
 
-pub(crate) use durable::{DurableSettings, delete_files, purge_files};
 use durable::{DurableCore, Push};
+pub(crate) use durable::{DurableSettings, delete_files, purge_files};
 
 use crate::modules::hub::wire::DataEvent;
 use crate::modules::node_config::WhenFull;
@@ -528,7 +528,11 @@ impl NodeQueue {
 
     /// [`NodeQueue::push`]; for a durable queue, also the ticket to wait on
     /// ([`NodeQueue::committed`]) before the event counts as stored.
-    pub(crate) async fn push_tracked(&self, event: DataEvent, size: usize) -> (Pushed, Option<u64>) {
+    pub(crate) async fn push_tracked(
+        &self,
+        event: DataEvent,
+        size: usize,
+    ) -> (Pushed, Option<u64>) {
         let started = Instant::now();
         let settings = self.settings();
         let when_full = settings.when_full;
@@ -658,7 +662,12 @@ impl NodeQueue {
     /// evicted events' budget permits pass straight to the new event, under
     /// the queue's lock, so no other queue can take the freed room in
     /// between. Nothing is evicted unless the event then fits.
-    fn push_memory_evicting(&self, event: DataEvent, size: usize, settings: &QueueSettings) -> Pushed {
+    fn push_memory_evicting(
+        &self,
+        event: DataEvent,
+        size: usize,
+        settings: &QueueSettings,
+    ) -> Pushed {
         let semaphore = &self.budget.semaphore;
         {
             // Declared before the lock, so they're dropped after it: the evicted
@@ -671,8 +680,9 @@ impl NodeQueue {
                 return Pushed::Dropped(DropReason::Closed);
             }
             let (len, bytes) = (state.items.len() as u64, state.bytes as u64);
-            let own_limits =
-                |n: u64, freed: u64| memory_fits(settings, (len - n) as usize, (bytes - freed) as usize, size);
+            let own_limits = |n: u64, freed: u64| {
+                memory_fits(settings, (len - n) as usize, (bytes - freed) as usize, size)
+            };
             // A snapshot: another queue may take budget meanwhile, which the
             // reservation below catches.
             let available = semaphore.available_permits() as u64;
@@ -700,7 +710,9 @@ impl NodeQueue {
                     permit.merge(p);
                 }
             }
-            let mine = permit.split(size).expect("the shortfall and evictions cover the event");
+            let mine = permit
+                .split(size)
+                .expect("the shortfall and evictions cover the event");
             _spare = permit;
             state.bytes += size;
             let epoch = state.epoch;

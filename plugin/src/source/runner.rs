@@ -69,15 +69,8 @@ impl<T: Source> SourceRunner<T> {
             let mut session = open_session(&self.client, &init, &mut backoff).await;
             let mut end = await_accept(&mut session, &mut backoff).await;
             if end.is_none() {
-                end = Some(
-                    run_source(
-                        &self.plugin,
-                        &self.client,
-                        &mut session,
-                        &mut finished,
-                    )
-                    .await,
-                );
+                end =
+                    Some(run_source(&self.plugin, &self.client, &mut session, &mut finished).await);
             }
             match end {
                 Some(SessionEnd::Disconnected) | None => {

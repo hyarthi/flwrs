@@ -87,12 +87,10 @@ async fn clean_spool_dir(engine: &Engine) {
             continue;
         }
         match engine.scenes.snapshot(&scene_id).await {
-            Err(ServiceError::NotFound(_)) => {
-                match tokio::fs::remove_dir_all(&path).await {
-                    Ok(()) => removed += 1,
-                    Err(err) => log::warn!("Director: couldn't remove {}: {err}", path.display()),
-                }
-            }
+            Err(ServiceError::NotFound(_)) => match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => removed += 1,
+                Err(err) => log::warn!("Director: couldn't remove {}: {err}", path.display()),
+            },
             Ok(snapshot) => {
                 let Ok(mut files) = tokio::fs::read_dir(&path).await else {
                     continue;

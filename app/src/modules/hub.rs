@@ -6,18 +6,18 @@ mod config;
 mod link_stats;
 mod pending;
 mod service;
-#[cfg(feature = "remote")]
-mod tls;
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "remote")]
+mod tls;
 #[cfg(all(test, feature = "remote"))]
 mod tls_tests;
 pub(crate) mod wire;
 
 pub(crate) use config::HubConfig;
-pub(crate) use link_stats::{HubConnections, LinkReport};
 #[cfg(test)]
 pub(crate) use link_stats::{ConnectionStats, HeartbeatStats};
+pub(crate) use link_stats::{HubConnections, LinkReport};
 pub(crate) use service::{
     ExpectedNode, Hub, HubError, HubEvent, LinkSender, NodeAuth, NodeLink, Routed,
 };

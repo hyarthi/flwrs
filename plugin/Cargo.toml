@@ -6,7 +6,7 @@ homepage = "https://github.com/hyarthi/flwrs"
 documentation = "https://docs.rs/flwrs-plugin"
 keywords = ["flwrs", "workflow", "plugin", "dataflow", "protobuf"]
 categories = ["network-programming", "development-tools"]
-version = "0.0.3" # published on its own; the other crates follow the workspace version
+version = "0.0.4" # published on its own; the other crates follow the workspace version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,6 +14,9 @@ repository.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+all-features = true # document `package` too
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -33,15 +36,21 @@ serde.workspace = true
 serde_json.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
+jsonschema = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
 
 [features]
 default = ["tls"]
 # Connecting to the hub's TLS listener (remote plugins), with an optional
 # client certificate (mTLS). Plugins that only ever run locally can leave it out.
 tls = ["dep:rustls", "dep:tokio-rustls"]
+# Plugin packages: the manifest model and validation, launch-args rules and
+# the ZIP checks, shared by the server and flwrs-trellis.
+package = ["dep:jsonschema", "dep:zip"]
 
 [dev-dependencies]
 rcgen.workspace = true # test certificates
+tempfile.workspace = true # package tests
 
 [build-dependencies]
 prost-build.workspace = true

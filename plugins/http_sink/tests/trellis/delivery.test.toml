@@ -1,0 +1,19 @@
+# How http_sink answers the hub, by HTTP outcome. `${mock}` is the port of the
+# mock server tests/trellis.rs starts.
+name = "acks by HTTP outcome"
+
+[[steps]]
+send = "payloads/ok.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/busy.json"
+expect_ack = { nack = { retryable = true } }
+
+[[steps]]
+send = "payloads/bad.json"
+expect_ack = { nack = { retryable = false } }
+
+[[steps]]
+redeliver = 1
+expect_ack = "ack"

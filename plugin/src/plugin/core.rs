@@ -1,10 +1,10 @@
 use crate::plugin::frame::PROTOCOL_VERSION;
 use crate::plugin::msg_client::{Connector, HubClient};
+use crate::schema::payload::PluginPayload;
 use crate::schema::payload::{
     FieldDefinition as PbFieldDefinition, SchemaDefinition as PbSchemaDefinition,
     field_type::Enum as FieldType,
 };
-use crate::schema::payload::PluginPayload;
 use crate::schema::protocol::{
     EventMetadata, Initialize, capability::Enum as Capability, plugin_type::Enum as PluginType,
 };

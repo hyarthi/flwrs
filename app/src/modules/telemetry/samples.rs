@@ -151,10 +151,18 @@ pub(crate) fn from_snapshot(snapshot: &StatsSnapshot, time: SystemTime) -> Sampl
             push(CONNECTIONS_ACCEPTED, labels.clone(), c.accepted);
             push(CONNECTIONS_REJECTED, labels.clone(), c.rejected);
             push(CONNECTIONS_REPLACED, labels.clone(), c.replaced);
-            push(CONNECTIONS_CLOSED_BY_PLUGIN, labels.clone(), c.closed_by_plugin);
+            push(
+                CONNECTIONS_CLOSED_BY_PLUGIN,
+                labels.clone(),
+                c.closed_by_plugin,
+            );
             push(CONNECTIONS_TIMED_OUT, labels.clone(), c.timed_out);
             push(CONNECTIONS_IO_ERRORS, labels.clone(), c.io_errors);
-            push(CONNECTIONS_VIOLATIONS, labels.clone(), c.protocol_violations);
+            push(
+                CONNECTIONS_VIOLATIONS,
+                labels.clone(),
+                c.protocol_violations,
+            );
             if let Some(q) = &node.queue {
                 push(QUEUE_DEPTH, labels.clone(), q.len as u64 + q.disk_len);
                 push(QUEUE_BYTES, labels.clone(), q.bytes as u64 + q.disk_bytes);
@@ -296,7 +304,10 @@ mod tests {
         assert_eq!(value("flwrs.node.heartbeat.rtt").unwrap().1, 1.5);
         assert_eq!(value("flwrs.node.heartbeat.missed").unwrap().1, 1.0);
         assert_eq!(value("flwrs.node.connections.accepted").unwrap().1, 3.0);
-        assert_eq!(value("flwrs.node.connections.lost.timed_out").unwrap().1, 2.0);
+        assert_eq!(
+            value("flwrs.node.connections.lost.timed_out").unwrap().1,
+            2.0
+        );
         assert_eq!(value("flwrs.hub.connections.open"), Some((vec![], 1.0)));
         assert_eq!(value("flwrs.hub.connections.pending").unwrap().1, 2.0);
         assert_eq!(value("flwrs.hub.connections.refused_busy").unwrap().1, 3.0);

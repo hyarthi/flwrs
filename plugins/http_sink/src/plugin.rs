@@ -1,12 +1,12 @@
 use crate::schema::build_schema;
 use crate::schema::{BODY_KEY, HEADERS_KEY, METHOD_KEY, URL_KEY};
 use bytes::Bytes;
+use flwrs_plugin::plugin::core::InboundEvent;
 use flwrs_plugin::plugin::core::InitializeRequest;
 use flwrs_plugin::plugin::error::{InitializeError, ShutdownError, SinkError};
-use flwrs_plugin::schema::protocol::log_level::Enum as LogLevel;
 use flwrs_plugin::schema::payload::field_value::Value;
-use flwrs_plugin::plugin::core::InboundEvent;
 use flwrs_plugin::schema::payload::{Field, PluginPayload};
+use flwrs_plugin::schema::protocol::log_level::Enum as LogLevel;
 use flwrs_plugin::sink::plugin::Sink;
 use reqwest::{Client, ClientBuilder, Method, RequestBuilder};
 use std::collections::HashMap;

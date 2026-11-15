@@ -20,10 +20,10 @@
 //! an empty `{}` becomes an array or a map as the target field says.
 
 use super::value::{self, Value};
-use flwrs_plugin::schema::protocol::EventMetadata;
 use flwrs_plugin::schema::payload::{
     FieldDefinition, SchemaDefinition, field_type::Enum as FieldType,
 };
+use flwrs_plugin::schema::protocol::EventMetadata;
 use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
 use pbjson_types::Timestamp;
 use std::collections::BTreeMap;
@@ -502,8 +502,8 @@ mod tests {
     use super::super::compile::{Schemas, compile};
     use super::super::{MappingSpec, path::Path};
     use super::*;
-    use flwrs_plugin::schema::rules::parse_json;
     use flwrs_plugin::schema::payload::PluginPayload;
+    use flwrs_plugin::schema::rules::parse_json;
     use serde_json::json;
 
     fn spec(json: serde_json::Value) -> MappingSpec {

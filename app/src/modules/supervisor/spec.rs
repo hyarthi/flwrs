@@ -3,13 +3,13 @@
 
 use crate::modules::hub::{ExpectedNode, NodeAuth};
 use crate::modules::node_config::{
-    EffectiveAuth, SceneDefaults,
-    LaunchMode, NodeConfig, QueueConfig, RuntimeConfig, SpillConfig, WhenFull,
+    EffectiveAuth, LaunchMode, NodeConfig, QueueConfig, RuntimeConfig, SceneDefaults, SpillConfig,
+    WhenFull,
 };
 use crate::modules::plugin::manifest::{self, PluginType};
 use crate::modules::plugin::service::Plugin;
-use flwrs_plugin::schema::rules;
 use flwrs_plugin::schema::payload::SchemaDefinition;
+use flwrs_plugin::schema::rules;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -128,7 +128,9 @@ impl DeliverySpec {
             max_attempts: n
                 .and_then(|x| x.max_attempts)
                 .or(d.and_then(|x| x.max_attempts))
-                .map_or(DEFAULT_MAX_ATTEMPTS, |v| u32::try_from(v).unwrap_or(u32::MAX)),
+                .map_or(DEFAULT_MAX_ATTEMPTS, |v| {
+                    u32::try_from(v).unwrap_or(u32::MAX)
+                }),
             retry_delay: Duration::from_millis(
                 n.and_then(|x| x.retry_delay_ms)
                     .or(d.and_then(|x| x.retry_delay_ms))
@@ -380,9 +382,8 @@ impl NodeSpec {
                     },
                     EffectiveAuth::Mtls { pin } => {
                         if !tls_available {
-                            errors.push(
-                                "auth mtls needs the hub's TLS listener ([hub.tls])".into(),
-                            );
+                            errors
+                                .push("auth mtls needs the hub's TLS listener ([hub.tls])".into());
                         }
                         Launch::Remote {
                             auth: NodeAuth::Mtls { pin },

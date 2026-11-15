@@ -1,12 +1,12 @@
 [package]
 name = "flwrs-trellis"
-description = "Developer toolkit for flwrs plugins: checks that a plugin (in any language) follows the plugin protocol"
+description = "Developer toolkit for flwrs plugins (any language): package, audit against the plugin protocol, test and benchmark"
 readme = "README.md"
 homepage = "https://github.com/hyarthi/flwrs"
 documentation = "https://docs.rs/flwrs-trellis"
-keywords = ["flwrs", "plugin", "conformance", "testing", "protocol"]
+keywords = ["flwrs", "plugin", "conformance", "testing", "benchmark"]
 categories = ["development-tools::testing", "command-line-utilities"]
-version = "0.0.1" # published on its own, like flwrs-plugin
+version = "0.0.2" # published on its own, like flwrs-plugin
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,12 +16,19 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-flwrs-plugin.workspace = true # framing, messages and schema rules
+# framing, messages and schema rules; the manifest model and package checks
+flwrs-plugin = { workspace = true, features = ["package"] }
 tokio.workspace = true
 prost.workspace = true
+pbjson-types.workspace = true # datetimes in test payloads
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 clap.workspace = true
 getrandom.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
+jsonschema.workspace = true # launch_args checks, as the server does them
+zip.workspace = true
+glob.workspace = true
+tempfile.workspace = true # unpacked packages
+hdrhistogram.workspace = true
+sysinfo.workspace = true

@@ -21,7 +21,9 @@ pub mod protocol {
 
 #[cfg(test)]
 mod tests {
-    use super::payload::{Field, FieldValue, PackedF32, PluginPayload, field_type, field_value::Value};
+    use super::payload::{
+        Field, FieldValue, PackedF32, PluginPayload, field_type, field_value::Value,
+    };
     use super::protocol::{capability, exit_code, log_level, msg_code, plugin_type};
     use prost::Message;
 

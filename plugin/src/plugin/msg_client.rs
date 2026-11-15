@@ -17,21 +17,20 @@
 //! checks the hub's sequence numbers and the liveness timeout. The runner only
 //! sees acceptance, `Shutdown` and incoming data events.
 
+use crate::plugin::core::{InboundEvent, InputRef};
 use crate::plugin::frame::{
     Frame, FrameError, SeqCounter, WireMessage, encode_frame, encode_message, read_frame,
 };
-use crate::plugin::core::{InboundEvent, InputRef};
 use crate::schema::payload::PluginPayload;
 use crate::schema::protocol::{
-    Ack, Credit, Event, FrameHeader, InitializeResponse, Nack, Ping, Pong,
-    Shutdown, capability::Enum as Capability, msg_code::Enum as MsgCode,
-    plugin_type::Enum as PluginType,
+    Ack, Credit, Event, FrameHeader, InitializeResponse, Nack, Ping, Pong, Shutdown,
+    capability::Enum as Capability, msg_code::Enum as MsgCode, plugin_type::Enum as PluginType,
 };
 use prost::Message;
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -340,7 +339,12 @@ impl HubClient {
         let Some(conn) = guard.as_mut().filter(|c| c.id == id) else {
             return;
         };
-        let done: Vec<u64> = conn.confirms.keys().copied().filter(|s| acked(*s)).collect();
+        let done: Vec<u64> = conn
+            .confirms
+            .keys()
+            .copied()
+            .filter(|s| acked(*s))
+            .collect();
         for seq in done {
             if let Some(tx) = conn.confirms.remove(&seq) {
                 let _ = tx.send(Ok(()));
@@ -482,10 +486,7 @@ async fn read_loop(
                 match tokio::time::timeout(limit, read_frame(reader)).await {
                     Ok(read) => read,
                     Err(_) => {
-                        return Err(format!(
-                            "nothing from the hub for {} ms",
-                            limit.as_millis()
-                        ));
+                        return Err(format!("nothing from the hub for {} ms", limit.as_millis()));
                     }
                 }
             }
@@ -498,7 +499,9 @@ async fn read_loop(
         };
         let code = frame.code();
         if !allowed(client.plugin_type, code) {
-            return Err(format!("protocol violation by the hub: unexpected {code:?}"));
+            return Err(format!(
+                "protocol violation by the hub: unexpected {code:?}"
+            ));
         }
         if !accepted && !matches!(code, MsgCode::InitializeResponse | MsgCode::Shutdown) {
             return Err(format!(
@@ -570,7 +573,10 @@ async fn read_loop(
 fn decode<M: WireMessage>(frame: &Frame) -> Result<M, String> {
     frame.decode::<M>().map_err(|err| match err {
         FrameError::Decode(e) => {
-            format!("protocol violation by the hub: undecodable {:?}: {e}", frame.code())
+            format!(
+                "protocol violation by the hub: undecodable {:?}: {e}",
+                frame.code()
+            )
         }
         other => other.to_string(),
     })

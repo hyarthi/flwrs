@@ -15,8 +15,8 @@ use flwrs_plugin::schema::payload::{
     field_value::Value,
 };
 use flwrs_plugin::schema::protocol::{
-    Ack, Credit, Event, EventMetadata, Exit, FrameHeader, Initialize, InitializeResponse,
-    LogEvent, Nack, Ping, Pong, Shutdown, capability::Enum as Capability, exit_code,
+    Ack, Credit, Event, EventMetadata, Exit, FrameHeader, Initialize, InitializeResponse, LogEvent,
+    Nack, Ping, Pong, Shutdown, capability::Enum as Capability, exit_code,
     msg_code::Enum as MsgCode, plugin_type::Enum as PbPluginType,
 };
 use prost::Message;
@@ -153,7 +153,9 @@ pub(super) struct FakePlugin {
 
 impl FakePlugin {
     pub(super) async fn connect(hub: &Hub) -> Self {
-        Self::over(Box::new(TcpStream::connect(hub.local_addr()).await.unwrap()))
+        Self::over(Box::new(
+            TcpStream::connect(hub.local_addr()).await.unwrap(),
+        ))
     }
 
     pub(super) fn over(stream: Box<dyn Io>) -> Self {
@@ -268,7 +270,11 @@ async fn accepts_a_valid_plugin_and_relays_both_directions() {
     let frame = plugin.recv().await.unwrap();
     assert_eq!(frame.code(), MsgCode::Event);
     assert_eq!(
-        (frame.header.seq, frame.header.attempt, frame.header.metadata.clone()),
+        (
+            frame.header.seq,
+            frame.header.attempt,
+            frame.header.metadata.clone()
+        ),
         (1, 1, Some(metadata))
     );
     let event: Event = frame.decode().unwrap();
@@ -324,7 +330,10 @@ async fn unknown_instance_and_wrong_token_get_shutdown_and_no_event() {
         plugin.send(&sink_init(id, token)).await;
         let reason = plugin.expect_shutdown().await;
         // Strangers learn nothing about which part was wrong.
-        assert_eq!(reason, "unknown instance id or wrong credentials", "{id}/{token}");
+        assert_eq!(
+            reason, "unknown instance id or wrong credentials",
+            "{id}/{token}"
+        );
     }
     assert_quiet(&mut link).await;
 }
@@ -354,7 +363,10 @@ async fn mismatched_declarations_are_rejected_with_reasons() {
         (wrong_version, "version: 1.0.0 in the registry"),
         (wrong_schema, "in.body: not in manifest"),
         (malformed, "in: "),
-        (old_protocol, "no common protocol version: the hub speaks 2..2, the plugin 1..1"),
+        (
+            old_protocol,
+            "no common protocol version: the hub speaks 2..2, the plugin 1..1",
+        ),
         (no_type, "type: UNDEFINED"),
         (
             init(PbPluginType::Source, "sink", TOKEN),
@@ -365,7 +377,10 @@ async fn mismatched_declarations_are_rejected_with_reasons() {
         let mut plugin = FakePlugin::connect(&hub.hub).await;
         plugin.send(&init).await;
         let reason = plugin.expect_shutdown().await;
-        assert!(reason.contains(expected_reason), "{expected_reason:?} not in {reason:?}");
+        assert!(
+            reason.contains(expected_reason),
+            "{expected_reason:?} not in {reason:?}"
+        );
         match next(&mut link).await {
             HubEvent::Rejected { reasons } => assert!(
                 reasons.iter().any(|r| r.contains(expected_reason)),
@@ -392,7 +407,10 @@ async fn negotiates_capabilities_by_plugin_type() {
     let (_sink, _, response) = connected(&hub.hub, &mut link, asked).await;
     // A sink produces nothing, so no credits; its window as asked.
     assert_eq!(response.capabilities, [Capability::Acks as i32]);
-    assert_eq!((response.max_unacked, response.heartbeat_interval_ms), (5, 1_000));
+    assert_eq!(
+        (response.max_unacked, response.heartbeat_interval_ms),
+        (5, 1_000)
+    );
 
     let mut link = hub.hub.expect(expected("src", PluginType::Source));
     let (mut source, _, response) = connected(
@@ -411,8 +429,12 @@ async fn negotiates_capabilities_by_plugin_type() {
     assert_eq!(credit.events, 4);
 
     let mut link = hub.hub.expect(expected("plain", PluginType::Transform));
-    let (_plain, _, response) =
-        connected(&hub.hub, &mut link, init(PbPluginType::Transform, "plain", TOKEN)).await;
+    let (_plain, _, response) = connected(
+        &hub.hub,
+        &mut link,
+        init(PbPluginType::Transform, "plain", TOKEN),
+    )
+    .await;
     assert!(response.capabilities.is_empty());
 }
 
@@ -432,7 +454,9 @@ async fn bad_first_frames_are_closed_without_reply() {
 
     // A hub -> plugin code.
     let mut plugin = FakePlugin::connect(&hub.hub).await;
-    plugin.send_raw(&header(MsgCode::InitializeResponse), &[]).await;
+    plugin
+        .send_raw(&header(MsgCode::InitializeResponse), &[])
+        .await;
     assert!(plugin.recv().await.is_none());
 
     // Garbage instead of a frame (and the old text-header framing).
@@ -522,7 +546,10 @@ async fn source_events_reach_the_link_and_oversized_ones_are_nacked() {
     let (mut plugin, conn_id, _) = connected(
         &hub.hub,
         &mut link,
-        with_caps(init(PbPluginType::Source, "src", TOKEN), &[Capability::Acks]),
+        with_caps(
+            init(PbPluginType::Source, "src", TOKEN),
+            &[Capability::Acks],
+        ),
     )
     .await;
 
@@ -569,7 +596,10 @@ async fn credits_are_enforced_and_returned() {
     let (mut plugin, conn_id, _) = connected(
         &hub.hub,
         &mut link,
-        with_caps(init(PbPluginType::Source, "src", TOKEN), &[Capability::Credits]),
+        with_caps(
+            init(PbPluginType::Source, "src", TOKEN),
+            &[Capability::Credits],
+        ),
     )
     .await;
     let credit: Credit = plugin.recv_msg().await;
@@ -612,7 +642,12 @@ async fn consumer_acks_reach_the_link() {
         with_caps(sink_init("sink", TOKEN), &[Capability::Acks]),
     )
     .await;
-    plugin.send(&Ack { up_to: 3, seqs: vec![5] }).await;
+    plugin
+        .send(&Ack {
+            up_to: 3,
+            seqs: vec![5],
+        })
+        .await;
     plugin
         .send(&Nack {
             seq: 4,
@@ -653,9 +688,17 @@ async fn protocol_violations_close_the_connection() {
         // A sink never sends events.
         ("Event from a SINK", header(MsgCode::Event), vec![]),
         ("Credit from a SINK", header(MsgCode::Credit), vec![]),
-        ("Initialize from a SINK", header(MsgCode::Initialize), vec![]),
+        (
+            "Initialize from a SINK",
+            header(MsgCode::Initialize),
+            vec![],
+        ),
         // Acks need the capability.
-        ("Ack without the ACKS capability", header(MsgCode::Ack), vec![]),
+        (
+            "Ack without the ACKS capability",
+            header(MsgCode::Ack),
+            vec![],
+        ),
         // A body that doesn't decode.
         ("undecodable Exit", header(MsgCode::Exit), vec![0xff, 0xff]),
     ];
@@ -669,7 +712,10 @@ async fn protocol_violations_close_the_connection() {
                 reason,
             } => {
                 assert_eq!(id, conn_id);
-                assert!(reason.contains(expected_reason), "{expected_reason:?}: {reason}");
+                assert!(
+                    reason.contains(expected_reason),
+                    "{expected_reason:?}: {reason}"
+                );
             }
             other => panic!("expected Disconnected, got {other:?}"),
         }
@@ -677,8 +723,12 @@ async fn protocol_violations_close_the_connection() {
 
     // A producer's seqs must count up from 1.
     let mut link = hub.hub.expect(expected("src", PluginType::Source));
-    let (mut plugin, _, _) =
-        connected(&hub.hub, &mut link, init(PbPluginType::Source, "src", TOKEN)).await;
+    let (mut plugin, _, _) = connected(
+        &hub.hub,
+        &mut link,
+        init(PbPluginType::Source, "src", TOKEN),
+    )
+    .await;
     seq_gap.seq = 2;
     plugin.send_raw(&seq_gap, &[]).await;
     plugin.expect_closed().await;
@@ -724,7 +774,10 @@ async fn heartbeats_ping_answer_and_time_out() {
     let silent = std::time::Instant::now();
     match next(&mut link).await {
         HubEvent::Disconnected { reason, .. } => {
-            assert!(reason.contains("nothing from the plugin for 300 ms"), "{reason}");
+            assert!(
+                reason.contains("nothing from the plugin for 300 ms"),
+                "{reason}"
+            );
             assert!(silent.elapsed() >= Duration::from_millis(250));
             assert_eq!(link.sender().link_report().connections.timed_out, 1);
         }
@@ -765,13 +818,20 @@ async fn heartbeat_round_trips_and_connections_are_counted() {
     let (mut plugin, _) = connected_sink(&hub.hub, &mut link).await;
     let connections = hub.hub.connections();
     assert_eq!((connections.connected, connections.pending), (1, 0));
-    assert_eq!((connections.failed_handshakes, connections.refused_busy), (1, 0));
+    assert_eq!(
+        (connections.failed_handshakes, connections.refused_busy),
+        (1, 0)
+    );
 
     // One ping answered right, one with a nonce the hub never sent.
     let ping: Ping = plugin.recv_msg().await;
     plugin.send(&Pong { nonce: ping.nonce }).await;
     let ping: Ping = plugin.recv_msg().await;
-    plugin.send(&Pong { nonce: ping.nonce + 1000 }).await;
+    plugin
+        .send(&Pong {
+            nonce: ping.nonce + 1000,
+        })
+        .await;
     eventually("the answers", || {
         let h = report().heartbeats;
         h.answered == 1 && h.unexpected == 1
@@ -793,11 +853,25 @@ async fn heartbeat_round_trips_and_connections_are_counted() {
     // A newer connection replaces it; closing that one is a loss.
     let (mut newer, _) = connected_sink(&hub.hub, &mut link).await;
     newer.stream.shutdown().await.unwrap();
-    assert!(matches!(next(&mut link).await, HubEvent::Disconnected { .. }));
+    assert!(matches!(
+        next(&mut link).await,
+        HubEvent::Disconnected { .. }
+    ));
     let c = report().connections;
     assert_eq!((c.accepted, c.rejected, c.replaced), (2, 1, 1));
-    assert_eq!((c.closed_by_plugin, c.timed_out, c.io_errors, c.protocol_violations), (1, 0, 0, 0));
-    eventually("the hub to see it close", || hub.hub.connections().connected == 0).await;
+    assert_eq!(
+        (
+            c.closed_by_plugin,
+            c.timed_out,
+            c.io_errors,
+            c.protocol_violations
+        ),
+        (1, 0, 0, 0)
+    );
+    eventually("the hub to see it close", || {
+        hub.hub.connections().connected == 0
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -807,7 +881,10 @@ async fn transform_outputs_carry_their_inputs_metadata() {
     let (mut plugin, _, _) = connected(
         &hub.hub,
         &mut link,
-        with_caps(init(PbPluginType::Transform, "t", TOKEN), &[Capability::Acks]),
+        with_caps(
+            init(PbPluginType::Transform, "t", TOKEN),
+            &[Capability::Acks],
+        ),
     )
     .await;
     let meta = |id: &str| EventMetadata {
@@ -824,7 +901,12 @@ async fn transform_outputs_carry_their_inputs_metadata() {
     // Output for input 2, then 1 (after acking it: an accumulator), then for
     // none, then for an input that was never sent.
     plugin.send_event(text_payload("B"), 2).await;
-    plugin.send(&Ack { up_to: 1, seqs: vec![] }).await;
+    plugin
+        .send(&Ack {
+            up_to: 1,
+            seqs: vec![],
+        })
+        .await;
     plugin.send_event(text_payload("A"), 1).await;
     plugin.send_event(text_payload("new"), 0).await;
     plugin.send_event(text_payload("unknown"), 99).await;
@@ -1114,7 +1196,11 @@ async fn sdk_plugin_round_trip_reconnect_and_shutdown() {
             ..
         } => {
             assert_eq!(event.payload().unwrap(), text_payload("HELLO"));
-            assert_eq!(event.metadata, Some(metadata.clone()), "the input's metadata");
+            assert_eq!(
+                event.metadata,
+                Some(metadata.clone()),
+                "the input's metadata"
+            );
             sender.routed(conn_id, seq, Routed::Accepted).await;
         }
         other => panic!("expected the transformed event, got {other:?}"),
@@ -1137,7 +1223,10 @@ async fn sdk_plugin_round_trip_reconnect_and_shutdown() {
         panic!("expected a second Connected");
     };
     assert_ne!(first, second);
-    sender.send_event(&data("again", Some(metadata))).await.unwrap();
+    sender
+        .send_event(&data("again", Some(metadata)))
+        .await
+        .unwrap();
     assert!(matches!(next(&mut link).await, HubEvent::Event { .. }));
     assert!(matches!(next(&mut link).await, HubEvent::Acked { .. }));
 

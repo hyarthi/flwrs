@@ -8,7 +8,7 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 
 > **Status:** early development; expect breaking changes. What works today:
 >
-> - the server core, the [plugin protocol](docs/protocol.md) (version 2) with its Rust SDK and a conformance suite, the plugin registry (package upload), and scene management over REST;
+> - the server core, the [plugin protocol](docs/protocol.md) (version 2) with its Rust SDK ([`flwrs-plugin`](https://crates.io/crates/flwrs-plugin)) and a plugin developer toolkit ([`flwrs-trellis`](https://crates.io/crates/flwrs-trellis): package, audit, test, bench), the plugin registry (package upload), and scene management over REST;
 > - running scenes: the director launches and supervises plugins (local, or remote over TLS with tokens or client certificates), routes events through bounded queues (credit-based flow control, at-least-once delivery with acks, optionally durable on disk), applies edge mappings (dot notation and Lua), and applies edits to a running scene as a diff, restarting only what changed;
 > - scene export / import between servers, status endpoints, and telemetry export (OpenTelemetry, or local files);
 > - one base plugin (HTTP sink, Rust), plus minimal demo plugins in Python, Go, TypeScript and Java.
@@ -35,7 +35,7 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 | `plugin/` | `flwrs-plugin` | Plugin protocol definition (`schema/*.proto`) and the reference Rust SDK: wire framing, `Source`/`Transform`/`Sink` traits and runners. |
 | `plugins/` | — | Base plugin library. Currently `http_sink` (Rust). Plugins in other languages can live here too. |
 | `examples/plugins/` | — | Minimal, unsupported demo plugins (HTTP sinks in Python, Go, TypeScript and Java). |
-| `xtask/` | — | Project automation: `cargo xtask package-plugin <dir>`. |
+| `trellis/` | `flwrs-trellis` | Developer toolkit for plugins (any language): `package`, `audit` (protocol conformance), `test`, `bench`. `cargo trellis <command>` in this repo. |
 | `ideas/` | — | Design notes for possible future work. |
 
 See [AGENTS.md](AGENTS.md) for a file-by-file map.
@@ -125,10 +125,12 @@ The protocol is the contract between the server and a plugin, so plugins can be 
 - The first frame is the plugin's `Initialize` (instance id, token, type, version, payload schemas, protocol versions, capabilities). The hub answers `InitializeResponse` or, to reject it, `Shutdown`. Then data events flow, `PING` is answered with `PONG`, and `Shutdown` is answered with `Exit`. A plugin that loses its connection reconnects with backoff (at most 30 s).
 - Optional capabilities: **`ACKS`** (acknowledgements and redelivery: at-least-once delivery) and **`CREDITS`** (credit-based flow control for what a plugin produces). A plugin without them still works, with TCP backpressure and at-most-once delivery on its hops.
 
-**Check a plugin** in any language with the conformance suite, which runs it against a fake hub:
+**Check a plugin** in any language with trellis, which runs it against a fake hub ([trellis/README.md](trellis/README.md)):
 
 ```sh
-cargo run -p flwrs-trellis -- path/to/unzipped-package   # --list shows the cases
+cargo trellis audit path/to/package.zip      # protocol conformance (--list shows the cases)
+cargo trellis test path/to/plugin-folder     # behaviour tests (*.test.toml), or a smoke test
+cargo trellis bench path/to/plugin-folder    # throughput, latency, CPU and memory
 ```
 
 ## Scenes
@@ -358,7 +360,7 @@ http-sink-0.0.1-macos-aarch64.zip
 | `DELETE /api/plugins/by-id/{id}` | Deregister and remove the files. Refused (409) while scene nodes use the plugin. |
 
 ```sh
-cargo xtask package-plugin http_sink                     # → target/plugins/http-sink-0.0.1-<platform>.zip
+cargo trellis package plugins/http_sink                 # → target/plugins/http-sink-0.0.1-<platform>.zip
 curl -F file=@target/plugins/http-sink-0.0.1-macos-aarch64.zip http://localhost:8080/api/plugins
 ```
 
@@ -372,9 +374,9 @@ curl -F file=@target/plugins/http-sink-0.0.1-macos-aarch64.zip http://localhost:
 - A transform's `process_event` returns any number of outputs, sent tied to their input (so the trace continues), then the input is acked. A stateful transform returns none until it's ready, and can emit later through its `LocalSink`: `emit` starts a new trace, `emit_linked` continues an earlier input's.
 - A source emits through the `LocalSink` it gets in `initialize`: `emit` (waits for credit), or `emit_confirmed` (also waits until the hub has stored the event).
 
-[`plugins/http_sink`](plugins/http_sink) is a complete example, including its package files. Package it with `cargo xtask package-plugin <dir>`.
+[`plugins/http_sink`](plugins/http_sink) is a complete example, including its package files and its trellis tests (`tests/trellis.rs`, with trellis as a dev-dependency). Package it with `cargo trellis package plugins/http_sink` (`--target <triple>` to cross-build, e.g. for a Raspberry Pi).
 
-**In any other language:** build an executable that follows the [plugin protocol](docs/protocol.md). Generate message types from `plugin/schema/*.proto`, implement the framing (a few dozen lines in most languages), and follow the lifecycle and reconnect rule; section 16 of the spec lists the minimum. [`examples/plugins/`](examples/plugins) has minimal demo HTTP sinks in Python, Go, TypeScript (Node.js) and Java, each with a `build.sh` that produces an uploadable package. Check yours with the conformance suite (`cargo run -p flwrs-trellis -- <package folder>`).
+**In any other language:** build an executable that follows the [plugin protocol](docs/protocol.md). Generate message types from `plugin/schema/*.proto`, implement the framing (a few dozen lines in most languages), and follow the lifecycle and reconnect rule; section 16 of the spec lists the minimum. [`examples/plugins/`](examples/plugins) has minimal demo HTTP sinks in Python, Go, TypeScript (Node.js) and Java, each with a `build.sh` that produces an uploadable package. Check yours with trellis (`cargo trellis audit <package>`; `test` and `bench` too), and package it with `cargo trellis package` and a `[build]` command in `trellis.toml`.
 
 ## Roadmap
 

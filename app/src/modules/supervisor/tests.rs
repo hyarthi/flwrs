@@ -8,16 +8,14 @@ use crate::modules::hub::{Hub, HubConfig};
 #[cfg_attr(not(feature = "remote"), allow(unused_imports))]
 use crate::modules::node_config::{NodeConfig, RuntimeConfig};
 use crate::modules::plugin::manifest::PluginType;
-use flwrs_plugin::plugin::frame::{
-    PROTOCOL_VERSION, read_frame, write_frame, write_message,
+use flwrs_plugin::plugin::frame::{PROTOCOL_VERSION, read_frame, write_frame, write_message};
+use flwrs_plugin::schema::payload::{
+    Field, FieldDefinition, FieldValue, PluginPayload, SchemaDefinition, field_type,
+    field_value::Value,
 };
 use flwrs_plugin::schema::protocol::{
     Event, Exit, FrameHeader, Initialize, exit_code, msg_code::Enum as MsgCode,
     plugin_type::Enum as PbPluginType,
-};
-use flwrs_plugin::schema::payload::{
-    Field, FieldDefinition, FieldValue, PluginPayload, SchemaDefinition, field_type,
-    field_value::Value,
 };
 use prost::Message;
 #[cfg_attr(not(feature = "remote"), allow(unused_imports))]
@@ -724,12 +722,10 @@ async fn spec_from_an_installed_plugin() {
         },
     )
     .unwrap();
-    assert!(
-        matches!(
-            remote.launch,
-            Launch::Remote { auth: crate::modules::hub::NodeAuth::Token { ref token, .. } } if token == "remote-token-0123456789"
-        )
-    );
+    assert!(matches!(
+        remote.launch,
+        Launch::Remote { auth: crate::modules::hub::NodeAuth::Token { ref token, .. } } if token == "remote-token-0123456789"
+    ));
 
     let errors = NodeSpec::resolve(
         "s",

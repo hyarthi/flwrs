@@ -409,12 +409,12 @@ impl Store {
             sqlx::query(
                 "INSERT INTO events (enqueue_time, size, header, event) VALUES ($1, $2, $3, $4)",
             )
-                .bind(now)
-                .bind(i64::try_from(p.size).unwrap_or(i64::MAX))
-                .bind(encode_header(&p.event))
-                .bind(p.event.body.to_vec())
-                .execute(&mut *tx)
-                .await?;
+            .bind(now)
+            .bind(i64::try_from(p.size).unwrap_or(i64::MAX))
+            .bind(encode_header(&p.event))
+            .bind(p.event.body.to_vec())
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await
     }

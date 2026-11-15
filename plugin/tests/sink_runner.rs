@@ -29,9 +29,15 @@ struct Counters {
 struct TestSink(Arc<Counters>);
 
 impl Sink for TestSink {
-    fn initialize(&mut self, id: String, _: LogLevel) -> Result<InitializeRequest, InitializeError> {
+    fn initialize(
+        &mut self,
+        id: String,
+        _: LogLevel,
+    ) -> Result<InitializeRequest, InitializeError> {
         self.0.initialized.fetch_add(1, Ordering::SeqCst);
-        Ok(InitializeRequest::new().with_id(id).with_version("1".into()))
+        Ok(InitializeRequest::new()
+            .with_id(id)
+            .with_version("1".into()))
     }
     fn shutdown(&mut self) -> Result<(), ShutdownError> {
         self.0.shut_down.fetch_add(1, Ordering::SeqCst);
@@ -120,13 +126,18 @@ async fn sink_lifecycle_with_acks_and_nacks() {
     };
     hub.send_event(payload(vec![text("text", "ok")]), Some(metadata.clone()))
         .await;
-    hub.send_event(payload(vec![text("text", "bad")]), None).await;
-    hub.send_event(payload(vec![text("text", "later")]), None).await;
+    hub.send_event(payload(vec![text("text", "bad")]), None)
+        .await;
+    hub.send_event(payload(vec![text("text", "later")]), None)
+        .await;
 
     let ack: Ack = hub.expect().await;
     assert_eq!((ack.up_to, ack.seqs), (0, vec![1]));
     let nack: Nack = hub.expect().await;
-    assert_eq!((nack.seq, nack.retry, nack.reason.as_str()), (2, false, "bad event"));
+    assert_eq!(
+        (nack.seq, nack.retry, nack.reason.as_str()),
+        (2, false, "bad event")
+    );
     let nack: Nack = hub.expect().await;
     assert_eq!((nack.seq, nack.retry), (3, true));
 
@@ -151,8 +162,10 @@ async fn one_at_a_time_by_default() {
 
     let (mut hub, _) = FakeHub::handshake(&listener).await;
     hub.accept_plugin(&[Capability::Acks], 0).await;
-    hub.send_event(payload(vec![text("text", "slow")]), None).await;
-    hub.send_event(payload(vec![text("text", "ok")]), None).await;
+    hub.send_event(payload(vec![text("text", "slow")]), None)
+        .await;
+    hub.send_event(payload(vec![text("text", "ok")]), None)
+        .await;
     // The second event waits for the first.
     hub.expect_quiet(Duration::from_millis(200)).await;
     counters.gate.notify_one();
@@ -174,8 +187,10 @@ async fn concurrent_events_are_acked_as_they_finish_and_drained_on_shutdown() {
 
     let (mut hub, _) = FakeHub::handshake(&listener).await;
     hub.accept_plugin(&[Capability::Acks], 0).await;
-    hub.send_event(payload(vec![text("text", "slow")]), None).await;
-    hub.send_event(payload(vec![text("text", "ok")]), None).await;
+    hub.send_event(payload(vec![text("text", "slow")]), None)
+        .await;
+    hub.send_event(payload(vec![text("text", "ok")]), None)
+        .await;
     // The second finishes first and is acked by itself (not cumulatively,
     // which would also cover the first).
     let ack: Ack = hub.expect().await;
@@ -202,8 +217,10 @@ async fn no_acks_unless_the_hub_enables_them() {
 
     let (mut hub, _) = FakeHub::handshake(&listener).await;
     hub.accept_plugin(&[], 0).await;
-    hub.send_event(payload(vec![text("text", "ok")]), None).await;
-    hub.send_event(payload(vec![text("text", "bad")]), None).await;
+    hub.send_event(payload(vec![text("text", "ok")]), None)
+        .await;
+    hub.send_event(payload(vec![text("text", "bad")]), None)
+        .await;
     hub.shutdown("").await;
     // No ACK or NACK before the Exit.
     expect_exit_ok(&mut hub).await;
@@ -227,7 +244,11 @@ async fn answers_ping_and_honours_the_heartbeat_timeout() {
     // connection and reconnects.
     let started = tokio::time::Instant::now();
     hub.expect_closed().await;
-    assert!(started.elapsed() >= Duration::from_millis(250), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "{:?}",
+        started.elapsed()
+    );
 
     let (mut hub, _) = FakeHub::handshake(&listener).await;
     hub.accept_plugin(&[], 0).await;
@@ -245,7 +266,8 @@ async fn reconnects_and_reinitializes_after_hub_restart() {
 
     let (mut hub, first) = FakeHub::handshake(&listener).await;
     hub.accept_plugin(&[Capability::Acks], 0).await;
-    hub.send_event(payload(vec![text("text", "ok")]), None).await;
+    hub.send_event(payload(vec![text("text", "ok")]), None)
+        .await;
     let ack: Ack = hub.expect().await;
     assert_eq!((ack.up_to, ack.seqs), (0, vec![1]));
     drop(hub);
@@ -255,7 +277,8 @@ async fn reconnects_and_reinitializes_after_hub_restart() {
     let (mut hub, again) = FakeHub::handshake(&listener).await;
     assert_eq!(again, first);
     hub.accept_plugin(&[Capability::Acks], 0).await;
-    hub.send_event(payload(vec![text("text", "ok")]), None).await;
+    hub.send_event(payload(vec![text("text", "ok")]), None)
+        .await;
     let ack: Ack = hub.expect().await;
     assert_eq!((ack.up_to, ack.seqs), (0, vec![1]));
     hub.shutdown("").await;
@@ -280,7 +303,10 @@ async fn shutdown_before_initialize_response_means_rejected() {
     expect_exit_ok(&mut hub).await;
     hub.expect_closed().await;
 
-    assert!(matches!(common::finished(runner).await, Err(Error::Rejected)));
+    assert!(matches!(
+        common::finished(runner).await,
+        Err(Error::Rejected)
+    ));
     assert_eq!(counters.shut_down.load(Ordering::SeqCst), 1);
     // It doesn't try again.
     let retry = tokio::time::timeout(Duration::from_millis(300), listener.accept());

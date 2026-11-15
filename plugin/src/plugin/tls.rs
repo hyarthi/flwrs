@@ -114,7 +114,11 @@ impl ClientTls {
                     .map_err(|e| invalid(format!("client certificate: {e}")))?
             }
             (None, None) => builder.with_no_client_auth(),
-            _ => return Err(invalid("a client certificate needs both a cert and a key".into())),
+            _ => {
+                return Err(invalid(
+                    "a client certificate needs both a cert and a key".into(),
+                ));
+            }
         };
         let name = settings.server_name.as_deref().unwrap_or(host).to_string();
         let server_name =

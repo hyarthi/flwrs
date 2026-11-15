@@ -20,9 +20,8 @@ pub const MAX_DEPTH: usize = crate::plugin::frame::MAX_NESTING_DEPTH;
 pub fn check_payload_depth(payload: &PluginPayload) -> Result<(), String> {
     for field in &payload.fields {
         if let Some(value) = &field.value {
-            value_depth(value, 1).map_err(|()| {
-                format!("{}: nested deeper than {MAX_DEPTH} levels", field.key)
-            })?;
+            value_depth(value, 1)
+                .map_err(|()| format!("{}: nested deeper than {MAX_DEPTH} levels", field.key))?;
         }
     }
     Ok(())

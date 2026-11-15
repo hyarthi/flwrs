@@ -3,7 +3,7 @@ resolver = "3"
 # Members are listed explicitly (no `plugins/*` glob), so folders under plugins/
 # that aren't Rust crates (non-Rust plugins, installed packages) can't break the
 # workspace. Add each new Rust plugin here.
-members = ["core", "app", "plugin", "plugins/http_sink", "xtask", "trellis"]
+members = ["core", "app", "plugin", "plugins/http_sink", "trellis"]
 
 # Shared package metadata; crates opt in with `<field>.workspace = true`.
 [workspace.package]
@@ -19,7 +19,9 @@ repository = "https://github.com/hyarthi/flwrs"
 # internal crates
 flwrs-core = { path = "core" }
 # Without default features: crates opt into the SDK's TLS client (feature `tls`).
-flwrs-plugin = { path = "plugin", version = "0.0.3", default-features = false }
+flwrs-plugin = { path = "plugin", version = "0.0.4", default-features = false }
+# The developer toolkit, as a dev-dependency of the plugins here (their tests run it).
+flwrs-trellis = { path = "trellis" }
 
 # async runtime
 tokio = { version = "1.54.1", features = ["full"] }
@@ -44,6 +46,7 @@ serde_json = "1.0.154"
 # server fetch URLs or read local files.
 jsonschema = { version = "0.60.2", default-features = false, features = ["idna"] }
 zip = { version = "9.3.0", default-features = false, features = ["deflate"] }
+glob = "0.3.4" # trellis: test/bench file lists and package include/exclude patterns
 
 # storage
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "chrono", "derive"] }
@@ -84,6 +87,9 @@ x509-parser = "0.18.1"
 
 # testing
 tempfile = "3.27.0"
+# trellis bench: latency histograms and process sampling
+hdrhistogram = { version = "7.6.0", default-features = false }
+sysinfo = { version = "0.40.3", default-features = false, features = ["system"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.5"

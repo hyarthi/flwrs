@@ -146,7 +146,13 @@ pub(crate) async fn finish(
     if let Err(err) = &shutdown {
         log::error!("Error shutting down: {err}");
     }
-    let rejected = matches!(end, SessionEnd::Shutdown { accepted: false, .. });
+    let rejected = matches!(
+        end,
+        SessionEnd::Shutdown {
+            accepted: false,
+            ..
+        }
+    );
     if let SessionEnd::Shutdown {
         accepted: false,
         reason,

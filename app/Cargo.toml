@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 flwrs-core.workspace = true
-flwrs-plugin.workspace = true # payload schema rules, wire framing and messages (shared with the hub)
+flwrs-plugin = { workspace = true, features = ["package"] } # payload schema rules, wire framing and messages (shared with the hub); manifest + package checks
 chrono.workspace = true
 log.workspace = true
 tokio.workspace = true

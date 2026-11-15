@@ -9,17 +9,17 @@ use super::running::Context;
 use crate::modules::hub::{Hub, HubConfig};
 use crate::modules::scene::service::tests::{Fixture, edge_input, fixture, node_input};
 use flwrs_core::db::Database;
+use flwrs_plugin::plugin::core::InboundEvent;
 use flwrs_plugin::plugin::core::{
     ConnectionConfig, FieldDefinition, InitializeRequest, SchemaDefinition,
 };
 use flwrs_plugin::plugin::error::{
     InitializeError, ShutdownError, SinkError, SourceError, TransformError,
 };
-use flwrs_plugin::schema::protocol::log_level::Enum as LogLevel;
 use flwrs_plugin::schema::payload::{
     Field, FieldValue, PluginPayload, field_type, field_value::Value,
 };
-use flwrs_plugin::plugin::core::InboundEvent;
+use flwrs_plugin::schema::protocol::log_level::Enum as LogLevel;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -375,7 +375,12 @@ async fn register_plugins(f: &Fixture, dir: &Path) {
         ("t-sink", "SINK", "sink", r#"{"in":"i.json"}"#),
         ("t-slow-sink", "SINK", "slow-sink", r#"{"in":"i.json"}"#),
         ("t-flaky-sink", "SINK", "flaky-sink", r#"{"in":"i.json"}"#),
-        ("t-failing-sink", "SINK", "failing-sink", r#"{"in":"i.json"}"#),
+        (
+            "t-failing-sink",
+            "SINK",
+            "failing-sink",
+            r#"{"in":"i.json"}"#,
+        ),
         ("t-crash-sink", "SINK", "crash-sink", r#"{"in":"i.json"}"#),
         ("t-gated-sink", "SINK", "gated-sink", r#"{"in":"i.json"}"#),
     ] {
@@ -610,7 +615,10 @@ async fn rejected_events_are_redelivered_with_a_higher_attempt() {
     // Each was rejected once, then delivered again: same event, attempt 2.
     assert!(lines.iter().all(|l| l[5] == "2"), "{lines:?}");
     let queue = queue_of(&s, &scene, &sink).await;
-    assert_eq!((queue.nacked, queue.redelivered, queue.dead_lettered), (3, 3, 0));
+    assert_eq!(
+        (queue.nacked, queue.redelivered, queue.dead_lettered),
+        (3, 3, 0)
+    );
     assert_eq!((queue.delivered, queue.in_flight), (3, 0));
 }
 
@@ -635,7 +643,10 @@ async fn events_that_keep_failing_are_dead_lettered() {
         let queue = queue_of(&s, &scene, &sink).await;
         if queue.dead_lettered == 3 {
             // Two attempts each: the first, and one redelivery.
-            assert_eq!((queue.nacked, queue.redelivered, queue.delivered), (6, 3, 0));
+            assert_eq!(
+                (queue.nacked, queue.redelivered, queue.delivered),
+                (6, 3, 0)
+            );
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "{queue:?}");
@@ -644,7 +655,10 @@ async fn events_that_keep_failing_are_dead_lettered() {
     assert!(s.lines().is_empty());
     let report = s.status(&scene).await;
     let sink_report = report.nodes.iter().find(|n| n.node_id == sink).unwrap();
-    assert_eq!(sink_report.counters.dropped, 3, "dead letters count as dropped");
+    assert_eq!(
+        sink_report.counters.dropped, 3,
+        "dead letters count as dropped"
+    );
 }
 
 #[tokio::test]
@@ -654,7 +668,11 @@ async fn events_in_flight_when_a_sink_crashes_are_redelivered() {
     let scene = s.enabled_scene().await;
     let source = s.node(&scene, "t-source").await;
     let sink = s
-        .node_with(&scene, "t-crash-sink", json!({"runtime": {"restart_delay_ms": 50}}))
+        .node_with(
+            &scene,
+            "t-crash-sink",
+            json!({"runtime": {"restart_delay_ms": 50}}),
+        )
         .await;
     s.edge(&scene, &source, &sink).await;
     s.director.reload(&scene).await.unwrap();
@@ -819,7 +837,11 @@ async fn a_reload_keeps_unchanged_nodes_and_swaps_edges_mappings_and_hop_limit()
     s.director.reload(&scene).await.unwrap();
     s.wait_text(&a, |t| t == "t3").await;
     let before = s.processes(&scene).await;
-    assert!(before.values().all(|(pid, launches)| pid.is_some() && *launches == 1));
+    assert!(
+        before
+            .values()
+            .all(|(pid, launches)| pid.is_some() && *launches == 1)
+    );
 
     // A new sink behind a mapping: only it starts.
     let b = s.node(&scene, "t-sink").await;
@@ -827,7 +849,11 @@ async fn a_reload_keeps_unchanged_nodes_and_swaps_edges_mappings_and_hop_limit()
         s.f.service
             .create_edge(
                 &scene,
-                edge_input(&ticker, &b, json!({"rules": [{"target": "text", "value": "mapped"}]})),
+                edge_input(
+                    &ticker,
+                    &b,
+                    json!({"rules": [{"target": "text", "value": "mapped"}]}),
+                ),
             )
             .await
             .unwrap()
@@ -846,7 +872,11 @@ async fn a_reload_keeps_unchanged_nodes_and_swaps_edges_mappings_and_hop_limit()
         .update_edge(
             &scene,
             &to_b,
-            edge_input(&ticker, &b, json!({"rules": [{"target": "text", "value": "changed"}]})),
+            edge_input(
+                &ticker,
+                &b,
+                json!({"rules": [{"target": "text", "value": "changed"}]}),
+            ),
         )
         .await
         .unwrap();
@@ -973,10 +1003,16 @@ async fn a_changed_remote_node_keeps_its_plugin_connected() {
             .is_some_and(|n| n > count + 3)
     })
     .await;
-    assert!(plugin.try_wait().unwrap().is_none(), "the remote plugin kept running");
+    assert!(
+        plugin.try_wait().unwrap().is_none(),
+        "the remote plugin kept running"
+    );
     let status = s.status(&scene).await;
     let node = status.nodes.iter().find(|n| n.node_id == remote).unwrap();
-    assert_eq!(node.status.state, crate::modules::supervisor::NodeState::Running);
+    assert_eq!(
+        node.status.state,
+        crate::modules::supervisor::NodeState::Running
+    );
 }
 
 #[tokio::test]

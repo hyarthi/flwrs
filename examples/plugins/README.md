@@ -28,6 +28,6 @@ At run time the server's host needs the language's runtime: `python3` with `prot
 - answers `Shutdown` with `Exit` once the request in hand is done, and exits; a `Shutdown` before `InitializeResponse` (a rejection) means exit with status 1, without reconnecting;
 - reconnects with the same `Initialize` if the connection drops (1 s, doubling up to 30 s).
 
-Each passes the conformance suite: `cargo run -p flwrs-trellis -- <unzipped package>` from the repo root (Python needs `protobuf` on the `python3` it runs with).
+Each passes the conformance suite: `cargo trellis audit <folder>/dist/<id>-0.0.1.zip` from the repo root (Python needs `protobuf` on the `python3` it runs with).
 
 Left out on purpose: `CREDITS` (a sink produces nothing), `LogEvent`s (stdout and stderr already go to the server log), launch arguments, log levels, TLS, and a proper HTTP client configuration.

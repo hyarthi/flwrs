@@ -10,8 +10,8 @@ use flwrs_plugin::schema::protocol::{
 use flwrs_plugin::source::local_sink::LocalSink;
 use flwrs_plugin::source::plugin::Source;
 use flwrs_plugin::source::runner::{SourceRunner, SourceRunnerConfig};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -44,7 +44,9 @@ impl Source for TestSource {
         sink: LocalSink,
     ) -> Result<InitializeRequest, InitializeError> {
         self.sink = Some(sink);
-        Ok(InitializeRequest::new().with_id(id).with_version(self.version()))
+        Ok(InitializeRequest::new()
+            .with_id(id)
+            .with_version(self.version()))
     }
     fn shutdown(&mut self) -> Result<(), ShutdownError> {
         self.shut_down.store(true, Ordering::SeqCst);
@@ -246,7 +248,11 @@ async fn emit_confirmed_waits_for_the_hubs_answer() {
     let mut seq = 1;
     assert_eq!(kind(&mut hub, &mut seq).await, "event");
     hub.expect_quiet(Duration::from_millis(100)).await;
-    hub.send(&Ack { up_to: 1, seqs: vec![] }).await;
+    hub.send(&Ack {
+        up_to: 1,
+        seqs: vec![],
+    })
+    .await;
     assert_eq!(outcome(&mut started).await, Ok(()));
 
     assert_eq!(kind(&mut hub, &mut seq).await, "event");
@@ -256,10 +262,7 @@ async fn emit_confirmed_waits_for_the_hubs_answer() {
         retry: false,
     })
     .await;
-    assert_eq!(
-        outcome(&mut started).await,
-        Err("too large".to_string())
-    );
+    assert_eq!(outcome(&mut started).await, Err("too large".to_string()));
 
     // A lost connection fails the pending confirmation and cancels `run`;
     // depending on which comes first, the failure is reported or not.
@@ -271,7 +274,11 @@ async fn emit_confirmed_waits_for_the_hubs_answer() {
     let mut seq = 1;
     // The restarted run emits again (its first event).
     assert_eq!(kind(&mut hub, &mut seq).await, "event");
-    hub.send(&Ack { up_to: 1, seqs: vec![] }).await;
+    hub.send(&Ack {
+        up_to: 1,
+        seqs: vec![],
+    })
+    .await;
     let mut next = outcome(&mut started).await;
     if next == Err("the connection to the hub was lost".to_string()) {
         next = outcome(&mut started).await;

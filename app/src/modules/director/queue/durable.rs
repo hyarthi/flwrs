@@ -410,7 +410,11 @@ async fn run(core: Arc<DurableCore>) {
     let s = &core.settings;
     // A fresh start takes over the node's files (the oldest one is kept, the
     // others are merged into it); otherwise a new file.
-    let existing = if s.adopt { node_files(&s.dir, &s.node_id) } else { vec![] };
+    let existing = if s.adopt {
+        node_files(&s.dir, &s.node_id)
+    } else {
+        vec![]
+    };
     let file = existing.first().cloned().unwrap_or_else(|| new_file(&core));
     let merge = existing.get(1..).unwrap_or_default();
     let mut store = match Store::open(&s.dir, &file, merge).await {
@@ -517,7 +521,8 @@ async fn run(core: Arc<DurableCore>) {
 /// A new spool file name for this node.
 fn new_file(core: &DurableCore) -> PathBuf {
     let s = &core.settings;
-    s.dir.join(format!("{}.{}.db", s.node_id, ulid::Ulid::generate()))
+    s.dir
+        .join(format!("{}.{}.db", s.node_id, ulid::Ulid::generate()))
 }
 
 /// Without a file: every event waiting to be written is refused (its
@@ -614,7 +619,9 @@ async fn write(core: &DurableCore, store: &Store, guard_log: &RateLimit) -> bool
                         batch.len()
                     );
                     s.shared.disk.sub(bytes as u64);
-                    counts.dropped_disk_error.fetch_add(batch.len() as u64, Relaxed);
+                    counts
+                        .dropped_disk_error
+                        .fetch_add(batch.len() as u64, Relaxed);
                     for p in &batch {
                         state.failed.insert(p.ticket);
                     }
@@ -671,10 +678,16 @@ async fn refill(core: &DurableCore, store: &Store) -> bool {
     if room_events == 0 && !at_least_one {
         return false;
     }
-    let rows = match store.load(after, room_events.max(1), room_bytes, at_least_one).await {
+    let rows = match store
+        .load(after, room_events.max(1), room_bytes, at_least_one)
+        .await
+    {
         Ok(rows) => rows,
         Err(err) => {
-            log::error!("Spool {}: couldn't read: {err}", core.settings.dir.display());
+            log::error!(
+                "Spool {}: couldn't read: {err}",
+                core.settings.dir.display()
+            );
             return false;
         }
     };
@@ -903,7 +916,9 @@ impl Store {
                 )
                 .execute(&mut *conn)
                 .await;
-                sqlx::query("DETACH DATABASE other").execute(&mut *conn).await?;
+                sqlx::query("DETACH DATABASE other")
+                    .execute(&mut *conn)
+                    .await?;
                 copied.map(|_| ())
             };
             match merged.await {
@@ -985,11 +1000,13 @@ impl Store {
             bytes += size;
             let header: Vec<u8> = row.get("header");
             let body: Vec<u8> = row.get("event");
-            let event = FrameHeader::decode(header.as_slice()).ok().map(|h| DataEvent {
-                body: body.into(),
-                metadata: h.metadata,
-                attempt: h.attempt,
-            });
+            let event = FrameHeader::decode(header.as_slice())
+                .ok()
+                .map(|h| DataEvent {
+                    body: body.into(),
+                    metadata: h.metadata,
+                    attempt: h.attempt,
+                });
             out.push((row.get("seq"), size, event));
         }
         Ok(out)
@@ -1165,7 +1182,9 @@ mod tests {
         wait_rows(&q, 0).await;
         q.finish(true).await;
         assert_eq!(
-            std::fs::read_dir(shared.scene_dir("scene")).unwrap().count(),
+            std::fs::read_dir(shared.scene_dir("scene"))
+                .unwrap()
+                .count(),
             0,
             "a removed node's file goes"
         );
@@ -1267,7 +1286,12 @@ mod tests {
         let new = queue(&shared, 8, false);
         push(&new, 3).await;
         new.finish(false).await;
-        assert!(std::fs::read_dir(shared.scene_dir("scene")).unwrap().count() >= 2);
+        assert!(
+            std::fs::read_dir(shared.scene_dir("scene"))
+                .unwrap()
+                .count()
+                >= 2
+        );
 
         let q = queue(&shared, 8, true);
         let labels: Vec<String> = [pop(&q).await, pop(&q).await, pop(&q).await]

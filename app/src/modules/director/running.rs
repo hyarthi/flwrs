@@ -14,11 +14,11 @@ use super::queue::{
 use crate::modules::hub::wire::{DataEvent, Negotiated};
 use crate::modules::hub::{Hub, HubError, LinkReport, LinkSender, Routed};
 use crate::modules::mapping::{self, Mapping, MappingSpec, Schemas};
+use crate::modules::node_config::NodeConfig;
 use crate::modules::node_config::WhenFull;
 use crate::modules::plugin::manifest::PluginType;
 use crate::modules::rate_limit::RateLimit;
 use crate::modules::scene::graph::nodes_in_cycles;
-use crate::modules::node_config::NodeConfig;
 use crate::modules::scene::service::{Edge, SceneSnapshot};
 use crate::modules::supervisor::{
     DeliverySpec, Launch, NodeHandle, NodeOutput, NodeSpec, NodeState, NodeStatus, Output,
@@ -310,7 +310,11 @@ impl Plan {
             .edges
             .iter()
             .filter(|e| e.source_node_id == node_id)
-            .filter(|e| self.nodes.iter().any(|n| n.spec.node_id == e.target_node_id))
+            .filter(|e| {
+                self.nodes
+                    .iter()
+                    .any(|n| n.spec.node_id == e.target_node_id)
+            })
             .filter_map(|e| {
                 Some(Target {
                     edge_id: e.id.clone(),
@@ -532,7 +536,10 @@ async fn stop_nodes(nodes: Vec<RunningNode>, remove: bool) {
     }
     for (mut router, deliverer, queue) in rest {
         // A stopped node's router ends once it has passed on what's left.
-        if tokio::time::timeout(ROUTER_DRAIN, &mut router).await.is_err() {
+        if tokio::time::timeout(ROUTER_DRAIN, &mut router)
+            .await
+            .is_err()
+        {
             router.abort();
         }
         if let Some(deliverer) = deliverer {
@@ -547,7 +554,10 @@ async fn stop_nodes(nodes: Vec<RunningNode>, remove: bool) {
 impl RunningScene {
     /// Checks the graph, then starts every node and the routing. Nothing is
     /// started if any check fails; every problem is returned.
-    pub(crate) async fn start(snapshot: &SceneSnapshot, ctx: &Context) -> Result<Self, Vec<String>> {
+    pub(crate) async fn start(
+        snapshot: &SceneSnapshot,
+        ctx: &Context,
+    ) -> Result<Self, Vec<String>> {
         let plan = Plan::new(snapshot, ctx)?;
         let scene_id = snapshot.scene.id.clone();
         let mut scene = Self {
@@ -612,7 +622,11 @@ impl RunningScene {
             .values()
             .filter_map(|n| Some((n.id.clone(), n.queue.clone()?)))
             .collect();
-        for planned in plan.nodes.iter().filter(|p| !kept.contains_key(&p.spec.node_id)) {
+        for planned in plan
+            .nodes
+            .iter()
+            .filter(|p| !kept.contains_key(&p.spec.node_id))
+        {
             let id = &planned.spec.node_id;
             let reusable = old.get_mut(id).filter(|n| {
                 planned.queue.is_some()
@@ -639,7 +653,12 @@ impl RunningScene {
         let mut started: HashMap<String, RunningNode> = HashMap::new();
         let start = |planned: &PlannedNode, started: &mut HashMap<String, RunningNode>| {
             let id = planned.spec.node_id.clone();
-            let node = launch(planned, queues.get(&id).cloned(), plan.routes(&id, &queues), ctx);
+            let node = launch(
+                planned,
+                queues.get(&id).cloned(),
+                plan.routes(&id, &queues),
+                ctx,
+            );
             started.insert(id, node);
         };
         for planned in &plan.nodes {
@@ -935,8 +954,8 @@ async fn route_event(
         let (body, size) = match &target.mapping {
             None => (event.body.clone(), size),
             Some(mapping) => {
-                let input = decoded
-                    .get_or_insert_with(|| event.payload().map_err(|e| e.to_string()));
+                let input =
+                    decoded.get_or_insert_with(|| event.payload().map_err(|e| e.to_string()));
                 let mapped = match input {
                     Ok(input) => mapping.apply(input, Some(&meta)).map_err(|e| e.to_string()),
                     Err(err) => Err(format!("undecodable event: {err}")),
