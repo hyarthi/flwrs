@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ticker launch arguments",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "pattern": "^([0-9]+(ms|s|m|h|d))+$"
+    }
+  },
+  "properties": {
+    "interval": {
+      "description": "Tick every this long, e.g. 500ms, 10s, 5m, 1h30m, 1d (at least 10ms). The default schedule when there's no cron.",
+      "$ref": "#/$defs/duration",
+      "default": "1s"
+    },
+    "cron": {
+      "description": "Tick on a cron pattern: 5 fields (minute hour day-of-month month day-of-week), or 6 with seconds first; nicknames like @hourly too.",
+      "type": "string",
+      "minLength": 1
+    },
+    "timezone": {
+      "description": "Time zone for cron, e.g. Europe/Berlin (IANA name).",
+      "type": "string",
+      "default": "UTC"
+    },
+    "align": {
+      "description": "Put interval ticks on wall-clock multiples of the interval since 1970-01-01 UTC (every 1m at :00), instead of counting from the start.",
+      "type": "boolean",
+      "default": false
+    },
+    "fire_on_start": {
+      "description": "Also tick at the start (when the plugin starts, or at start_time).",
+      "type": "boolean",
+      "default": false
+    },
+    "jitter": {
+      "description": "Delay each tick by a random amount below this; tick_time stays the scheduled time.",
+      "$ref": "#/$defs/duration"
+    },
+    "start_time": {
+      "description": "No ticks before this time (RFC 3339). An interval without align counts from it.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "end_time": {
+      "description": "No ticks after this time (RFC 3339); then the source stops emitting.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "missed": {
+      "description": "What happens to ticks that couldn't go out on time: skip (drop them; the next tick counts them), fire_once (one catch-up tick) or catch_up (each, up to max_catch_up).",
+      "enum": ["skip", "fire_once", "catch_up"],
+      "default": "skip"
+    },
+    "max_catch_up": {
+      "description": "With missed = catch_up: at most this many missed ticks are sent.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000,
+      "default": 100
+    },
+    "max_late": {
+      "description": "With missed = skip: a tick that would go out later than this after its time is dropped.",
+      "$ref": "#/$defs/duration",
+      "default": "1s"
+    },
+    "label": {
+      "description": "Copied into every tick, to tell several tickers apart downstream.",
+      "type": "string",
+      "default": ""
+    },
+    "confirmed": {
+      "description": "Wait for the hub to take each tick before the next.",
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "dependentRequired": { "timezone": ["cron"] },
+  "allOf": [
+    { "not": { "required": ["interval", "cron"] } },
+    {
+      "if": { "properties": { "align": { "const": true } }, "required": ["align"] },
+      "then": { "not": { "required": ["cron"] } }
+    }
+  ]
+}

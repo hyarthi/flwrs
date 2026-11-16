@@ -243,6 +243,10 @@ impl Default for FieldDefinition {
 /// Environment variable a plugin reads its connection token from.
 pub const TOKEN_ENV: &str = "FLWRS_TOKEN";
 
+/// The bootstrap arguments the server passes to every local plugin (as
+/// `--<name> <value>`), so a node's launch args can't set them.
+pub const BOOTSTRAP_ARGS: [&str; 5] = ["id", "host", "port", "log-level", "token"];
+
 /// Longest wait between reconnect attempts that the protocol allows. The hub's
 /// reconnect timeout is set above this, so a reconnecting plugin isn't killed.
 pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);

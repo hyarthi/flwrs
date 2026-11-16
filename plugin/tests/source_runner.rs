@@ -25,6 +25,9 @@ enum Mode {
     Burst(usize),
     /// Emit confirmed events and report each outcome.
     Confirmed(usize),
+    /// Emit `n` events, each only after `ready` (raced against a 100 ms
+    /// timer: a timeout is reported as `Err("late")`, and that try is dropped).
+    WhenReady(usize),
 }
 
 struct TestSource {
@@ -77,6 +80,22 @@ impl Source for TestSource {
                         .await
                         .map_err(|e| e.to_string());
                     self.outcomes.send(outcome).unwrap();
+                }
+            }
+            Mode::WhenReady(n) => {
+                let mut sent = 0;
+                while sent < n {
+                    tokio::select! {
+                        ready = sink.ready() => {
+                            ready?;
+                            sink.emit(payload(vec![])).await?;
+                            sent += 1;
+                            self.outcomes.send(Ok(())).unwrap();
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            self.outcomes.send(Err("late".into())).unwrap();
+                        }
+                    }
                 }
             }
         }
@@ -233,6 +252,28 @@ async fn credits_limit_what_the_source_sends() {
         assert_eq!(kind(&mut hub, &mut seq).await, "event");
     }
     hub.expect_quiet(Duration::from_millis(100)).await;
+    stop(&mut hub, started).await;
+}
+
+#[tokio::test]
+async fn ready_waits_for_credit_without_sending() {
+    let _serial = SERIAL.lock().await;
+    let (listener, port) = listen().await;
+    let mut started = start(port, Mode::WhenReady(2));
+
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[Capability::Credits], 0).await;
+    // No credit: `ready` doesn't return, and cancelling it sends nothing.
+    hub.expect_quiet(Duration::from_millis(250)).await;
+    assert_eq!(outcome(&mut started).await, Err("late".to_string()));
+    hub.send(&Credit { events: 1 }).await;
+    let mut seq = 1;
+    assert_eq!(kind(&mut hub, &mut seq).await, "event");
+    // The source drops tries until the next grant.
+    while outcome(&mut started).await.is_ok() {}
+    hub.expect_quiet(Duration::from_millis(150)).await;
+    hub.send(&Credit { events: 1 }).await;
+    assert_eq!(kind(&mut hub, &mut seq).await, "event");
     stop(&mut hub, started).await;
 }
 

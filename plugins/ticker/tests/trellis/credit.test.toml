@@ -1,0 +1,34 @@
+name = "ticks follow the hub's credit and skip what they missed"
+launch_args = "fast.json"   # every 100 ms
+initial_credit = 0
+return_credit = false       # credit only from the grant steps
+
+[[steps]]
+wait_ms = 450
+expect_outputs = [{ count = 0 }]   # no credit, no ticks
+
+[[steps]]
+grant = 1                          # the latest tick goes out, counting the dropped ones
+expect_outputs = [{ path = "missed", ge = 2 }]
+
+[[steps]]
+grant = 2                          # then ticks on schedule
+expect_outputs = [{ path = "seq", eq = 2 }, { path = "seq", eq = 3 }]
+
+[[steps]]
+grant = 1
+expect_outputs = [{ path = "label", eq = "fast" }]
+
+[[steps]]
+disconnect = true                  # reconnects with no credit
+
+[[steps]]
+wait_ms = 350
+
+[[steps]]
+grant = 1                          # seq carries on across the reconnect; the dropped ticks are counted
+expect_outputs = [{ path = "missed", ge = 1 }]
+
+[[steps]]
+grant = 1
+expect_outputs = [{ path = "seq", eq = 6 }]

@@ -1,0 +1,9 @@
+# flwrs-trellis settings (cargo trellis audit|test|bench plugins/ticker)
+[audit]
+launch_args = "tests/trellis/fast.json"
+
+[test]
+files = ["tests/trellis/*.test.toml"]
+
+[bench]
+files = ["benches/*.bench.toml"]

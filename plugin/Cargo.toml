@@ -6,7 +6,7 @@ homepage = "https://github.com/hyarthi/flwrs"
 documentation = "https://docs.rs/flwrs-plugin"
 keywords = ["flwrs", "workflow", "plugin", "dataflow", "protobuf"]
 categories = ["network-programming", "development-tools"]
-version = "0.0.4" # published on its own; the other crates follow the workspace version
+version = "0.0.5" # published on its own; the other crates follow the workspace version
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -38,6 +38,7 @@ rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 jsonschema = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
 
 [features]
 default = ["tls"]
@@ -47,6 +48,9 @@ tls = ["dep:rustls", "dep:tokio-rustls"]
 # Plugin packages: the manifest model and validation, launch-args rules and
 # the ZIP checks, shared by the server and flwrs-trellis.
 package = ["dep:jsonschema", "dep:zip"]
+# The bootstrap arguments (`--id --host --port --log-level --token`) as a
+# clap struct to flatten into a plugin's own arguments.
+cli = ["dep:clap"]
 
 [dev-dependencies]
 rcgen.workspace = true # test certificates

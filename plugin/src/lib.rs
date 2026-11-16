@@ -1,3 +1,5 @@
+#[cfg(feature = "cli")]
+pub mod cli;
 #[cfg(feature = "package")]
 pub mod package;
 pub mod plugin;

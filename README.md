@@ -11,7 +11,7 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 > - the server core, the [plugin protocol](docs/protocol.md) (version 2) with its Rust SDK ([`flwrs-plugin`](https://crates.io/crates/flwrs-plugin)) and a plugin developer toolkit ([`flwrs-trellis`](https://crates.io/crates/flwrs-trellis): package, audit, test, bench), the plugin registry (package upload), and scene management over REST;
 > - running scenes: the director launches and supervises plugins (local, or remote over TLS with tokens or client certificates), routes events through bounded queues (credit-based flow control, at-least-once delivery with acks, optionally durable on disk), applies edge mappings (dot notation and Lua), and applies edits to a running scene as a diff, restarting only what changed;
 > - scene export / import between servers, status endpoints, and telemetry export (OpenTelemetry, or local files);
-> - one base plugin (HTTP sink, Rust), plus minimal demo plugins in Python, Go, TypeScript and Java.
+> - two base plugins (HTTP sink, ticker; Rust), plus minimal demo plugins in Python, Go, TypeScript and Java.
 >
 > See the [roadmap](#roadmap) for what's missing.
 > 
@@ -33,7 +33,7 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 | `core/` | `flwrs-core` | Shared library: config, logging, SQLite + migrations, HTTP server, service registry. |
 | `app/` | `flwrs-app` | The flwrs server. |
 | `plugin/` | `flwrs-plugin` | Plugin protocol definition (`schema/*.proto`) and the reference Rust SDK: wire framing, `Source`/`Transform`/`Sink` traits and runners. |
-| `plugins/` | — | Base plugin library. Currently `http_sink` (Rust). Plugins in other languages can live here too. |
+| `plugins/` | — | Base plugin library. Currently `http_sink` and `ticker` (Rust). Plugins in other languages can live here too. |
 | `examples/plugins/` | — | Minimal, unsupported demo plugins (HTTP sinks in Python, Go, TypeScript and Java). |
 | `trellis/` | `flwrs-trellis` | Developer toolkit for plugins (any language): `package`, `audit` (protocol conformance), `test`, `bench`. `cargo trellis <command>` in this repo. |
 | `ideas/` | — | Design notes for possible future work. |
@@ -368,13 +368,13 @@ curl -F file=@target/plugins/http-sink-0.0.1-macos-aarch64.zip http://localhost:
 
 ## Writing a plugin
 
-**In Rust:** create a binary crate under `plugins/`, add it to `members` in the root `Cargo.toml`, depend on `flwrs-plugin`, implement `Sink`, `Source` or `Transform`, declare the plugin's schema, and run the matching runner (`SinkRunner`, `SourceRunner`, `TransformRunner`). The runner handles the connection (token from `FLWRS_TOKEN` or `ConnectionConfig::with_token`; TLS with the `tls` feature), the handshake, heartbeats, credit, acks, reconnecting, logging and shutdown.
+**In Rust:** create a binary crate under `plugins/`, add it to `members` in the root `Cargo.toml`, depend on `flwrs-plugin`, implement `Sink`, `Source` or `Transform`, declare the plugin's schema, parse the server's bootstrap arguments with `flwrs_plugin::cli::Bootstrap` (feature `cli`, flattened into your clap arguments), and run the matching runner (`SinkRunner`, `SourceRunner`, `TransformRunner`). The runner handles the connection (token from `FLWRS_TOKEN` or `ConnectionConfig::with_token`; TLS with the `tls` feature), the handshake, heartbeats, credit, acks, reconnecting, logging and shutdown.
 
 - A sink's `consume_event` gets an `InboundEvent` (payload, metadata, attempt); `Ok` acks it, an error NACKs it (`SinkError::retryable` to have it delivered again).
 - A transform's `process_event` returns any number of outputs, sent tied to their input (so the trace continues), then the input is acked. A stateful transform returns none until it's ready, and can emit later through its `LocalSink`: `emit` starts a new trace, `emit_linked` continues an earlier input's.
-- A source emits through the `LocalSink` it gets in `initialize`: `emit` (waits for credit), or `emit_confirmed` (also waits until the hub has stored the event).
+- A source emits through the `LocalSink` it gets in `initialize`: `emit` (waits for credit), or `emit_confirmed` (also waits until the hub has stored the event). `ready` waits for credit without sending, so a source can drop stale data instead of queueing it.
 
-[`plugins/http_sink`](plugins/http_sink) is a complete example, including its package files and its trellis tests (`tests/trellis.rs`, with trellis as a dev-dependency). Package it with `cargo trellis package plugins/http_sink` (`--target <triple>` to cross-build, e.g. for a Raspberry Pi).
+[`plugins/http_sink`](plugins/http_sink) (a sink) and [`plugins/ticker`](plugins/ticker) (a source) are complete examples, including its package files and its trellis tests (`tests/trellis.rs`, with trellis as a dev-dependency). Package it with `cargo trellis package plugins/http_sink` (`--target <triple>` to cross-build, e.g. for a Raspberry Pi).
 
 **In any other language:** build an executable that follows the [plugin protocol](docs/protocol.md). Generate message types from `plugin/schema/*.proto`, implement the framing (a few dozen lines in most languages), and follow the lifecycle and reconnect rule; section 16 of the spec lists the minimum. [`examples/plugins/`](examples/plugins) has minimal demo HTTP sinks in Python, Go, TypeScript (Node.js) and Java, each with a `build.sh` that produces an uploadable package. Check yours with trellis (`cargo trellis audit <package>`; `test` and `bench` too), and package it with `cargo trellis package` and a `[build]` command in `trellis.toml`.
 
@@ -382,7 +382,7 @@ curl -F file=@target/plugins/http-sink-0.0.1-macos-aarch64.zip http://localhost:
 
 flwrs is in early development. The main things still missing, roughly in order:
 
-1. **A set of base plugins.** Common sources, transforms and sinks (timers, MQTT, HTTP in and out, files, databases, scripting, ML inference, …), so typical workflows need no custom plugin. Today there's only the HTTP sink.
+1. **A set of base plugins.** Common sources, transforms and sinks (timers, MQTT, HTTP in and out, files, databases, scripting, ML inference, …), so typical workflows need no custom plugin. Today there's the HTTP sink and the ticker ([plugins/ticker](plugins/ticker): interval or cron).
 2. **Alternative storage back-ends**, such as PostgreSQL. Today scenes, nodes, edges and the plugin registry live in SQLite only (the `Database` enum in `flwrs-core` has a single variant); a shared database is also a step towards running several servers.
 3. **A web UI** for building and running scenes visually (nodes, edges, mappings, status), instead of through the REST API.
 4. **Running as a cluster.** The server currently runs in **single-node mode only**: one server runs every scene it has, and there's no swarming, no handover of scenes between servers, and no load balancing. Remote plugins can run on other machines, but they all connect to one hub. Running properly in a data-centre environment (in-cluster) needs scenes spread across servers, failover, and load balancing.

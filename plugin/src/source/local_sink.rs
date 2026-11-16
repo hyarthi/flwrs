@@ -26,6 +26,16 @@ impl LocalSink {
             .map_err(SourceError::new)
     }
 
+    /// Waits until [`LocalSink::emit`] would send at once: the plugin is
+    /// connected and the hub has granted credit (or doesn't use `CREDITS`).
+    /// Sends nothing and is cancel-safe, so a source can race it against its
+    /// own clock, e.g. to drop a tick that would go out late rather than
+    /// queue it. With one task emitting, the next `emit` then doesn't wait
+    /// for credit.
+    pub async fn ready(&self) -> Result<(), SourceError> {
+        self.client.ready().await.map_err(SourceError::new)
+    }
+
     /// Like [`LocalSink::emit`], then waits until the hub has taken the event:
     /// routed it, and stored it where the target's queue is durable. Use it
     /// when the event's origin must be told only once it's safe (e.g. a

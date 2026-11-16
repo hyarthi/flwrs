@@ -1,0 +1,28 @@
+[package]
+name = "flwrs-ticker"
+description = "flwrs source plugin that emits a tick at an interval or on a cron schedule."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls"] } # TLS for remote use
+tokio.workspace = true
+clap.workspace = true
+log.workspace = true
+jiff.workspace = true
+croner.workspace = true
+pbjson-types.workspace = true # DATETIME values
+getrandom.workspace = true # jitter
+
+[dev-dependencies]
+serde_json.workspace = true
+jsonschema.workspace = true # the launch-args schema against the CLI
+flwrs-plugin = { workspace = true, features = ["package"] }
+tokio = { workspace = true, features = ["test-util"] } # paused clock in the schedule tests
+flwrs-trellis.workspace = true # tests/trellis.rs: audit and behaviour tests

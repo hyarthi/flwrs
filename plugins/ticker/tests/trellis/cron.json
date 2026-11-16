@@ -1,0 +1,1 @@
+{ "cron": "* * * * * *", "fire_on_start": true, "label": "every-second" }

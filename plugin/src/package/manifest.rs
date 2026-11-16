@@ -13,7 +13,7 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 pub const MANIFEST_VERSION: u32 = 1;
 
 /// Hub bootstrap arguments; a node's `launch_args` can't override them.
-pub const RESERVED_ARGS: [&str; 5] = ["id", "host", "port", "log-level", "token"];
+pub const RESERVED_ARGS: [&str; 5] = crate::plugin::core::BOOTSTRAP_ARGS;
 
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]

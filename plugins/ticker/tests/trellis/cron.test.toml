@@ -1,0 +1,9 @@
+name = "cron every second, with a start tick"
+launch_args = "cron.json"
+initial_credit = 0
+return_credit = false
+
+[[steps]]
+grant = 2
+within_ms = 3000
+expect_outputs = [{ path = "seq", eq = 1 }, { path = "label", eq = "every-second" }]

@@ -1,0 +1,7 @@
+# The ticker at its fastest interval (10 ms): its accuracy and footprint.
+# Throughput is the schedule's (≈ 100 ticks/s), not a limit of the plugin.
+name = "every 10 ms"
+launch_args = "fast.json"
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3

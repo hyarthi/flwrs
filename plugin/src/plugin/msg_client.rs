@@ -217,6 +217,33 @@ impl HubClient {
     /// Sends a data event: waits for credit if the hub uses credits, and
     /// returns its seq. With `confirm`, also returns a receiver for the hub's
     /// ACK / NACK (resolved at once if the hub doesn't use acks).
+    /// Waits until an event could be sent without waiting for credit: the
+    /// connection is ready and has credit (or the hub didn't enable
+    /// `CREDITS`). Sends nothing, so it's cancel-safe. Fails while not
+    /// connected, like [`HubClient::send_event`].
+    pub(crate) async fn ready(&self) -> io::Result<()> {
+        loop {
+            let credit = self.credit.notified();
+            tokio::pin!(credit);
+            credit.as_mut().enable();
+            {
+                let guard = self.conn.lock().await;
+                if self.stage() < Stage::Ready {
+                    return Err(not_connected());
+                }
+                let conn = guard.as_ref().ok_or_else(not_connected)?;
+                if conn.credit != Some(0) {
+                    return Ok(());
+                }
+            }
+            let mut stage = self.stage.subscribe();
+            tokio::select! {
+                _ = &mut credit => {}
+                _ = stage.wait_for(|s| *s < Stage::Ready) => return Err(not_connected()),
+            }
+        }
+    }
+
     pub(crate) async fn send_event(
         &self,
         payload: PluginPayload,

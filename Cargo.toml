@@ -3,7 +3,7 @@ resolver = "3"
 # Members are listed explicitly (no `plugins/*` glob), so folders under plugins/
 # that aren't Rust crates (non-Rust plugins, installed packages) can't break the
 # workspace. Add each new Rust plugin here.
-members = ["core", "app", "plugin", "plugins/http_sink", "trellis"]
+members = ["core", "app", "plugin", "plugins/http_sink", "plugins/ticker", "trellis"]
 
 # Shared package metadata; crates opt in with `<field>.workspace = true`.
 [workspace.package]
@@ -19,7 +19,7 @@ repository = "https://github.com/hyarthi/flwrs"
 # internal crates
 flwrs-core = { path = "core" }
 # Without default features: crates opt into the SDK's TLS client (feature `tls`).
-flwrs-plugin = { path = "plugin", version = "0.0.4", default-features = false }
+flwrs-plugin = { path = "plugin", version = "0.0.5", default-features = false }
 # The developer toolkit, as a dev-dependency of the plugins here (their tests run it).
 flwrs-trellis = { path = "trellis" }
 
@@ -47,6 +47,11 @@ serde_json = "1.0.154"
 jsonschema = { version = "0.60.2", default-features = false, features = ["idna"] }
 zip = { version = "9.3.0", default-features = false, features = ["deflate"] }
 glob = "0.3.4" # trellis: test/bench file lists and package include/exclude patterns
+
+# time (ticker): jiff reads the system time zone database on Unix and bundles it
+# on Windows, so the binary stays small; croner on top of it for cron patterns.
+jiff = "0.2.45"
+croner = { version = "4.0.3", default-features = false, features = ["jiff"] }
 
 # storage
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "chrono", "derive"] }

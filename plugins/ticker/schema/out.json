@@ -1,0 +1,9 @@
+{
+  "fields": [
+    { "key": "tick_time", "description": "When the tick was scheduled", "type": "DATETIME" },
+    { "key": "emit_time", "description": "When the tick was sent", "type": "DATETIME" },
+    { "key": "seq", "description": "Tick number since the plugin started, from 1", "type": "U64" },
+    { "key": "missed", "description": "Ticks dropped since the previous one", "type": "U32" },
+    { "key": "label", "description": "The node's label launch arg", "type": "STRING" }
+  ]
+}
