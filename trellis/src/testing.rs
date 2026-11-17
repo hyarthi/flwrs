@@ -5,6 +5,7 @@
 //! # tests/uppercase.test.toml
 //! name = "uppercases the text"
 //! launch_args = "node.json"            # the node's launch_args (JSON file), optional
+//! uploads = { "model.onnx" = "model.onnx" }  # files uploaded to the node, optional
 //!
 //! [[steps]]
 //! send = "payloads/hello.json"         # plain JSON shaped by the in schema
@@ -54,6 +55,10 @@ pub struct TestFile {
     pub name: Option<String>,
     /// A JSON file with the node's `launch_args`.
     pub launch_args: Option<String>,
+    /// Files uploaded to the node, by name (paths relative to this file),
+    /// on top of `[uploads]` in trellis.toml.
+    #[serde(default)]
+    pub uploads: BTreeMap<String, String>,
     /// Extra plugin arguments.
     #[serde(default)]
     pub args: Vec<String>,
@@ -303,6 +308,7 @@ impl Tester {
         let file = TestFile {
             name: Some("smoke".into()),
             launch_args: None,
+            uploads: BTreeMap::new(),
             args: vec![],
             env: BTreeMap::new(),
             setup: vec![],
@@ -389,6 +395,9 @@ impl Tester {
 
     fn prepare(&self, file: &TestFile, port: u16) -> Result<Target, String> {
         let mut target = self.target.clone();
+        for (name, path) in &file.uploads {
+            target = target.with_upload(name, file.dir.join(path))?;
+        }
         if let Some(path) = &file.launch_args {
             let path = file.dir.join(path);
             let text =

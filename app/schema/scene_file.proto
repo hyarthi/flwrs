@@ -49,8 +49,23 @@ message Node {
   string plugin_version = 5;
   // The node's config as JSON text. JSON rather than google.protobuf.Struct,
   // which would turn every number into a double (launch_args keep integers).
-  // Remote nodes always have `remote_id`; `token` only with includes_secrets.
+  // Remote nodes always have `remote_id`; `token` and the plugin's
+  // launch-args secrets only with includes_secrets.
   string config_json = 6;
+  // JSON pointers of the launch-args secrets this node had set that the
+  // export left out (without includes_secrets): they need setting again.
+  repeated string omitted_secrets = 8;
+  // The files uploaded to the node. A `.far` archive carries their content
+  // (found by its SHA-256); a bare `.flwr` only lists them.
+  repeated NodeFile files = 7;
+}
+
+message NodeFile {
+  // The upload's name (what the node's launch args call it).
+  string name = 1;
+  // Lowercase hex SHA-256 of the content.
+  string sha256 = 2;
+  uint64 size = 3;
 }
 
 message Edge {

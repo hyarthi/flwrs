@@ -1,8 +1,14 @@
 //! The plugin under check: its executable, its manifest and how to start it.
+//!
+//! It runs as on the server: in a node folder (a temporary one here) with a
+//! link to each top-level entry of the package, its `launch_args` delivered as
+//! arguments, environment variables and files in `config/`, and files
+//! uploaded to the node linked into `config/` too.
 
+use flwrs_plugin::package::launch::check_file_name;
 use flwrs_plugin::package::{
-    self, LaunchArgsStyle, Limits, MANIFEST_FILE, Manifest, current_platform, launch_args_to_argv,
-    validate_launch_args,
+    self, CONFIG_DIR, ConfigContent, LaunchSpec, Limits, MANIFEST_FILE, Manifest, SchemaSource,
+    current_platform, validate_launch_args,
 };
 use flwrs_plugin::schema::payload::SchemaDefinition;
 use flwrs_plugin::schema::protocol::plugin_type::Enum as PluginType;
@@ -16,12 +22,13 @@ use std::sync::Arc;
 pub struct Target {
     /// The executable.
     pub program: PathBuf,
-    /// Working directory: the package's folder, as on the server.
+    /// The package's folder.
     pub cwd: PathBuf,
     pub manifest: Manifest,
     pub plugin_type: PluginType,
     pub version: String,
-    /// From the manifest: what the plugin must declare.
+    /// What the plugin must declare: the manifest's schemas, or the node's
+    /// own (from its `launch_args`, manifest version 2).
     pub in_schema: Option<SchemaDefinition>,
     pub out_schema: Option<SchemaDefinition>,
     /// The node's `launch_args` (as on the server) and the arguments they become.
@@ -32,8 +39,12 @@ pub struct Target {
     pub env: Vec<(String, String)>,
     /// Show the plugin's stdout and stderr instead of discarding them.
     pub show_output: bool,
+    /// Files uploaded to the node: name → file.
+    uploads: Vec<(String, PathBuf)>,
     /// Keeps an unpacked package's temporary folder alive.
     unpacked: Option<Arc<tempfile::TempDir>>,
+    /// The node's folder: the plugin's working directory.
+    node: Arc<tempfile::TempDir>,
 }
 
 impl Target {
@@ -65,17 +76,20 @@ impl Target {
         if !problems.is_empty() {
             return Err(format!("{MANIFEST_FILE}: {}", problems.join("; ")));
         }
-        let schema = |path: &Option<String>| -> Result<Option<SchemaDefinition>, String> {
-            match path {
+        // A per-node schema's default stands in until the launch args set one.
+        let schema = |source: &Option<SchemaSource>| -> Result<Option<SchemaDefinition>, String> {
+            match source.as_ref().and_then(|s| s.file()) {
                 None => Ok(None),
                 Some(file) => rules::parse_json(&read(file)?)
                     .map(Some)
                     .map_err(|e| format!("{file}: {e}")),
             }
         };
+        let cwd = std::path::absolute(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         Ok(Self {
-            program: dir.join(&manifest.executable),
-            cwd: dir.to_path_buf(),
+            program: cwd.join(&manifest.executable),
+            node: Arc::new(node_folder(&cwd)?),
+            cwd,
             plugin_type: protocol_type(manifest.plugin_type),
             version: manifest.version.clone(),
             in_schema: schema(&manifest.payload_schemas.input)?,
@@ -86,6 +100,7 @@ impl Target {
             args: vec![],
             env: vec![],
             show_output: false,
+            uploads: vec![],
             unpacked: None,
         })
     }
@@ -116,30 +131,105 @@ impl Target {
         self
     }
 
+    /// A file uploaded to the node as `name` (what a `"source": "upload"`
+    /// launch arg names). Add uploads before [`Target::with_launch_args`].
+    pub fn with_upload(mut self, name: &str, file: impl Into<PathBuf>) -> Result<Self, String> {
+        check_file_name(name).map_err(|e| format!("upload name {name:?}: {e}"))?;
+        let file = file.into();
+        if !file.is_file() {
+            return Err(format!("upload {name:?}: {} isn't a file", file.display()));
+        }
+        let file = std::path::absolute(&file).map_err(|e| e.to_string())?;
+        self.uploads.retain(|(n, _)| n != name);
+        self.uploads.push((name.to_string(), file));
+        Ok(self)
+    }
+
     /// Sets the node's `launch_args`, checked like the server checks them
-    /// (the manifest's JSON Schema and `launch_args_style`).
+    /// (the manifest's JSON Schema and launch rules), and delivered the same
+    /// way: arguments, environment variables, and files in a fresh node
+    /// folder's `config/`. With manifest version 2, payload schemas the
+    /// plugin takes from its launch args are taken from `args`.
     pub fn with_launch_args(mut self, args: Value) -> Result<Self, String> {
         let schema = match &self.manifest.launch_args_schema {
             None => None,
             Some(file) => {
                 let text = std::fs::read_to_string(self.cwd.join(file))
                     .map_err(|e| format!("{file}: {e}"))?;
-                let value: Value =
-                    serde_json::from_str(&text).map_err(|e| format!("{file}: {e}"))?;
-                Some(
-                    jsonschema::validator_for(&value)
-                        .map_err(|e| format!("{file}: not a valid JSON Schema: {e}"))?,
-                )
+                Some(serde_json::from_str::<Value>(&text).map_err(|e| format!("{file}: {e}"))?)
             }
         };
-        let style: LaunchArgsStyle = self.manifest.launch_args_style;
-        let problems = validate_launch_args(schema.as_ref(), style, &args);
+        let validator = match &schema {
+            None => None,
+            Some(value) => Some(
+                jsonschema::validator_for(value)
+                    .map_err(|e| format!("launch_args_schema: not a valid JSON Schema: {e}"))?,
+            ),
+        };
+        let (spec, report) = LaunchSpec::new(&self.manifest, schema.as_ref());
+        if !report.errors.is_empty() {
+            return Err(report.errors.join("; "));
+        }
+        let problems = validate_launch_args(validator.as_ref(), &spec, &args);
         if !problems.is_empty() {
             return Err(problems.join("; "));
         }
-        self.launch_argv = launch_args_to_argv(style, &args).map_err(|e| e.join("; "))?;
+        // The node's own payload schemas.
+        let (input, output) = spec.schema_pointers();
+        for (pointer, slot) in [(input, &mut self.in_schema), (output, &mut self.out_schema)] {
+            let Some(pointer) = pointer else { continue };
+            match args.pointer(pointer).filter(|v| !v.is_null()) {
+                Some(value) => {
+                    let parsed = rules::parse_json(&value.to_string())
+                        .map_err(|e| format!("launch_args{pointer}: not a payload schema: {e}"))?;
+                    let problems = rules::check_well_formed(&parsed);
+                    if !problems.is_empty() {
+                        return Err(format!("launch_args{pointer}: {}", problems.join("; ")));
+                    }
+                    *slot = Some(parsed);
+                }
+                None if slot.is_some() => {} // the package's default
+                None => {
+                    return Err(format!(
+                        "launch_args{pointer}: the node's payload schema is required"
+                    ));
+                }
+            }
+        }
+
+        let node = node_folder(&self.cwd)?;
+        let config = node.path().join(CONFIG_DIR);
+        let plan = spec.plan(&args, &config).map_err(|e| e.join("; "))?;
+        if !plan.files.is_empty() {
+            std::fs::create_dir(&config).map_err(|e| format!("{}: {e}", config.display()))?;
+        }
+        for file in &plan.files {
+            let path = config.join(&file.name);
+            match &file.content {
+                ConfigContent::Data(bytes) => std::fs::write(&path, bytes)
+                    .map_err(|e| format!("config/{}: {e}", file.name))?,
+                ConfigContent::Upload(name) => {
+                    let (_, source) = self.uploads.iter().find(|(n, _)| n == name).ok_or_else(|| {
+                        format!(
+                            "launch_args name the uploaded file {name:?}; add it first (Target::with_upload, `[uploads]` in trellis.toml, `uploads` in a test file, or --upload)"
+                        )
+                    })?;
+                    link(source, &path, false).map_err(|e| format!("config/{}: {e}", file.name))?;
+                }
+            }
+        }
+        self.env
+            .retain(|(k, _)| !plan.env.iter().any(|(n, _)| n == k));
+        self.env.extend(plan.env);
+        self.launch_argv = plan.argv;
         self.launch_args = args;
+        self.node = Arc::new(node);
         Ok(self)
+    }
+
+    /// The plugin's working directory: the node's folder.
+    pub fn workdir(&self) -> &Path {
+        self.node.path()
     }
 
     /// Everything after the bootstrap arguments.
@@ -156,10 +246,164 @@ impl Target {
     }
 }
 
+/// A fresh node folder: a link to each top-level entry of `package`.
+fn node_folder(package: &Path) -> Result<tempfile::TempDir, String> {
+    let node = tempfile::tempdir().map_err(|e| format!("temporary folder: {e}"))?;
+    let entries = std::fs::read_dir(package).map_err(|e| format!("{}: {e}", package.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        if name == CONFIG_DIR {
+            continue;
+        }
+        let is_dir = entry.file_type().map_err(|e| e.to_string())?.is_dir();
+        link(&entry.path(), &node.path().join(&name), is_dir)
+            .map_err(|e| format!("linking {}: {e}", entry.path().display()))?;
+    }
+    Ok(node)
+}
+
+#[cfg(unix)]
+fn link(target: &Path, path: &Path, _is_dir: bool) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, path)
+}
+
+/// Elsewhere: symbolic links if allowed, else hard links (files) or copies.
+#[cfg(not(unix))]
+fn link(target: &Path, path: &Path, is_dir: bool) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let linked = if is_dir {
+            std::os::windows::fs::symlink_dir(target, path)
+        } else {
+            std::os::windows::fs::symlink_file(target, path)
+        };
+        if linked.is_ok() {
+            return Ok(());
+        }
+    }
+    if is_dir {
+        copy_dir(target, path)
+    } else {
+        std::fs::hard_link(target, path).or_else(|_| std::fs::copy(target, path).map(|_| ()))
+    }
+}
+
+#[cfg(not(unix))]
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let dest = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), dest)?;
+        }
+    }
+    Ok(())
+}
+
 fn protocol_type(t: package::PluginType) -> PluginType {
     match t {
         package::PluginType::Source => PluginType::Source,
         package::PluginType::Sink => PluginType::Sink,
         package::PluginType::Transform => PluginType::Transform,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A manifest v2 transform package folder.
+    fn package() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |path: &str, text: &str| {
+            let p = dir.path().join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        write(
+            "manifest.json",
+            r#"{"manifest_version": 2, "id": "script", "name": "Script", "version": "0.1.0",
+                "type": "TRANSFORM", "executable": "bin/run",
+                "launch_args_schema": "schema/launch_args.json",
+                "payload_schemas": {"in": {"from_launch_args": "/schemas/in"},
+                                    "out": {"from_launch_args": "/schemas/out", "default": "schema/out.json"}}}"#,
+        );
+        write(
+            "schema/launch_args.json",
+            r#"{"type": "object", "properties": {
+                "schemas": {"type": "object", "properties": {"in": {"type": "object"}, "out": {"type": "object"}}},
+                "script": {"type": "string", "x-flwrs-launch": {"via": "file"}},
+                "model": {"type": "string", "x-flwrs-launch": {"via": "file", "source": "upload"}},
+                "key": {"type": "string", "writeOnly": true, "x-flwrs-launch": {"via": "env", "alias": "SCRIPT_KEY"}}}}"#,
+        );
+        write(
+            "schema/out.json",
+            r#"{"fields": [{"key": "y", "type": "STRING"}]}"#,
+        );
+        write("bin/run", "#!/bin/sh\n");
+        dir
+    }
+
+    #[test]
+    fn runs_like_the_server() {
+        let dir = package();
+        let model = dir.path().join("weights.bin");
+        std::fs::write(&model, "weights").unwrap();
+        let target = Target::from_package(dir.path())
+            .unwrap()
+            .with_upload("model.onnx", &model)
+            .unwrap()
+            .with_launch_args(json!({
+                "schemas": {"in": {"fields": [{"key": "x", "type": "U64"}]}},
+                "script": "return payload",
+                "model": "model.onnx",
+                "key": "secret"
+            }))
+            .unwrap();
+        // the node's own in schema; the package's default out schema
+        assert_eq!(target.in_schema.as_ref().unwrap().fields[0].key, "x");
+        assert_eq!(target.out_schema.as_ref().unwrap().fields[0].key, "y");
+        // a node folder with the package linked in and config/
+        let work = target.workdir();
+        assert!(work.join("bin/run").is_file());
+        assert_eq!(
+            std::fs::read_to_string(work.join("config/script")).unwrap(),
+            "return payload"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join("config/model.onnx")).unwrap(),
+            "weights"
+        );
+        assert!(target.argv().any(|a| a == "--model"));
+        assert!(target.env.contains(&("SCRIPT_KEY".into(), "secret".into())));
+    }
+
+    #[test]
+    fn refuses_what_the_server_refuses() {
+        let dir = package();
+        let target = Target::from_package(dir.path()).unwrap();
+        let e = target
+            .clone()
+            .with_launch_args(json!({"script": "x"}))
+            .unwrap_err();
+        assert!(
+            e.contains("launch_args/schemas/in: the node's payload schema is required"),
+            "{e}"
+        );
+        let e = target
+            .clone()
+            .with_launch_args(json!({"schemas": {"in": {"fields": []}}, "model": "m.onnx"}))
+            .unwrap_err();
+        assert!(e.contains("add it first"), "{e}");
+        assert!(
+            target
+                .with_upload(".x", dir.path().join("bin/run"))
+                .is_err()
+        );
     }
 }

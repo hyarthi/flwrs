@@ -1,7 +1,96 @@
 use crate::modules::node_config::SceneDefaults;
-use crate::modules::scene::service::{EdgeRow, ListFilters, NodeRow, Scene};
+use crate::modules::scene::service::{EdgeRow, ListFilters, NodeRow, NodeUpload, Scene};
 use chrono::Local;
 use sqlx::{Sqlite, SqliteConnection};
+
+// --- uploaded node files ---
+
+pub(super) async fn list_uploads(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+) -> Result<Vec<NodeUpload>, sqlx::Error> {
+    sqlx::query_as::<Sqlite, NodeUpload>(
+        "SELECT * FROM scene_node_uploads WHERE node_id = $1 ORDER BY \"name\"",
+    )
+    .bind(node_id)
+    .fetch_all(conn)
+    .await
+}
+
+pub(super) async fn list_scene_uploads(
+    conn: &mut SqliteConnection,
+    scene_id: &str,
+) -> Result<Vec<NodeUpload>, sqlx::Error> {
+    sqlx::query_as::<Sqlite, NodeUpload>(
+        "SELECT u.* FROM scene_node_uploads u JOIN scene_nodes n ON n.id = u.node_id \
+         WHERE n.scene_id = $1 ORDER BY u.node_id, u.\"name\"",
+    )
+    .bind(scene_id)
+    .fetch_all(conn)
+    .await
+}
+
+pub(super) async fn get_upload(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    name: &str,
+) -> Result<NodeUpload, sqlx::Error> {
+    sqlx::query_as::<Sqlite, NodeUpload>(
+        "SELECT * FROM scene_node_uploads WHERE node_id = $1 AND \"name\" = $2",
+    )
+    .bind(node_id)
+    .bind(name)
+    .fetch_one(conn)
+    .await
+}
+
+/// Adds or replaces the node's upload named `name`.
+pub(super) async fn put_upload(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    name: &str,
+    sha256: &str,
+    size: i64,
+) -> Result<NodeUpload, sqlx::Error> {
+    sqlx::query_as::<Sqlite, NodeUpload>(
+        "INSERT INTO scene_node_uploads (node_id, \"name\", sha256, \"size\", create_time) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (node_id, \"name\") DO UPDATE SET sha256 = excluded.sha256, \
+             \"size\" = excluded.\"size\", create_time = excluded.create_time \
+         RETURNING *",
+    )
+    .bind(node_id)
+    .bind(name)
+    .bind(sha256)
+    .bind(size)
+    .bind(Local::now())
+    .fetch_one(conn)
+    .await
+}
+
+pub(super) async fn delete_upload(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    name: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM scene_node_uploads WHERE node_id = $1 AND \"name\" = $2")
+        .bind(node_id)
+        .bind(name)
+        .execute(conn)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Every stored file some node still has: (name, sha256).
+pub(super) async fn stored_files(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as::<Sqlite, (String, String)>(
+        "SELECT DISTINCT \"name\", sha256 FROM scene_node_uploads",
+    )
+    .fetch_all(conn)
+    .await
+}
 
 // --- scenes ---
 

@@ -22,6 +22,12 @@ pub(crate) struct DirectorConfig {
     pub spill_max_bytes: u64,
     /// Never spill if the spool filesystem would have less free space than this.
     pub spill_min_free_bytes: u64,
+    /// Local nodes' folders (their working directories): `<nodes_dir>/<scene-id>/<node-id>/`.
+    /// Kept until the node or its scene is deleted.
+    pub nodes_dir: PathBuf,
+    /// Files uploaded to nodes: `<files_dir>/<stem>_<sha256><.ext>`, stored
+    /// once per name and content; removed once no node has them.
+    pub files_dir: PathBuf,
 }
 
 impl Default for DirectorConfig {
@@ -33,6 +39,8 @@ impl Default for DirectorConfig {
             memory_soft_inflight_bytes: 128 * 1024 * 1024,
             spill_max_bytes: 10 * 1024 * 1024 * 1024,
             spill_min_free_bytes: 1024 * 1024 * 1024,
+            nodes_dir: PathBuf::from("./nodes"),
+            files_dir: PathBuf::from("./files"),
         }
     }
 }

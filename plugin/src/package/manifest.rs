@@ -1,16 +1,21 @@
 //! Plugin manifest (`manifest.json` at the root of a plugin package) and the
 //! rules for a node's `launch_args`, which the manifest defines.
 //!
-//! The format is described in the repository README (*Plugin packages*). The
+//! The format is specified in `docs/plugin-spec.md` in the repository. The
 //! server and `flwrs-trellis` share this code, so a package that passes
 //! `flwrs-trellis package` passes the server's upload checks too.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path};
 
 pub const MANIFEST_FILE: &str = "manifest.json";
-pub const MANIFEST_VERSION: u32 = 1;
+/// The newest manifest version; every version from 1 up to it is read.
+pub const MANIFEST_VERSION: u32 = 2;
+/// A package can't have a top-level entry with this name: it's the node
+/// folder's `config/` (the files the server provides to a node).
+pub const RESERVED_ENTRY: &str = "config";
 
 /// Hub bootstrap arguments; a node's `launch_args` can't override them.
 pub const RESERVED_ARGS: [&str; 5] = crate::plugin::core::BOOTSTRAP_ARGS;
@@ -42,21 +47,77 @@ pub enum LaunchArgsStyle {
     Flags,
     /// `["a", "b"]` → `a b`, verbatim.
     Positional,
-    /// Any JSON → `--launch-args '<json>'`.
-    Json,
+}
+
+/// Where a payload schema comes from.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SchemaSource {
+    /// A file in the package.
+    Path(String),
+    /// The node's config (manifest version 2).
+    FromLaunchArgs(FromLaunchArgs),
+}
+
+/// `{"from_launch_args": "/schemas/out", "default": "schema/out.json"}`: the
+/// schema is the `SchemaDefinition` at a JSON pointer into the node's
+/// `launch_args`; `default` (a file in the package) applies when it's absent.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FromLaunchArgs {
+    pub from_launch_args: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+impl SchemaSource {
+    /// The package file: the path, or the default of a per-node schema.
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            SchemaSource::Path(p) => Some(p),
+            SchemaSource::FromLaunchArgs(f) => f.default.as_deref(),
+        }
+    }
+
+    /// The JSON pointer of a per-node schema.
+    pub fn pointer(&self) -> Option<&str> {
+        match self {
+            SchemaSource::Path(_) => None,
+            SchemaSource::FromLaunchArgs(f) => Some(&f.from_launch_args),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct PayloadSchemaPaths {
+pub struct PayloadSchemas {
     #[serde(rename = "in", default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<String>,
+    pub input: Option<SchemaSource>,
     #[serde(rename = "out", default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
+    pub output: Option<SchemaSource>,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+/// How the plugin is presented in a UI (manifest version 2).
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct Ui {
+    /// SVG or PNG file in the package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Free tags for grouping and filtering, e.g. `["Messaging", "IoT"]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+    /// `#RRGGBB`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Markdown file in the package: the help text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs: Option<String>,
+}
+
+/// `manifest.json`. Unknown fields are refused, except top-level `x-*` ones
+/// (kept in `extensions`; see [`Manifest::warnings`]).
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Manifest {
     pub manifest_version: u32,
     pub id: String,
@@ -76,9 +137,15 @@ pub struct Manifest {
     #[serde(default)]
     pub launch_args_style: LaunchArgsStyle,
     #[serde(default)]
-    pub payload_schemas: PayloadSchemaPaths,
+    pub payload_schemas: PayloadSchemas,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_defaults: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<Ui>,
+    /// Every other field. Only `x-*` ones are allowed (a warning); the rest
+    /// are errors in [`Manifest::validate`].
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 /// The platform this hub runs on, in manifest notation (`macos-aarch64`, `linux-x86_64`, …).
@@ -94,11 +161,14 @@ impl Manifest {
     /// the server's runtime settings, which the server checks itself.
     pub fn validate(&self, platform: &str) -> Vec<String> {
         let mut errors = vec![];
-        if self.manifest_version != MANIFEST_VERSION {
+        if !(1..=MANIFEST_VERSION).contains(&self.manifest_version) {
             errors.push(format!(
-                "manifest_version {} is not supported (expected {MANIFEST_VERSION})",
+                "manifest_version {} is not supported (1 to {MANIFEST_VERSION})",
                 self.manifest_version
             ));
+        }
+        for key in self.extensions.keys().filter(|k| !k.starts_with("x-")) {
+            errors.push(format!("unknown field {key:?}"));
         }
         if !is_valid_id(&self.id) {
             errors.push(format!(
@@ -136,6 +206,33 @@ impl Manifest {
             PluginType::Transform => (true, true),
         };
         let schemas = &self.payload_schemas;
+        let v2 = self.manifest_version >= 2;
+        for (name, source) in [("in", &schemas.input), ("out", &schemas.output)] {
+            if let Some(SchemaSource::FromLaunchArgs(f)) = source {
+                if !v2 {
+                    errors.push(format!(
+                        "payload_schemas.{name}.from_launch_args needs manifest_version 2"
+                    ));
+                }
+                if self.launch_args_schema.is_none() {
+                    errors.push(format!(
+                        "payload_schemas.{name}.from_launch_args needs a launch_args_schema"
+                    ));
+                }
+                if let Err(e) = parse_pointer(&f.from_launch_args) {
+                    errors.push(format!(
+                        "payload_schemas.{name}.from_launch_args {:?}: {e}",
+                        f.from_launch_args
+                    ));
+                }
+            }
+        }
+        if let Some(ui) = &self.ui {
+            if !v2 {
+                errors.push("ui needs manifest_version 2".into());
+            }
+            errors.extend(ui.validate());
+        }
         for (name, needed, present) in [
             ("in", needs_in, schemas.input.is_some()),
             ("out", needs_out, schemas.output.is_some()),
@@ -163,20 +260,95 @@ impl Manifest {
         errors
     }
 
+    /// Problems that don't make the manifest invalid: `x-*` fields, which
+    /// this server doesn't know and ignores.
+    pub fn warnings(&self) -> Vec<String> {
+        self.extensions
+            .keys()
+            .filter(|k| k.starts_with("x-"))
+            .map(|k| format!("field {k:?} isn't known to this server and is ignored"))
+            .collect()
+    }
+
     /// Every path the manifest points to, with the field it comes from.
     pub fn file_references(&self) -> Vec<(&'static str, &str)> {
         let mut refs = vec![("executable", self.executable.as_str())];
         if let Some(p) = &self.launch_args_schema {
             refs.push(("launch_args_schema", p));
         }
-        if let Some(p) = &self.payload_schemas.input {
+        if let Some(p) = self.payload_schemas.input.as_ref().and_then(|s| s.file()) {
             refs.push(("payload_schemas.in", p));
         }
-        if let Some(p) = &self.payload_schemas.output {
+        if let Some(p) = self.payload_schemas.output.as_ref().and_then(|s| s.file()) {
             refs.push(("payload_schemas.out", p));
+        }
+        if let Some(ui) = &self.ui {
+            if let Some(p) = &ui.icon {
+                refs.push(("ui.icon", p));
+            }
+            if let Some(p) = &ui.docs {
+                refs.push(("ui.docs", p));
+            }
         }
         refs
     }
+}
+
+impl Ui {
+    fn validate(&self) -> Vec<String> {
+        let mut errors = vec![];
+        let mut seen = HashSet::new();
+        for c in &self.categories {
+            if c.trim().is_empty() || c.chars().count() > 64 {
+                errors.push(format!(
+                    "ui.categories: {c:?} must be 1 to 64 characters, not blank"
+                ));
+            } else if !seen.insert(c.as_str()) {
+                errors.push(format!("ui.categories: {c:?} is listed twice"));
+            }
+        }
+        if let Some(color) = &self.color {
+            let hex = color.strip_prefix('#').unwrap_or_default();
+            if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                errors.push(format!("ui.color {color:?} must be #RRGGBB"));
+            }
+        }
+        if let Some(icon) = &self.icon {
+            let lower = icon.to_ascii_lowercase();
+            if !(lower.ends_with(".svg") || lower.ends_with(".png")) {
+                errors.push(format!("ui.icon {icon:?} must be an .svg or .png file"));
+            }
+        }
+        errors
+    }
+}
+
+/// Parses a JSON pointer (RFC 6901) into its reference tokens. The root
+/// pointer `""` isn't allowed: a schema must be a field of the config.
+pub fn parse_pointer(pointer: &str) -> Result<Vec<String>, &'static str> {
+    let Some(rest) = pointer.strip_prefix('/') else {
+        return Err("must be a JSON pointer starting with '/'");
+    };
+    let mut tokens = vec![];
+    for raw in rest.split('/') {
+        if raw.is_empty() {
+            return Err("has an empty segment");
+        }
+        let mut token = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '~' => match chars.next() {
+                    Some('0') => token.push('~'),
+                    Some('1') => token.push('/'),
+                    _ => return Err("has '~' not followed by 0 or 1"),
+                },
+                c => token.push(c),
+            }
+        }
+        tokens.push(token);
+    }
+    Ok(tokens)
 }
 
 pub fn is_valid_id(id: &str) -> bool {
@@ -300,51 +472,12 @@ pub fn launch_args_to_argv(
                 argv.push(s.to_string());
             }
         }
-        LaunchArgsStyle::Json => argv.extend(["--launch-args".to_string(), args.to_string()]),
     }
     if errors.is_empty() {
         Ok(argv)
     } else {
         Err(errors)
     }
-}
-
-/// Validates a node's `launch_args` against the plugin's JSON Schema (if it
-/// has one) and the conversion rules of its `launch_args_style`.
-pub fn validate_launch_args(
-    schema: Option<&jsonschema::Validator>,
-    style: LaunchArgsStyle,
-    args: &Value,
-) -> Vec<String> {
-    // Omitted launch_args means "no extra arguments": validate the style's
-    // empty value, so schemas with required keys still catch the omission.
-    // The json style passes nothing at all when omitted, so there's nothing to check.
-    let empty_object = Value::Object(Default::default());
-    let empty_array = Value::Array(vec![]);
-    let effective = match (args, style) {
-        (Value::Null, LaunchArgsStyle::Flags) => Some(&empty_object),
-        (Value::Null, LaunchArgsStyle::Positional) => Some(&empty_array),
-        (Value::Null, LaunchArgsStyle::Json) => None,
-        _ => Some(args),
-    };
-    let mut errors: Vec<String> = match (schema, effective) {
-        (Some(validator), Some(args)) => validator
-            .iter_errors(args)
-            .map(|e| {
-                let at = e.instance_path().to_string();
-                if at.is_empty() {
-                    format!("launch_args: {e}")
-                } else {
-                    format!("launch_args{at}: {e}")
-                }
-            })
-            .collect(),
-        _ => vec![],
-    };
-    if let Err(conversion) = launch_args_to_argv(style, args) {
-        errors.extend(conversion);
-    }
-    errors
 }
 
 #[cfg(test)]
@@ -364,12 +497,18 @@ mod tests {
             platforms: None,
             launch_args_schema: None,
             launch_args_style: LaunchArgsStyle::Flags,
-            payload_schemas: PayloadSchemaPaths {
-                input: Some("schema/in.json".into()),
+            payload_schemas: PayloadSchemas {
+                input: Some(path("schema/in.json")),
                 output: None,
             },
             runtime_defaults: None,
+            ui: None,
+            extensions: Default::default(),
         }
+    }
+
+    fn path(p: &str) -> SchemaSource {
+        SchemaSource::Path(p.into())
     }
 
     #[test]
@@ -384,7 +523,7 @@ mod tests {
     #[test]
     fn reports_invalid_fields() {
         let mut m = manifest(PluginType::Sink);
-        m.manifest_version = 2;
+        m.manifest_version = 3;
         m.id = "Bad Id".into();
         m.name = " ".into();
         m.version = "1.0".into();
@@ -393,7 +532,7 @@ mod tests {
         m.runtime_defaults = Some(json!([1]));
         let errors = m.validate("linux-x86_64");
         for fragment in [
-            "manifest_version 2",
+            "manifest_version 3",
             "id \"Bad Id\"",
             "name is empty",
             "version \"1.0\"",
@@ -422,9 +561,9 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("payload_schemas.in isn't used by a SOURCE"))
         );
-        source.payload_schemas = PayloadSchemaPaths {
+        source.payload_schemas = PayloadSchemas {
             input: None,
-            output: Some("o.json".into()),
+            output: Some(path("o.json")),
         };
         assert!(source.validate("x").is_empty());
 
@@ -435,7 +574,7 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("payload_schemas.out is required"))
         );
-        transform.payload_schemas.output = Some("o.json".into());
+        transform.payload_schemas.output = Some(path("o.json"));
         assert!(transform.validate("x").is_empty());
     }
 
@@ -450,6 +589,94 @@ mod tests {
         let bad_type = json!({"manifest_version": 1, "id": "a", "name": "A", "version": "1.0.0",
                               "type": "sink", "executable": "a"});
         assert!(serde_json::from_value::<Manifest>(bad_type).is_err());
+        // unknown top-level fields: x-* is a warning, anything else an error
+        let extra = json!({"manifest_version": 2, "id": "a", "name": "A", "version": "1.0.0",
+                           "type": "SINK", "executable": "a", "payload_schemas": {"in": "i.json"},
+                           "x-vendor": {"a": 1}, "executabel": "a"});
+        let m: Manifest = serde_json::from_value(extra).unwrap();
+        let errors = m.validate("x");
+        assert_eq!(errors, ["unknown field \"executabel\""]);
+        assert!(m.warnings()[0].contains("x-vendor"), "{:?}", m.warnings());
+        // nested objects stay strict
+        let nested = json!({"manifest_version": 2, "id": "a", "name": "A", "version": "1.0.0",
+                            "type": "SINK", "executable": "a", "payload_schemas": {"in": "i.json"},
+                            "ui": {"icons": "a.svg"}});
+        assert!(serde_json::from_value::<Manifest>(nested).is_err());
+    }
+
+    #[test]
+    fn version_2_fields() {
+        let v2 = json!({"manifest_version": 2, "id": "a", "name": "A", "version": "1.0.0",
+                        "type": "TRANSFORM", "executable": "bin/a",
+                        "launch_args_schema": "schema/launch_args.json",
+                        "payload_schemas": {
+                            "in": {"from_launch_args": "/schemas/in"},
+                            "out": {"from_launch_args": "/schemas/out", "default": "schema/out.json"}
+                        },
+                        "ui": {"icon": "ui/a.svg", "categories": ["Transform", "Scripting"],
+                               "color": "#4f7cff", "docs": "README.md"}});
+        let m: Manifest = serde_json::from_value(v2).unwrap();
+        assert!(m.validate("x").is_empty(), "{:?}", m.validate("x"));
+        let refs: Vec<_> = m.file_references().into_iter().map(|(_, p)| p).collect();
+        assert_eq!(
+            refs,
+            [
+                "bin/a",
+                "schema/launch_args.json",
+                "schema/out.json",
+                "ui/a.svg",
+                "README.md"
+            ]
+        );
+        assert_eq!(
+            m.payload_schemas.input.as_ref().unwrap().pointer(),
+            Some("/schemas/in")
+        );
+
+        let mut v1 = m.clone();
+        v1.manifest_version = 1;
+        let errors = v1.validate("x");
+        assert!(errors.iter().any(|e| e.contains("payload_schemas.in.from_launch_args needs manifest_version 2")));
+        assert!(
+            errors.iter().any(|e| e == "ui needs manifest_version 2"),
+            "{errors:?}"
+        );
+
+        let mut bad = m.clone();
+        bad.launch_args_schema = None;
+        bad.payload_schemas.input = Some(SchemaSource::FromLaunchArgs(FromLaunchArgs {
+            from_launch_args: "schemas".into(),
+            default: None,
+        }));
+        bad.ui = Some(Ui {
+            icon: Some("a.gif".into()),
+            categories: vec!["A".into(), "A".into(), " ".into()],
+            color: Some("blue".into()),
+            docs: None,
+        });
+        let errors = bad.validate("x");
+        for fragment in [
+            "needs a launch_args_schema",
+            "must be a JSON pointer",
+            "ui.icon \"a.gif\"",
+            "\"A\" is listed twice",
+            "\" \" must be 1 to 64",
+            "ui.color \"blue\"",
+        ] {
+            assert!(
+                errors.iter().any(|e| e.contains(fragment)),
+                "missing {fragment:?} in {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_pointers() {
+        assert_eq!(parse_pointer("/a/b").unwrap(), ["a", "b"]);
+        assert_eq!(parse_pointer("/a~1b/c~0d").unwrap(), ["a/b", "c~d"]);
+        for bad in ["", "a", "/", "/a//b", "/a~2"] {
+            assert!(parse_pointer(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -501,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn positional_and_json_conversion() {
+    fn positional_conversion() {
         assert_eq!(
             launch_args_to_argv(LaunchArgsStyle::Positional, &json!(["run", "--fast"])).unwrap(),
             ["run", "--fast"]
@@ -512,58 +739,5 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(errors.len(), 3, "{errors:?}");
-        assert_eq!(
-            launch_args_to_argv(LaunchArgsStyle::Json, &json!({"a": [1, 2]})).unwrap(),
-            ["--launch-args", r#"{"a":[1,2]}"#]
-        );
-        assert!(
-            launch_args_to_argv(LaunchArgsStyle::Json, &Value::Null)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn launch_args_schema_validation() {
-        let schema = json!({
-            "type": "object",
-            "properties": {"timeout": {"type": "integer", "minimum": 1}},
-            "additionalProperties": false
-        });
-        let validator = jsonschema::validator_for(&schema).unwrap();
-        assert!(
-            validate_launch_args(
-                Some(&validator),
-                LaunchArgsStyle::Flags,
-                &json!({"timeout": 5})
-            )
-            .is_empty()
-        );
-        let errors = validate_launch_args(
-            Some(&validator),
-            LaunchArgsStyle::Flags,
-            &json!({"timeout": 0, "x": 1}),
-        );
-        assert!(
-            errors.iter().any(|e| e.starts_with("launch_args/timeout:")),
-            "{errors:?}"
-        );
-        assert!(errors.iter().any(|e| e.contains("x")), "{errors:?}");
-        // omitted launch_args validate as the style's empty value
-        assert!(
-            validate_launch_args(Some(&validator), LaunchArgsStyle::Flags, &Value::Null).is_empty()
-        );
-        let required =
-            jsonschema::validator_for(&json!({"type": "object", "required": ["timeout"]})).unwrap();
-        assert!(
-            !validate_launch_args(Some(&required), LaunchArgsStyle::Flags, &Value::Null).is_empty()
-        );
-        assert!(
-            validate_launch_args(Some(&required), LaunchArgsStyle::Json, &Value::Null).is_empty()
-        );
-        // conversion rules apply even without a schema
-        assert!(
-            !validate_launch_args(None, LaunchArgsStyle::Flags, &json!({"token": "t"})).is_empty()
-        );
     }
 }

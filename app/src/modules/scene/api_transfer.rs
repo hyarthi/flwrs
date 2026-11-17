@@ -1,16 +1,18 @@
-//! REST for moving scenes between servers (`.flwr` files), and for checking
-//! whether a scene can run on this one.
+//! REST for moving scenes between servers (`.flwr` files, and `.far`
+//! archives with the nodes' uploaded files), and for checking whether a scene
+//! can run on this one.
 
 use crate::modules::api_error::{ApiError, ErrorBody, api_error};
 use crate::modules::scene::api::{Scene, Svc};
-use crate::modules::scene::scene_file::MAX_FILE_BYTES;
 use crate::modules::scene::service::SceneCheck;
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 use utoipa::{IntoParams, ToSchema};
 
 /// Media type of `.flwr` files.
@@ -48,16 +50,29 @@ pub(crate) struct ImportResponse {
 
 #[derive(Deserialize, IntoParams)]
 pub(crate) struct ExportParams {
-    /// Include remote nodes' pre-shared tokens. Off by default; a file with
-    /// secrets must be handled like one.
+    /// Include remote nodes' pre-shared tokens and the plugins' launch-args
+    /// secrets (and, in an archive, files secret launch args name). Off by
+    /// default; a file with secrets must be handled like one.
     pub include_secrets: Option<bool>,
+    /// `flwr` (default): the scene file alone (it lists the nodes' uploaded
+    /// files). `far`: a ZIP of the scene file and those files.
+    pub format: Option<ExportFormat>,
+}
+
+#[derive(Deserialize, ToSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ExportFormat {
+    Flwr,
+    Far,
 }
 
 /// Multipart form for imports.
 #[derive(ToSchema)]
 #[allow(dead_code)] // documentation only
 pub(crate) struct SceneUpload {
-    /// A `.flwr` file from `GET …/export`.
+    /// A `.flwr` or `.far` file from `GET …/export`, or a ZIP, tar or tar.gz
+    /// archive with one `.flwr` at its root and the nodes' uploaded files
+    /// anywhere in it (found by their SHA-256).
     #[schema(value_type = String, format = Binary)]
     file: Vec<u8>,
 }
@@ -66,11 +81,11 @@ pub(crate) struct SceneUpload {
     get,
     path = "/by-id/{id}/export",
     operation_id = "export-scene",
-    summary = "Export a scene with its nodes and edges as a .flwr file",
-    description = "The file can be imported on another flwrs server. Remote nodes carry their `remote_id`; their tokens only with `include_secrets=true`.",
+    summary = "Export a scene with its nodes and edges as a .flwr file (or a .far archive with its files)",
+    description = "The file can be imported on another flwrs server. Remote nodes carry their `remote_id`; tokens and launch-args secrets only with `include_secrets=true`. `format=far` adds the nodes' uploaded files.",
     params(("id" = String, Path, description = "Scene ID"), ExportParams),
     responses(
-        (status = 200, description = "The .flwr file", content_type = "application/vnd.flwrs.scene", body = Vec<u8>),
+        (status = 200, description = "The .flwr file, or the .far archive (application/zip)", content_type = "application/vnd.flwrs.scene", body = Vec<u8>),
         (status = 404, description = "Not found", body = ErrorBody),
     )
 )]
@@ -79,9 +94,33 @@ pub(super) async fn export_scene(
     Path(id): Path<String>,
     Query(params): Query<ExportParams>,
 ) -> Result<Response, ApiError> {
-    let export = service
-        .export_scene(&id, params.include_secrets.unwrap_or(false))
-        .await?;
+    let include_secrets = params.include_secrets.unwrap_or(false);
+    if params.format == Some(ExportFormat::Far) {
+        let archive = service.export_archive(&id, include_secrets).await?;
+        let file = tokio::fs::File::open(&archive.path).await;
+        // The open file stays readable (Unix); elsewhere start-up removes it.
+        let _ = tokio::fs::remove_file(&archive.path).await;
+        let file = file.map_err(|e| {
+            log::error!("Scenes API: reading an exported archive: {e}");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error",
+                vec![],
+            )
+        })?;
+        return Ok((
+            [
+                (header::CONTENT_TYPE, "application/zip".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", archive.file_name),
+                ),
+            ],
+            Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+        )
+            .into_response());
+    }
+    let export = service.export_scene(&id, include_secrets).await?;
     Ok((
         [
             (header::CONTENT_TYPE, MEDIA_TYPE.to_string()),
@@ -99,14 +138,14 @@ pub(super) async fn export_scene(
     post,
     path = "/import",
     operation_id = "import-scene",
-    summary = "Import a scene from a .flwr file",
-    description = "Creates a new, disabled scene with new ids. The file's structure must be valid; plugins this server lacks don't block the import, but are listed as problems until they're installed.",
+    summary = "Import a scene from a .flwr file or an archive",
+    description = "Creates a new, disabled scene with new ids. The file's structure must be valid; plugins this server lacks don't block the import, but are listed as problems until they're installed, as are uploaded files the import doesn't carry. Size limits: `[scenes] max_import_bytes` (the file, and what an archive unpacks to) and `max_import_entries`.",
     request_body(content = SceneUpload, content_type = "multipart/form-data"),
     responses(
         (status = 201, description = "Imported", body = ImportResponse),
         (status = 400, description = "No `file` field", body = ErrorBody),
         (status = 413, description = "File too large"),
-        (status = 422, description = "Not a valid scene file; details list every problem", body = ErrorBody),
+        (status = 422, description = "Not a valid scene file or archive; details list every problem", body = ErrorBody),
     )
 )]
 pub(super) async fn import_scene(
@@ -119,18 +158,38 @@ pub(super) async fn import_scene(
         if field.name() != Some("file") {
             continue;
         }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = field.chunk().await.map_err(bad)? {
-            if bytes.len() + chunk.len() > MAX_FILE_BYTES {
-                return Err(api_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    format!("scene files are limited to {MAX_FILE_BYTES} bytes"),
+        let path = service.incoming_path().await?;
+        let limit = service.files().max_import_bytes;
+        let saved: Result<(), ApiError> = async {
+            let failed = |e: std::io::Error| {
+                log::error!("Scenes API: saving an import: {e}");
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal server error",
                     vec![],
-                ));
+                )
+            };
+            let mut out = tokio::fs::File::create(&path).await.map_err(failed)?;
+            let mut total: u64 = 0;
+            while let Some(chunk) = field.chunk().await.map_err(bad)? {
+                total += chunk.len() as u64;
+                if total > limit {
+                    return Err(api_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        format!("imports are limited to {limit} bytes ([scenes] max_import_bytes)"),
+                        vec![],
+                    ));
+                }
+                out.write_all(&chunk).await.map_err(failed)?;
             }
-            bytes.extend_from_slice(&chunk);
+            out.flush().await.map_err(failed)
         }
-        let imported = service.import_scene(&bytes).await?;
+        .await;
+        if let Err(e) = saved {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(e);
+        }
+        let imported = service.import_file(&path).await?;
         return Ok((
             StatusCode::CREATED,
             Json(ImportResponse {
@@ -141,7 +200,7 @@ pub(super) async fn import_scene(
     }
     Err(api_error(
         StatusCode::BAD_REQUEST,
-        "missing multipart field 'file' with the .flwr file",
+        "missing multipart field 'file' with the .flwr file or archive",
         vec![],
     ))
 }
@@ -170,8 +229,8 @@ pub(super) fn routes() -> Router<Svc> {
         .route("/scenes/by-id/{id}/check", get(check_scene))
         .route(
             "/scenes/import",
-            // Room for the multipart framing around the file.
-            post(import_scene).layer(DefaultBodyLimit::max(MAX_FILE_BYTES + 64 * 1024)),
+            // The handler enforces [scenes] max_import_bytes while streaming.
+            post(import_scene).layer(DefaultBodyLimit::disable()),
         )
 }
 
@@ -313,7 +372,7 @@ mod tests {
             json_of(&err)["details"][0]
                 .as_str()
                 .unwrap()
-                .contains("not a flwrs scene file")
+                .contains("not a scene file (.flwr) or an archive")
         );
         let (status, _, _) = send(svc, get("/scenes/by-id/nope/export")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);

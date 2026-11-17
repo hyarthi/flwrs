@@ -1,7 +1,7 @@
 use crate::modules::api_error::{ApiError, ErrorBody, api_error, internal};
 use crate::modules::node_config::SceneDefaults;
 use crate::modules::scene::service::{self, ListFilters, Service, ServiceError};
-use crate::modules::scene::{api_graph, api_status, api_transfer};
+use crate::modules::scene::{api_graph, api_status, api_transfer, api_uploads};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -26,6 +26,7 @@ impl From<ServiceError> for ApiError {
             ServiceError::Unavailable(message) => {
                 api_error(StatusCode::SERVICE_UNAVAILABLE, message, vec![])
             }
+            ServiceError::Forbidden(message) => api_error(StatusCode::FORBIDDEN, message, vec![]),
             e @ (ServiceError::Query(_)
             | ServiceError::Connection(_)
             | ServiceError::Unknown(_)) => internal("Scenes API", e),
@@ -270,6 +271,12 @@ async fn disable_scene(
         api_graph::get_edge,
         api_graph::update_edge,
         api_graph::delete_edge,
+        api_uploads::put_upload,
+        api_uploads::list_uploads,
+        api_uploads::get_upload,
+        api_uploads::get_upload_content,
+        api_uploads::delete_upload,
+        api_uploads::reset_workdir,
     ),
     components(schemas(
         Scene,
@@ -283,8 +290,10 @@ async fn disable_scene(
         api_transfer::SceneCheckResponse,
         api_transfer::ImportResponse,
         api_transfer::SceneUpload,
+        api_transfer::ExportFormat,
         api_status::SceneStatusResponse,
         api_status::PurgeResponse,
+        api_uploads::Upload,
     ))
 )]
 pub(crate) struct Api;
@@ -302,6 +311,7 @@ impl Api {
             .merge(api_graph::routes())
             .merge(api_transfer::routes())
             .merge(api_status::routes())
+            .merge(api_uploads::routes())
             .with_state(service)
     }
 }

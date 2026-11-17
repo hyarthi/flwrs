@@ -2,6 +2,7 @@
 
 use super::api::Svc;
 use crate::modules::api_error::{ApiError, ErrorBody};
+use crate::modules::plugin::node_rules::strip;
 use crate::modules::scene::service::{self, EdgeInput, NodeInput};
 use axum::Json;
 use axum::Router;
@@ -10,6 +11,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use utoipa::ToSchema;
 
 #[derive(Serialize, ToSchema)]
@@ -24,20 +26,31 @@ pub(crate) struct Node {
     pub plugin_id: String,
     /// The plugin version the node was configured with, if known.
     pub plugin_version: Option<String>,
-    /// Node config (`launch`, `runtime`, `launch_args`). The token is never returned.
+    /// Node config (`launch`, `runtime`, `launch_args`). The token and the
+    /// launch-args secrets are never returned.
     #[schema(value_type = Object)]
     pub config: Value,
     /// Whether a pre-shared token is stored (remote nodes).
     pub has_token: bool,
+    /// Every launch-args secret the plugin declares (JSON pointer, e.g.
+    /// `/password`) and whether this node has it set. On update, a secret
+    /// left out is kept, `null` clears it.
+    pub launch_args_secrets: BTreeMap<String, bool>,
     pub create_time: i64,
     pub update_time: i64,
 }
 
 impl From<service::Node> for Node {
     fn from(n: service::Node) -> Self {
+        let mut config = n.config.redacted();
+        if let Some(args) = config.get_mut("launch_args") {
+            let secrets: Vec<String> = n.secrets.keys().cloned().collect();
+            *args = strip(args, &secrets);
+        }
         Self {
             has_token: n.config.token.is_some(),
-            config: n.config.redacted(),
+            config,
+            launch_args_secrets: n.secrets,
             id: n.id,
             scene_id: n.scene_id,
             name: n.name,
@@ -396,6 +409,56 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn secrets_are_never_returned() {
+        let f = fixture().await;
+        let svc = f.service;
+        let (_, scene) = call(svc, "POST", "/scenes", Some(json!({"name": "s"}))).await;
+        let sid = scene["id"].as_str().unwrap();
+        let args = json!({"schemas": {"in": {"fields": [{"key": "msg", "type": "STRING"}]}},
+                          "script": "return payload", "api_key": "s3cr3t"});
+        let (status, node) = call(
+            svc,
+            "POST",
+            &format!("/scenes/by-id/{sid}/nodes"),
+            Some(json!({"plugin_id": "test-script", "config": {"launch_args": args}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{node}");
+        assert_eq!(
+            node["launch_args_secrets"],
+            json!({"/api_key": true, "/key": false})
+        );
+        assert!(
+            node["config"]["launch_args"].get("api_key").is_none(),
+            "{node}"
+        );
+        assert_eq!(node["config"]["launch_args"]["script"], "return payload");
+        let nid = node["id"].as_str().unwrap();
+        let (_, listed) = call(svc, "GET", &format!("/scenes/by-id/{sid}/nodes"), None).await;
+        assert!(!listed.to_string().contains("s3cr3t"), "{listed}");
+        // a plugin without secrets: an empty map
+        let (_, sink) = call(
+            svc,
+            "POST",
+            &format!("/scenes/by-id/{sid}/nodes"),
+            Some(json!({"plugin_id": "test-sink"})),
+        )
+        .await;
+        assert_eq!(sink["launch_args_secrets"], json!({}));
+        let (_, got) = call(
+            svc,
+            "GET",
+            &format!("/scenes/by-id/{sid}/nodes/by-id/{nid}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            got["launch_args_secrets"],
+            json!({"/api_key": true, "/key": false})
+        );
     }
 
     #[cfg(feature = "remote")] // creates remote nodes

@@ -35,13 +35,15 @@ fs4.workspace = true # free disk space for the spill guard (cross-platform, safe
 mlua = { workspace = true, optional = true } # Lua mappings (feature mapping-lua)
 reqwest = { workspace = true, optional = true } # OTLP/HTTP export (feature otel)
 pbjson = { workspace = true, optional = true } # OTLP JSON telemetry files (feature otel)
-flate2 = { workspace = true, optional = true } # gzip for closed telemetry files (feature telemetry-file)
+flate2.workspace = true # gzip: tar.gz scene imports, closed telemetry files (feature telemetry-file)
+tar.workspace = true # scene imports from tar / tar.gz archives
 pbjson-types.workspace = true # Timestamp in event metadata
 rustls = { workspace = true, optional = true } # TLS listener for remote plugins (feature remote)
 tokio-rustls = { workspace = true, optional = true }
 x509-parser = { workspace = true, optional = true } # client certificate names (mTLS)
 prost.workspace = true # scene export files (.flwr), protocol messages
 bytes.workspace = true # opaque event bodies
+futures-util.workspace = true # streaming node uploads to disk
 prost-types.workspace = true
 
 [target.'cfg(unix)'.dependencies]
@@ -49,6 +51,7 @@ nix.workspace = true # SIGTERM / SIGKILL to plugin process groups (safe API)
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true # Ctrl-Break and Job Objects for plugin processes
+junction.workspace = true # node folders: links to the package's folders
 
 [features]
 default = ["mapping-lua", "otel", "telemetry-file", "remote"]
@@ -62,7 +65,7 @@ otel = ["dep:reqwest", "dep:pbjson"]
 # Write telemetry to local time-partitioned files ([[telemetry.file]]: OTLP
 # JSON Lines (with otel), SQLite, InfluxDB line protocol, OpenMetrics). On by
 # default; minimal edge builds can leave it out.
-telemetry-file = ["dep:flate2"]
+telemetry-file = []
 # Remote plugins: nodes with `launch = "remote"` (pre-shared tokens, remote_id),
 # and the TLS listener ([hub.tls], rustls) with optional client certificates
 # (mTLS). On by default; a bare build for a small edge device can leave it

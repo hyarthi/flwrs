@@ -36,6 +36,7 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 | `plugins/` | — | Base plugin library. Currently `http_sink` and `ticker` (Rust). Plugins in other languages can live here too. |
 | `examples/plugins/` | — | Minimal, unsupported demo plugins (HTTP sinks in Python, Go, TypeScript and Java). |
 | `trellis/` | `flwrs-trellis` | Developer toolkit for plugins (any language): `package`, `audit` (protocol conformance), `test`, `bench`. `cargo trellis <command>` in this repo. |
+| `docs/` | — | Specifications for plugin authors: the [plugin protocol](docs/protocol.md) and the [plugin specification](docs/plugin-spec.md) (packages, manifests, launching). |
 | `ideas/` | — | Design notes for possible future work. |
 
 See [AGENTS.md](AGENTS.md) for a file-by-file map.
@@ -99,6 +100,12 @@ key = "hub.key"
 # max_hops = 32      # an event is dropped after this many handovers (stops loops); scenes can override it
 # spool_dir = "./scenes"     # spill-to-disk queue files
 # spill_default = false      # spill for nodes that don't say
+# nodes_dir = "./nodes"      # local nodes' folders (their working directories)
+# files_dir = "./files"      # files uploaded to nodes
+
+[scenes]
+# max_upload_bytes = 1073741824   # one file uploaded to a node
+# max_import_bytes = 1073741824   # one scene import (and what an archive unpacks to)
 ```
 
 ```sh
@@ -111,7 +118,7 @@ cargo run -p flwrs-app -- --config config.toml
 cargo run -p flwrs-app -- --config config.dev.toml   # serves on 127.0.0.1:8080
 ```
 
-It keeps everything the server writes at run time (database, installed plugins, spool files, telemetry files) under `./.data/`, which is gitignored, so runtime data never mixes with the source tree.
+It keeps everything the server writes at run time (database, installed plugins, node folders, uploaded files, spool files, telemetry files) under `./.data/`, which is gitignored, so runtime data never mixes with the source tree.
 
 - REST API: `http://localhost:8080/api/scenes`
 - Swagger UI: `http://localhost:8080/swagger-ui`
@@ -143,7 +150,9 @@ A **scene** is a workflow: a directed graph whose **nodes** are plugin instances
 | `POST /api/scenes/by-id/{id}/enable`, `…/disable` | Run or stop the workflow. Enabling requires every node's plugin to be installed. |
 | `GET/POST /api/scenes/by-id/{id}/nodes`, `GET/PUT/DELETE …/nodes/by-id/{node_id}` | Manage nodes. A node runs a registered plugin; its `type` is the plugin's type. |
 | `GET/POST /api/scenes/by-id/{id}/edges`, `GET/PUT/DELETE …/edges/by-id/{edge_id}` | Manage edges. A SINK can't send and a SOURCE can't receive; at most one edge per direction between two nodes. |
-| `GET /api/scenes/by-id/{id}/export`, `POST /api/scenes/import` | Move a scene to another server as a `.flwr` file (see below). |
+| `GET /api/scenes/by-id/{id}/export`, `POST /api/scenes/import` | Move a scene to another server as a `.flwr` file or a `.far` archive with its nodes' files (see below). |
+| `PUT/GET/DELETE …/nodes/by-id/{node_id}/uploads/{name}`, `GET …/uploads`, `GET …/uploads/{name}/content` | Files uploaded to a node, for settings that name one (a model, a certificate, a spec). Raw body, up to `[scenes] max_upload_bytes`. A running node restarts with the new file; a file a setting names can't be deleted, and one a secret setting names can't be downloaded. |
+| `DELETE …/nodes/by-id/{node_id}/workdir` | Empty a node's folder (the plugin's state and caches), while the scene is disabled. |
 | `GET /api/scenes/by-id/{id}/check` | Whether the scene can run here: `launchable`, `problems` (block enabling), `warnings`. |
 | `GET /api/scenes/by-id/{id}/status` | What the scene is doing right now (see *Status*, below). |
 | `DELETE /api/scenes/by-id/{id}/spool`, `…/nodes/by-id/{node_id}/spool` | Start the queues of the scene's nodes over, or one node's: the lever for corrupted, overflowing or lagging spool files. Every queued event goes, including those handed to a plugin and not acknowledged yet (they aren't delivered again), and spool files are deleted (running queues start fresh ones). For a disabled scene, that's what its durable queues kept. Also brings back a durable queue whose file couldn't be opened. Returns `purged_events`. |
@@ -172,7 +181,7 @@ Invalid requests return **422** with every problem listed in `details`.
 - **`remote_id`** (remote nodes): the id the remote plugin is started with (`--id`). Defaults to the node id, but unlike the node id it stays the same when the scene is exported and imported elsewhere. Several nodes may share one; their credentials tell them apart.
 - **`auth`** (remote nodes): `token` (a pre-shared secret of at least 16 characters, in `token`) or `mtls` (a client certificate on the TLS listener: one that chains to `[hub.tls] client_ca` and names the `remote_id` in its SAN or CN, or the one pinned in `tls.client_cert_sha256`). Default: the scene's `remote_auth`, else `token`. **`require_tls`** (token nodes): only accept the plugin over the TLS listener; default: the scene's, else true when the hub has a TLS listener. A remote plugin built on the Rust SDK takes its TLS settings from `FLWRS_TLS_CA`, `FLWRS_TLS_SERVER_NAME`, `FLWRS_TLS_CERT` and `FLWRS_TLS_KEY`.
 - **`token`:** never returned by the API (`has_token` instead). Omitting it on update keeps the stored one.
-- **`launch_args`:** checked against the plugin's launch-args schema and argument rules. Local nodes only.
+- **`launch_args`:** the node's settings, checked against the plugin's launch-args schema and delivery rules ([plugin spec](docs/plugin-spec.md#3-node-settings-the-launch-args-schema)); for code settings, the code's syntax too. **Secrets** (the schema's `writeOnly` properties) are never returned: responses list them in `launch_args_secrets` (`{"/api_key": true}`: set or not), an update that leaves one out keeps it, and `null` clears it. Settings that name an uploaded file need it uploaded (`…/uploads/{name}`) before the scene can be enabled. Local nodes; a remote node only carries them for its payload schemas, when its plugin takes those from its settings.
 - **`runtime`:** timeouts, restarts, the event queue and redelivery (`delivery`: `max_attempts`, 5, and `retry_delay_ms`, 1 000). Unknown keys are rejected. A node on a cycle can't use `"when_full": "block"`, because blocking can deadlock there.
 
 **Event queues.** Every node that receives events has an inbound queue. By default it holds up to 1 024 events or 64 MiB in memory; when it's full, `when_full` decides: `block` (the default: the producer waits, up to `block_timeout_ms`), `drop_newest` (the incoming event is dropped) or `drop_oldest` (as many of the oldest queued events as needed are evicted to fit it). `max_evictions` caps how many one incoming event may evict: if fitting it would take more, nothing is evicted and the incoming event is dropped instead, so one unexpectedly large event can't empty the queue (no limit by default). All queues share a hub-wide budget (`[hub] max_inflight_bytes`, 512 MiB); when it's used up, a `drop_oldest` queue evicts its own oldest events to make room (within `max_evictions`), never another queue's.
@@ -298,56 +307,36 @@ A scene can be exported from one flwrs server and imported into another, ready t
 ```sh
 curl -o line3.flwr http://source:8080/api/scenes/by-id/<id>/export          # tokens left out
 curl -o line3.flwr "http://source:8080/api/scenes/by-id/<id>/export?include_secrets=true"
+curl -o line3.far "http://source:8080/api/scenes/by-id/<id>/export?format=far"   # with the nodes' files
 curl -F file=@line3.flwr http://destination:8080/api/scenes/import
 ```
 
-- **The file** (`.flwr`, `application/vnd.flwrs.scene`) holds the scene's name, hop limit and defaults, every node (type, plugin id and version, config) and every edge (with its mapping). Format: the ASCII magic `FLWR`, a u32 little-endian length, the format version (`1.0.0`), then a protobuf `SceneFile` ([`app/schema/scene_file.proto`](app/schema/scene_file.proto)).
-- **Secrets:** remote nodes' tokens are left out unless you export with `include_secrets=true`. Treat such a file like a password. Without tokens, the imported remote nodes need one set before the scene can be enabled.
+- **The file** (`.flwr`, `application/vnd.flwrs.scene`) holds the scene's name, hop limit and defaults, every node (type, plugin id and version, config, the list of its uploaded files) and every edge (with its mapping). Format: the ASCII magic `FLWR`, a u32 little-endian length, the format version (`1.0.0`), then a protobuf `SceneFile` ([`app/schema/scene_file.proto`](app/schema/scene_file.proto)).
+- **Secrets:** remote nodes' tokens and the plugins' secret settings are left out unless you export with `include_secrets=true`. Treat such a file like a password. Without them, the imported nodes need them set again (the import warns which) before the scene can be enabled.
+- **Uploaded files:** `?format=far` exports a `.far` archive: a ZIP of the scene file and the nodes' uploaded files (a secret setting's file only with secrets). The import also takes a ZIP, tar or tar.gz with one `.flwr` at its root: files are matched by content (SHA-256) wherever they are in it. Uploads the import doesn't carry are reported, and the scene can't be enabled until they're uploaded. Limits: `[scenes] max_import_bytes` (the file, and what an archive unpacks to) and `max_import_entries`.
 - **Ids:** an import always creates a new scene with new node and edge ids, so the same file can be imported twice. Remote nodes keep their `remote_id` (the export fills it in from the node id if it was never set), so remote plugins don't need to be restarted with new ids.
 - **Mappings travel with the scene** (as JSON, Lua code included), and the destination checks them against **its** plugins and build: a mapping that names a field the destination's plugin version doesn't have, Lua code with a syntax error, or any Lua on a server built without Lua support is reported as a problem (blocking enabling), not an import error. Only an invalid mapping shape (e.g. a malformed path) makes the file itself invalid.
 - **Imports always arrive disabled.** The file's own structure is checked strictly (422 with every problem). Plugins the destination doesn't have, or has with another type, don't block the import: they're reported as `problems` (in the import response and by `…/check`), and enabling is refused until they're fixed, e.g. by uploading the plugin. A different plugin version is only a warning.
 
 ## Plugin packages
 
-Plugins are installed into the server as **packages**: a ZIP with `manifest.json` at its root, the executable, and any files the manifest references. Everything else (assets, models, libraries) is optional.
-
-```
-http-sink-0.0.1-macos-aarch64.zip
-├── manifest.json
-├── bin/flwrs-http-sink
-├── schema/launch_args.json      JSON Schema for the node's launch_args (optional)
-└── schema/in.json               payload schema(s), required by plugin type
-```
+Plugins are installed into the server as **packages**: a ZIP with `manifest.json` at its root, the executable, and the files the manifest references.
 
 ```json
 {
-  "manifest_version": 1,
-  "id": "http-sink",
-  "name": "HTTP sink",
+  "manifest_version": 2,
+  "id": "ticker",
+  "name": "Ticker",
   "version": "0.0.1",
-  "type": "SINK",
-  "description": "Sends an HTTP request for each event.",
-  "executable": "bin/flwrs-http-sink",
-  "platforms": ["macos-aarch64"],
+  "type": "SOURCE",
+  "executable": "bin/flwrs-ticker",
   "launch_args_schema": "schema/launch_args.json",
-  "launch_args_style": "flags",
-  "payload_schemas": { "in": "schema/in.json" }
+  "payload_schemas": { "out": "schema/out.json" },
+  "ui": { "icon": "ui/ticker.svg", "categories": ["Triggers"], "docs": "README.md" }
 }
 ```
 
-| Field | Required | Meaning |
-|---|---|---|
-| `manifest_version` | yes | `1`. |
-| `id` | yes | Unique plugin id, `^[a-z0-9][a-z0-9_-]{0,63}$`; also the install folder name. |
-| `name`, `version` | yes | Display name, and a semantic version. The version is what the plugin must report in `Initialize`. |
-| `type` | yes | `SOURCE`, `SINK` or `TRANSFORM`. |
-| `description` | no | Free text. |
-| `executable` | yes | Path inside the ZIP. A native binary, or a script with a shebang (`#!/usr/bin/env python3`). |
-| `platforms` | no | `<os>-<arch>` targets (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, …). The upload fails on another platform. Omit it for scripts that run anywhere. |
-| `launch_args_schema` | no | JSON Schema for a node's `launch_args`. External `$ref`s aren't resolved. |
-| `launch_args_style` | no | How `launch_args` becomes arguments: `flags` (default: `{"http_timeout_seconds": 60, "verbose": true}` → `--http-timeout-seconds 60 --verbose`), `positional` (a list of strings, passed verbatim) or `json` (`--launch-args '<json>'`). The hub's own arguments (`--id`, `--host`, `--port`, `--log-level`, `--token`) can't be overridden. |
-| `payload_schemas` | by type | `in` for SINK, `out` for SOURCE, both for TRANSFORM. Each is a `SchemaDefinition` in proto3 JSON, e.g. `{"fields": [{"key": "url", "type": "STRING"}]}`. The plugin must declare exactly these schemas in `Initialize`. |
-| `runtime_defaults` | no | Object with defaults for the node's runtime settings (timeouts, restart delay, …). |
+The manifest names the plugin's type and version, its payload schemas (fixed, or taken from each node's settings), and a JSON Schema of a node's settings (`launch_args`). That schema also says how each setting reaches the plugin (a command-line argument, an environment variable, or a file in the node's `config/` folder), which ones are secrets, which hold code, and how a UI should present them. A local plugin runs in a folder of its own per node, where it can keep state. **The format and the launch contract are specified in [`docs/plugin-spec.md`](docs/plugin-spec.md)**, for plugin authors in any language.
 
 **Managing plugins** (REST, documented in Swagger UI):
 
@@ -367,6 +356,8 @@ curl -F file=@target/plugins/http-sink-0.0.1-macos-aarch64.zip http://localhost:
 > **Security:** an uploaded plugin is code the server will run. Upload, upgrade and delete are **off by default** (`[plugins] allow_upload = true` turns them on). When they're on, callers need `Authorization: Bearer <[plugins] admin_token>`, or, if no token is configured, must connect from loopback. `config.dev.toml` enables uploads from loopback for development.
 
 ## Writing a plugin
+
+Plugins are packaged and run as described in the [plugin specification](docs/plugin-spec.md).
 
 **In Rust:** create a binary crate under `plugins/`, add it to `members` in the root `Cargo.toml`, depend on `flwrs-plugin`, implement `Sink`, `Source` or `Transform`, declare the plugin's schema, parse the server's bootstrap arguments with `flwrs_plugin::cli::Bootstrap` (feature `cli`, flattened into your clap arguments), and run the matching runner (`SinkRunner`, `SourceRunner`, `TransformRunner`). The runner handles the connection (token from `FLWRS_TOKEN` or `ConnectionConfig::with_token`; TLS with the `tls` feature), the handshake, heartbeats, credit, acks, reconnecting, logging and shutdown.
 

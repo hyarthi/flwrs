@@ -1,7 +1,7 @@
 //! The director: runs scene workflows. Other services talk to it through
 //! [`DirectorHandle`].
 
-mod config;
+pub(crate) mod config;
 mod engine;
 pub(crate) mod handle;
 pub(crate) mod queue;

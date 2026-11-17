@@ -3,8 +3,7 @@
 //! its own check of `runtime_defaults` against its runtime settings.
 
 pub(crate) use flwrs_plugin::package::{
-    LaunchArgsStyle, Manifest, PluginType, current_platform, is_valid_id, launch_args_to_argv,
-    validate_launch_args,
+    LaunchSpec, Manifest, PluginType, current_platform, is_valid_id, validate_launch_args,
 };
 
 /// The server's extra manifest check (`package::ExtraCheck`): `runtime_defaults`
@@ -25,7 +24,7 @@ pub(crate) fn check_runtime_defaults(manifest: &Manifest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flwrs_plugin::package::PayloadSchemaPaths;
+    use flwrs_plugin::package::{LaunchArgsStyle, PayloadSchemas, SchemaSource};
     use serde_json::json;
 
     #[test]
@@ -41,11 +40,13 @@ mod tests {
             platforms: None,
             launch_args_schema: None,
             launch_args_style: LaunchArgsStyle::Flags,
-            payload_schemas: PayloadSchemaPaths {
-                input: Some("schema/in.json".into()),
+            payload_schemas: PayloadSchemas {
+                input: Some(SchemaSource::Path("schema/in.json".into())),
                 output: None,
             },
             runtime_defaults: None,
+            ui: None,
+            extensions: Default::default(),
         };
         assert!(check_runtime_defaults(&m).is_empty());
         m.runtime_defaults = Some(json!({"init_timeout_ms": 5000}));

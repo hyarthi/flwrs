@@ -331,6 +331,25 @@ fn epoch_ms(t: &Timestamp) -> i64 {
 }
 
 /// The innermost message of a Lua error (without mlua's wrapping).
+/// Checks `code`'s syntax as the body of `function(<params>)`, in a bare
+/// Lua state (nothing runs). The error names `label` and the line, as the
+/// user wrote it.
+pub(crate) fn check_syntax(label: &str, code: &str, params: &[String]) -> Result<(), String> {
+    let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())
+        .map_err(|e| format!("couldn't start Lua: {e}"))?;
+    lua.load(code)
+        .set_name(format!("={label}"))
+        .into_function()
+        .map_err(|e| describe(&e))?;
+    // `...` is fine in a main chunk but not inside the function.
+    let source = format!("return function({}) {code}\nend", params.join(", "));
+    lua.load(source)
+        .set_name(format!("={label}"))
+        .into_function()
+        .map(|_| ())
+        .map_err(|e| describe(&e))
+}
+
 fn describe(err: &mlua::Error) -> String {
     match err {
         mlua::Error::CallbackError { cause, .. } => describe(cause),

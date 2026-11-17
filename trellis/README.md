@@ -7,7 +7,7 @@ Developer toolkit for [flwrs](https://github.com/hyarthi/flwrs) plugins, a light
 - **`test`** runs behavioural end-to-end tests: send events, trigger sources, and check ACKs, NACKs and outputs, through redeliveries, disconnects and restarts.
 - **`bench`** measures the plugin's throughput, latency, startup time, CPU and memory.
 
-> **Status:** early development; expect breaking changes. 0.0.1 was the protocol audit alone (then the `flwrs-trellis <package>` command); 0.0.2 adds `package`, `test` and `bench`, and the audit is now `flwrs-trellis audit <package>` (in Rust, `Audit::new(target).run()` instead of `run(&target, &[])`). It speaks plugin protocol version 2.
+> **Status:** early development; expect breaking changes. 0.0.1 was the protocol audit alone (then the `flwrs-trellis <package>` command); 0.0.2 adds `package`, `test` and `bench`, and the audit is now `flwrs-trellis audit <package>` (in Rust, `Audit::new(target).run()` instead of `run(&target, &[])`). 0.0.3 reads manifest version 2 packages and runs plugins as the server now does: in a node folder (a link to each of the package's top-level entries, and `config/` with the files the server delivers), with launch args delivered as arguments, environment variables or files, the node's own payload schemas, and uploaded files (`[uploads]`, `uploads` in test files, `--upload`, `Target::with_upload`). It needs `flwrs-plugin` 0.0.6. It speaks plugin protocol version 2.
 
 ## Install
 
@@ -42,7 +42,13 @@ flwrs-trellis audit path/to/plugin --list           # the cases
 flwrs-trellis audit path/to/plugin --case handshake -- --extra plugin-arg
 ```
 
-The argument is a package ZIP or a plugin folder. A folder that needs a build is packaged first, so the run uses what would ship. Each case starts the plugin afresh with the usual bootstrap arguments (`--id`, `--host`, `--port`, `--log-level`, and the token in `FLWRS_TOKEN`):
+The argument is a package ZIP or a plugin folder. A folder that needs a build is packaged first, so the run uses what would ship. Each case starts the plugin afresh with the usual bootstrap arguments (`--id`, `--host`, `--port`, `--log-level`, and the token in `FLWRS_TOKEN`), as the server would:
+
+- **Working directory:** a temporary node folder with a link to each top-level entry of the package, so relative paths to the package's files work.
+- **Launch args** (`--launch-args <file>` or `[audit] launch_args`): checked against the manifest's schema and delivered as the manifest says: command-line arguments, environment variables, or files in the node folder's `config/` (manifest version 2). A plugin that takes its payload schemas from its launch args (manifest version 2) is held to the schemas in them.
+- **Uploaded files** that the launch args name (`"source": "upload"`): from `[uploads]` in `trellis.toml` or `--upload NAME=PATH`, linked into `config/`.
+
+The cases:
 
 | Case | Checks |
 |---|---|
@@ -74,6 +80,7 @@ A test file is TOML. Payloads live in JSON files next to it, as plain JSON shape
 ```toml
 name = "uppercases the text"
 launch_args = "node.json"            # the node's launch_args (JSON), optional
+uploads = { "model.onnx" = "model.onnx" }   # files uploaded to the node (on top of [uploads]), optional
 
 [[steps]]
 send = "payloads/hello.json"
@@ -170,6 +177,9 @@ features = []
 no_default_features = true
 manifest = "manifest.edge.json"
 
+[uploads]                        # files uploaded to the node, for "source": "upload" launch args
+"model.onnx" = "tests/model.onnx"
+
 [audit]
 launch_args = "tests/node.json"
 args = []
@@ -188,7 +198,7 @@ Everything above is available as a library, for example in a Rust plugin's own i
 
 ```toml
 [dev-dependencies]
-flwrs-trellis = "0.0.2"
+flwrs-trellis = "0.0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

@@ -8,31 +8,37 @@
       "description": "Total HTTP request timeout, in seconds.",
       "type": "integer",
       "minimum": 1,
-      "default": 60
+      "default": 60,
+      "x-flwrs-group": "Timeouts"
     },
     "http_read_timeout_seconds": {
       "description": "HTTP read timeout, in seconds.",
       "type": "integer",
       "minimum": 1,
-      "default": 30
+      "default": 30,
+      "x-flwrs-group": "Timeouts"
     },
     "http_connect_timeout_seconds": {
       "description": "HTTP connect timeout, in seconds.",
       "type": "integer",
       "minimum": 1,
-      "default": 30
+      "default": 30,
+      "x-flwrs-group": "Timeouts"
     },
     "http_verbose_logging": {
       "description": "Log HTTP connection details.",
       "type": "boolean",
-      "default": false
+      "default": false,
+      "x-flwrs-group": "Diagnostics",
+      "x-flwrs-advanced": true
     },
     "max_concurrent_requests": {
       "description": "How many requests may be in flight at once. Each event is acknowledged after its response.",
       "type": "integer",
       "minimum": 1,
       "maximum": 1024,
-      "default": 16
+      "default": 16,
+      "x-flwrs-group": "Delivery"
     }
   }
 }

@@ -2,7 +2,8 @@
 //! files it references, and extracts it. Every check runs before anything is
 //! written to disk.
 
-use super::manifest::{MANIFEST_FILE, Manifest};
+use super::launch::LaunchSpec;
+use super::manifest::{MANIFEST_FILE, Manifest, RESERVED_ENTRY};
 use crate::schema::rules;
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -51,8 +52,12 @@ pub struct Package {
     pub manifest_json: String,
     /// Contents of the referenced files, as compact JSON.
     pub launch_args_schema: Option<String>,
+    /// A per-node schema's `default`, if it has one.
     pub in_schema: Option<String>,
     pub out_schema: Option<String>,
+    /// Problems that don't refuse the package (unknown `x-*` fields and
+    /// `x-flwrs-*` keywords).
+    pub warnings: Vec<String>,
 }
 
 /// Why a package was refused.
@@ -234,7 +239,16 @@ fn read_package(
         .map_err(|e| invalid(format!("{MANIFEST_FILE}: {e}")))?;
 
     let mut errors = manifest.validate(platform);
+    let mut warnings = manifest.warnings();
     errors.extend(extra(&manifest));
+    if entries
+        .iter()
+        .any(|e| e.path.components().next() == Some(Component::Normal(RESERVED_ENTRY.as_ref())))
+    {
+        errors.push(format!(
+            "the package can't have a top-level {RESERVED_ENTRY:?} entry (the name of a node's folder for its config files)"
+        ));
+    }
     for (field, path) in manifest.file_references() {
         match find(path) {
             Some(e) if !e.is_dir => {}
@@ -260,13 +274,25 @@ fn read_package(
                     "launch_args_schema {path:?}: not a valid JSON Schema: {e}"
                 ));
             }
-            Some(value.to_string())
+            Some(value)
         }
     };
+    let (spec, report) = LaunchSpec::new(&manifest, launch_args_schema.as_ref());
+    errors.extend(report.errors);
+    warnings.extend(report.warnings);
+    for (field, path) in spec.file_references() {
+        match find(path) {
+            Some(e) if !e.is_dir => {}
+            _ => errors.push(format!("{field} {path:?} is missing from the package")),
+        }
+    }
+    let launch_args_schema = launch_args_schema.map(|v| v.to_string());
     let mut payload_schema = |field: &str,
-                              path: &Option<String>|
+                              source: &Option<super::manifest::SchemaSource>|
      -> Result<Option<String>, PackageError> {
-        let Some(path) = path else { return Ok(None) };
+        let Some(path) = source.as_ref().and_then(|s| s.file()) else {
+            return Ok(None);
+        };
         let text = read_text(archive, find(path).expect("checked above"), path)?;
         match rules::parse_json(&text) {
             Ok(schema) => {
@@ -298,6 +324,7 @@ fn read_package(
         launch_args_schema,
         in_schema,
         out_schema,
+        warnings,
     })
 }
 
@@ -695,6 +722,62 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("id \"Bad_ID\""))
                 && errors.iter().any(|e| e.contains("version \"x\""))
+        );
+    }
+
+    const V2_MANIFEST: &str = r#"{"manifest_version": 2, "id": "script", "name": "Script",
+        "version": "0.1.0", "type": "SINK", "executable": "bin/run",
+        "launch_args_schema": "schema/launch.json",
+        "payload_schemas": {"in": {"from_launch_args": "/schemas/in", "default": "schema/in.json"}},
+        "ui": {"icon": "ui/icon.svg", "categories": ["Scripting"]},
+        "x-vendor": true}"#;
+    const V2_LAUNCH_SCHEMA: &str = r#"{"type": "object", "properties": {
+        "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+        "script": {"type": "string", "contentMediaType": "text/x-lua",
+                   "x-flwrs-code": {"language": "lua", "params": ["payload"], "definitions": "types/script.d.lua"},
+                   "x-flwrs-hint": 1}}}"#;
+
+    #[test]
+    fn version_2_package() {
+        let items = |defs: bool, config_entry: bool| {
+            let mut items = vec![
+                Item::File("manifest.json", V2_MANIFEST.as_bytes()),
+                Item::File("bin/run", b"#!/bin/sh\n"),
+                Item::File("schema/launch.json", V2_LAUNCH_SCHEMA.as_bytes()),
+                Item::File("schema/in.json", IN_SCHEMA.as_bytes()),
+                Item::File("ui/icon.svg", b"<svg/>"),
+            ];
+            if defs {
+                items.push(Item::File("types/script.d.lua", b"---@meta\n"));
+            }
+            if config_entry {
+                items.push(Item::File("config/x.json", b"{}"));
+            }
+            items
+        };
+        let (_d, r) = run(&items(true, false));
+        let package = r.unwrap();
+        // the per-node schema's default is the package's schema
+        assert!(package.in_schema.is_some());
+        assert_eq!(package.warnings.len(), 2, "{:?}", package.warnings);
+        assert!(package.warnings.iter().any(|w| w.contains("x-vendor")));
+        assert!(package.warnings.iter().any(|w| w.contains("x-flwrs-hint")));
+
+        let (_d, r) = run(&items(false, false));
+        let errors = errors_of(r);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("\"types/script.d.lua\" is missing")),
+            "{errors:?}"
+        );
+        let (_d, r) = run(&items(true, true));
+        let errors = errors_of(r);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("top-level \"config\" entry")),
+            "{errors:?}"
         );
     }
 }

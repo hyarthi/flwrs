@@ -22,12 +22,13 @@ use crate::modules::scene::graph::nodes_in_cycles;
 use crate::modules::scene::service::{Edge, SceneSnapshot};
 use crate::modules::supervisor::{
     DeliverySpec, Launch, NodeHandle, NodeOutput, NodeSpec, NodeState, NodeStatus, Output,
-    Surroundings, supervise,
+    Surroundings, supervise, workdir,
 };
 use flwrs_plugin::schema::payload::PluginPayload;
 use flwrs_plugin::schema::protocol::EventMetadata;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -53,6 +54,10 @@ pub(crate) struct Context {
     pub spill: SpillShared,
     pub max_hops: u32,
     pub log_level: String,
+    /// `[director] nodes_dir`: local nodes' folders.
+    pub nodes_dir: PathBuf,
+    /// `[director] files_dir`: files uploaded to nodes.
+    pub files_dir: PathBuf,
 }
 
 /// A node's run-time report, for status.
@@ -109,6 +114,9 @@ struct NodeKey {
     when_full: Option<WhenFull>,
     /// Memory, spill or durable (the scene's default can change it).
     kind: Option<QueueKind>,
+    /// The node's uploaded files (name, content hash): a new one means new
+    /// files in its `config/`.
+    uploads: Vec<(String, String)>,
 }
 
 /// A node of a checked graph.
@@ -152,6 +160,9 @@ impl Plan {
                 tls_available: ctx.hub.tls_addr().is_some(),
                 log_level: &ctx.log_level,
                 scene_defaults: &snapshot.scene.defaults,
+                nodes_dir: &ctx.nodes_dir,
+                files_dir: &ctx.files_dir,
+                uploads: &node.uploads,
             };
             match NodeSpec::resolve(scene_id, &node.id, &node.config, plugin, &at) {
                 Ok(spec) if spec.plugin_type.as_str() != node.node_type => errors.push(format!(
@@ -287,6 +298,11 @@ impl Plan {
                     config: node.config.clone(),
                     when_full: queue.as_ref().map(|q| q.when_full),
                     kind: queue.is_some().then_some(kind),
+                    uploads: node
+                        .uploads
+                        .iter()
+                        .map(|u| (u.name.clone(), u.sha256.clone()))
+                        .collect(),
                 };
                 PlannedNode {
                     spec,
@@ -338,6 +354,8 @@ struct RunningNode {
     plugin_type: PluginType,
     key: NodeKey,
     remote: bool,
+    /// A local node's folder (deleted with the node).
+    node_dir: Option<PathBuf>,
     handle: NodeHandle,
     queue: Option<Arc<NodeQueue>>,
     /// The node's routing table, swapped on reload.
@@ -500,6 +518,10 @@ fn launch(
         plugin_type: spec.plugin_type,
         key: planned.key.clone(),
         remote: matches!(spec.launch, Launch::Remote { .. }),
+        node_dir: match &spec.launch {
+            Launch::Local(local) => Some(local.workdir.dir.clone()),
+            Launch::Remote { .. } => None,
+        },
         handle,
         queue,
         routes: routes_tx,
@@ -508,6 +530,16 @@ fn launch(
         dropped_hops,
         mapping_errors,
         emitted,
+    }
+}
+
+/// Deletes a removed node's folder (its plugin has stopped).
+async fn remove_node_dir(dir: PathBuf) {
+    let shown = dir.display().to_string();
+    match tokio::task::spawn_blocking(move || workdir::remove(&dir)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => log::warn!("Director: couldn't remove node folder {shown}: {err}"),
+        Err(err) => log::warn!("Director: couldn't remove node folder {shown}: {err}"),
     }
 }
 
@@ -673,7 +705,16 @@ impl RunningScene {
             }
         }
         // Removed nodes, and changed ones whose queue couldn't be kept.
+        // Removed nodes' folders go too; changed nodes keep theirs.
+        let removed_dirs: Vec<PathBuf> = old
+            .values()
+            .filter(|n| !plan.nodes.iter().any(|p| p.spec.node_id == n.id))
+            .filter_map(|n| n.node_dir.clone())
+            .collect();
         stop_nodes(old.into_values().collect(), true).await;
+        for dir in removed_dirs {
+            remove_node_dir(dir).await;
+        }
         for planned in &plan.nodes {
             let id = &planned.spec.node_id;
             if !kept.contains_key(id) && !started.contains_key(id) {

@@ -51,21 +51,20 @@ Out of scope here: how scenes are configured, and how the hub queues events inte
 
 ## 3. Processes and connections
 
-A node runs its plugin in one of two ways.
-
-**Local** (the default). The hub starts the plugin executable as a child process, with the plugin's install folder as its working directory, and these arguments, followed by the node's own launch arguments:
+Whoever starts a plugin gives it what it needs to speak the protocol:
 
 ```
 --id <instance id> --host <hub host> --port <hub port> --log-level <trace|debug|info|warn|error>
 ```
 
-A fresh random **token** for this launch is in the environment variable `FLWRS_TOKEN`. It's in the environment rather than the arguments because arguments are visible to other users in `ps`. Standard input is closed. Standard output and standard error go to the server log, tagged with the scene and node.
+and its **token**, in the environment variable `FLWRS_TOKEN` (or `--token`). The token is in the environment rather than the arguments because arguments are visible to other users in `ps`.
 
-**Remote.** An operator starts the plugin, possibly on another machine, with the same arguments pointing at the hub's reachable address, and authenticates it with the node's pre-shared token (`FLWRS_TOKEN`, or `--token`) or with a client certificate ([section 14](#14-security)).
+- **Local** nodes (the default): the hub starts the plugin as a child process, with a fresh token for each launch. How it's started (working directory, the node's own settings as arguments, environment variables and files, output, stopping) is the launch contract in the [plugin specification](plugin-spec.md#5-launching-a-local-plugin), together with packages and manifests.
+- **Remote** nodes: an operator starts the plugin, possibly on another machine, with the same arguments pointing at the hub's reachable address, and authenticates it with the node's pre-shared token or with a client certificate ([section 14](#14-security)).
 
 In both cases the plugin opens **one TCP connection** to the hub and keeps it for its whole run. Messages flow in both directions on it. If the connection drops, the plugin reconnects ([section 6.5](#65-reconnecting)).
 
-Stopping a local plugin: the hub sends `Shutdown` and waits for the process to exit (10 s by default). Then it asks the OS to stop the process and everything it started (SIGTERM to its process group on Unix, Ctrl-Break to its console group on Windows), waits again (2 s by default) and kills it. A plugin SHOULD exit on `Shutdown`, and SHOULD treat SIGTERM or Ctrl-Break as a last request to stop.
+To stop a plugin, the hub sends `Shutdown` ([section 6.4](#64-shutdown)). A local plugin that doesn't exit is then stopped by the OS ([plugin specification, section 5.4](plugin-spec.md#54-stopping)).
 
 ## 4. Framing
 
@@ -189,7 +188,7 @@ The hub then checks, in order:
 
 1. **Identity.** A node with this instance id is expected, and the credentials match: the token (compared in constant time), or the client certificate. Otherwise the reply is `Shutdown` with a short `reason`, and the attempt is logged (rate-limited). A plugin left over from an earlier server run gets the same answer, since its token is no longer valid.
 2. **Protocol version.** The hub picks the highest version both sides speak. If there's none, the reply is `Shutdown` ("no common protocol version: hub speaks 2..2").
-3. **Declaration.** `plugin_type` and `plugin_version` equal the installed plugin's manifest, and the declared schemas are well formed and structurally equal to the manifest's ([section 11.4](#114-schema-rules)). Otherwise the reply is `Shutdown` with every difference in `reason`. The hub doesn't relaunch a local plugin rejected this way: the same executable would fail the same way.
+3. **Declaration.** `plugin_type` and `plugin_version` equal the installed plugin's manifest, and the declared schemas are well formed and structurally equal to the node's: the manifest's, or the node's own when the plugin takes its payload schemas from its settings ([plugin specification, section 3.5](plugin-spec.md#35-per-node-payload-schemas); [section 11.4](#114-schema-rules)). Otherwise the reply is `Shutdown` with every difference in `reason`. The hub doesn't relaunch a local plugin rejected this way: the same executable would fail the same way.
 
 If all pass, the hub answers `InitializeResponse` with the protocol version in use, the capabilities enabled (a subset of those offered), its heartbeat interval and, with `ACKS`, the consumer window it will use. If the node already had a connection, the new one replaces it and the old one is closed ("newest connection wins"). This recovers from half-open connections.
 
@@ -378,7 +377,7 @@ A plugin declares the shape of what it accepts and emits as a `SchemaDefinition`
 - `content_type` is set only on `BYTES`;
 - nesting is at most 32 levels deep.
 
-**Matching** (declared against the manifest): structural equality. Both have the same set of keys at every level, with the same type, nested definition, object fields and content type for each key. Field order and descriptions are ignored.
+**Matching** (declared against the node's schemas, see section 6.1): structural equality. Both have the same set of keys at every level, with the same type, nested definition, object fields and content type for each key. Field order and descriptions are ignored.
 
 **Values** in a payload SHOULD follow the declared schema. The hub checks payloads only where an edge maps them: it converts losslessly to the target's schema where it can, and counts and logs a mapping error where it can't. Undeclared fields are dropped on mapped edges, and passed through unchanged on unmapped ones.
 
@@ -436,7 +435,7 @@ Either way, the hub checks `instance_id` together with the credentials: several 
 
 What every plugin MUST do:
 
-1. Read `--id`, `--host`, `--port`, `--log-level` (and its own arguments) and the token from `FLWRS_TOKEN` (or `--token`).
+1. Read `--id`, `--host`, `--port`, `--log-level` (and its own settings, [plugin specification](plugin-spec.md)) and the token from `FLWRS_TOKEN` (or `--token`).
 2. Connect, and send `INITIALIZE` with `min_protocol_version = max_protocol_version = 2` and no capabilities.
 3. Read frames. On `INITIALIZE_RESPONSE`, start working. On `SHUTDOWN`, send `EXIT` and stop (and don't reconnect if it came before `INITIALIZE_RESPONSE`). On `PING`, answer `PONG`.
 4. Producers: send `EVENT` frames with `seq` 1, 2, 3, …. Transforms also set `input_seq`.

@@ -106,6 +106,10 @@ struct PluginArgs {
     /// A JSON file with the node's launch_args.
     #[arg(long)]
     launch_args: Option<PathBuf>,
+    /// A file uploaded to the node, for `"source": "upload"` launch args
+    /// (repeatable; on top of trellis.toml's [uploads]).
+    #[arg(long = "upload", value_name = "NAME=PATH", value_parser = parse_var)]
+    uploads: Vec<(String, String)>,
     /// Show the plugin's stdout and stderr.
     #[arg(long)]
     show_output: bool,
@@ -379,6 +383,14 @@ fn open(plugin: &PluginArgs, default_profile: Profile) -> Result<(Target, Option
         }
     };
     target.show_output = plugin.show_output;
+    if let Some(config) = &config {
+        for (name, path) in &config.uploads {
+            target = target.with_upload(name, config.dir.join(path))?;
+        }
+    }
+    for (name, path) in &plugin.uploads {
+        target = target.with_upload(name, path)?;
+    }
     Ok((target, config))
 }
 

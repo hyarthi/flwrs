@@ -8,7 +8,7 @@ use super::handle::{
 use super::queue::{delete_files, purge_files};
 use super::running::{Context, RunningScene};
 use crate::modules::scene::service::{Service as SceneService, ServiceError};
-use crate::modules::supervisor::NodeState;
+use crate::modules::supervisor::{NodeState, workdir};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -37,6 +37,7 @@ impl Engine {
     ) {
         let engine = Arc::new(self);
         clean_spool_dir(&engine).await;
+        clean_nodes_dir(&engine).await;
         let mut workers: HashMap<String, mpsc::UnboundedSender<DirectorCommand>> = HashMap::new();
         let mut tasks = JoinSet::new();
 
@@ -112,6 +113,69 @@ async fn clean_spool_dir(engine: &Engine) {
             "Director: removed {removed} orphaned spool entries from {}",
             dir.display()
         );
+    }
+}
+
+/// Removes the folders of scenes and nodes that no longer exist. A disabled
+/// scene's nodes keep theirs.
+async fn clean_nodes_dir(engine: &Engine) {
+    let dir = engine.ctx.nodes_dir.clone();
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return; // not created yet
+    };
+    let mut orphans: Vec<(String, Option<Vec<String>>)> = vec![];
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let scene_id = entry.file_name().to_string_lossy().into_owned();
+        match engine.scenes.snapshot(&scene_id).await {
+            Err(ServiceError::NotFound(_)) => orphans.push((scene_id, None)),
+            Ok(snapshot) => {
+                let Ok(mut nodes) = tokio::fs::read_dir(entry.path()).await else {
+                    continue;
+                };
+                let mut gone = vec![];
+                while let Ok(Some(node)) = nodes.next_entry().await {
+                    let name = node.file_name().to_string_lossy().into_owned();
+                    let node_id = name.strip_suffix(".links").unwrap_or(&name).to_string();
+                    if !snapshot.nodes.iter().any(|n| n.id == node_id) && !gone.contains(&node_id) {
+                        gone.push(node_id);
+                    }
+                }
+                if !gone.is_empty() {
+                    orphans.push((scene_id, Some(gone)));
+                }
+            }
+            Err(err) => log::warn!("Director: can't check node folders of {scene_id}: {err}"),
+        }
+    }
+    if orphans.is_empty() {
+        return;
+    }
+    let shown = dir.display().to_string();
+    let removed = tokio::task::spawn_blocking(move || {
+        let mut removed = 0;
+        for (scene_id, nodes) in orphans {
+            let result = match nodes {
+                None => workdir::remove_scene(&dir, &scene_id).map(|()| 1),
+                Some(nodes) => nodes.iter().try_fold(0, |n, node| {
+                    workdir::remove(&dir.join(&scene_id).join(node)).map(|()| n + 1)
+                }),
+            };
+            match result {
+                Ok(n) => removed += n,
+                Err(err) => {
+                    log::warn!("Director: couldn't remove node folders of {scene_id}: {err}")
+                }
+            }
+        }
+        removed
+    })
+    .await
+    .unwrap_or(0);
+    if removed > 0 {
+        log::info!("Director: removed {removed} orphaned node folder(s) from {shown}");
     }
 }
 
@@ -330,7 +394,18 @@ async fn reload(
             if let Some(scene) = running.take() {
                 scene.stop().await;
             }
-            // Its queued events go with it.
+            // Its node folders and queued events go with it.
+            let (nodes_dir, id) = (engine.ctx.nodes_dir.clone(), scene_id.to_string());
+            match tokio::task::spawn_blocking(move || workdir::remove_scene(&nodes_dir, &id)).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    log::warn!("Director: couldn't remove the node folders of [{scene_id}]: {err}")
+                }
+                Err(err) => {
+                    log::warn!("Director: couldn't remove the node folders of [{scene_id}]: {err}")
+                }
+            }
             let spool = engine.ctx.spill.scene_dir(scene_id);
             if let Err(err) = tokio::fs::remove_dir_all(&spool).await
                 && err.kind() != std::io::ErrorKind::NotFound

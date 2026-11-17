@@ -41,6 +41,8 @@ port = 7400
 # The director runs the enabled scenes; spill-to-disk files go here.
 [director]
 spool_dir = ".data/scenes"
+nodes_dir = ".data/nodes"   # local nodes' folders (their working directories)
+files_dir = ".data/files"   # files uploaded to nodes
 
 # Export stats to a local OpenTelemetry collector (e.g. `otelcol` with an
 # OTLP/HTTP receiver on 4318). Uncomment to try it.

@@ -2,7 +2,8 @@
 //! plugin instance. Shared by the scene service (validation), the plugin
 //! registry (manifest `runtime_defaults`) and, later, the director.
 
-use crate::modules::plugin::manifest::{self, LaunchArgsStyle};
+use crate::modules::plugin::manifest::{self, LaunchSpec};
+use crate::modules::plugin::node_rules::NodeRules;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -321,7 +322,9 @@ impl RuntimeConfig {
 /// What the node's plugin says about its configuration.
 pub(crate) struct PluginRules<'a> {
     pub launch_args_schema: Option<&'a jsonschema::Validator>,
-    pub launch_args_style: LaunchArgsStyle,
+    pub launch_spec: &'a LaunchSpec,
+    /// Per-node payload schemas and code fields (manifest version 2).
+    pub node: Option<&'a NodeRules>,
 }
 
 impl NodeConfig {
@@ -345,15 +348,32 @@ impl NodeConfig {
         if let Some(unsupported) = self.unsupported() {
             errors.push(unsupported);
         }
-        if self.launch == LaunchMode::Local {
+        let node_schemas = plugin.node.is_some_and(|n| n.has_node_schemas());
+        match self.launch {
+            LaunchMode::Local => {
+                errors.extend(
+                    manifest::validate_launch_args(
+                        plugin.launch_args_schema,
+                        plugin.launch_spec,
+                        &self.launch_args,
+                    )
+                    .into_iter()
+                    .map(|e| format!("config.{e}")),
+                );
+                if let Some(code) = plugin.node.and_then(|n| n.code_problems(&self.launch_args)) {
+                    errors.extend(code.into_iter().map(|e| format!("config.{e}")));
+                }
+            }
+            LaunchMode::Remote if !self.launch_args.is_null() && !node_schemas => errors.push(
+                "config.launch_args is only used for local nodes (and for a remote node's payload schemas, which this plugin doesn't take); a remote plugin gets its arguments from whoever starts it".into(),
+            ),
+            LaunchMode::Remote => {}
+        }
+        if node_schemas && let Some(node) = plugin.node {
             errors.extend(
-                manifest::validate_launch_args(
-                    plugin.launch_args_schema,
-                    plugin.launch_args_style,
-                    &self.launch_args,
-                )
-                .into_iter()
-                .map(|e| format!("config.{e}")),
+                node.node_schema_problems(&self.launch_args)
+                    .into_iter()
+                    .map(|e| format!("config.{e}")),
             );
         }
         errors
@@ -396,11 +416,6 @@ impl NodeConfig {
                     errors.push(format!(
                         "config.remote_id must be 1 to {MAX_REMOTE_ID_LEN} characters of letters, digits, '.', '_', ':' and '-'"
                     ));
-                }
-                if !self.launch_args.is_null() {
-                    errors.push(
-                        "config.launch_args is only used for local nodes; a remote plugin gets its arguments from whoever starts it".into(),
-                    );
                 }
                 if let Some(pin) = self
                     .tls
@@ -564,9 +579,11 @@ mod tests {
     }
 
     fn no_schema() -> PluginRules<'static> {
+        static FLAGS: std::sync::LazyLock<LaunchSpec> = std::sync::LazyLock::new(LaunchSpec::flags);
         PluginRules {
             launch_args_schema: None,
-            launch_args_style: LaunchArgsStyle::Flags,
+            launch_spec: &FLAGS,
+            node: None,
         }
     }
 
@@ -721,9 +738,11 @@ mod tests {
             "type": "object", "properties": {"t": {"type": "integer"}}, "additionalProperties": false
         }))
         .unwrap();
+        let spec = LaunchSpec::flags();
         let rules = PluginRules {
             launch_args_schema: Some(&schema),
-            launch_args_style: LaunchArgsStyle::Flags,
+            launch_spec: &spec,
+            node: None,
         };
         let ok = NodeConfig::parse(&json!({"launch_args": {"t": 1}})).unwrap();
         assert!(ok.validate(&rules, &SceneDefaults::default()).is_empty());

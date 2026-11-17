@@ -2,6 +2,7 @@ mod query_sqlite;
 
 use super::config::PluginsConfig;
 use super::manifest::{self, Manifest};
+use super::node_rules::NodeRules;
 use super::package::{self, Limits, Package, PackageError};
 use crate::modules::director::DirectorHandle;
 use chrono::Local;
@@ -173,8 +174,16 @@ impl Service {
         self.config.dir.join(".trash")
     }
 
-    fn install_dir(&self, id: &str) -> PathBuf {
+    /// `<dir>/<id>`: every installed version of a plugin.
+    fn plugin_dir(&self, id: &str) -> PathBuf {
         self.config.dir.join(id)
+    }
+
+    /// `<dir>/<id>/<version>`: one version's files. Versioned, so node
+    /// folders linking into it never see a newer version's files while their
+    /// plugin still runs.
+    fn install_dir(&self, id: &str, version: &str) -> PathBuf {
+        self.plugin_dir(id).join(version)
     }
 
     fn limits(&self) -> Limits {
@@ -220,12 +229,14 @@ impl Service {
     }
 
     /// Start-up check: logs registered plugins whose files are missing, and
-    /// folders that don't belong to any registered plugin. Returns the ids of
-    /// broken plugins.
+    /// folders that don't belong to any registered plugin, and removes the
+    /// folders of versions replaced by an upgrade (nothing runs them before
+    /// the director starts). Returns the ids of broken plugins.
     pub(crate) async fn check_installations(&self) -> Result<Vec<String>, ServiceError> {
         let plugins = self.list().await?;
         let mut broken = vec![];
         for plugin in &plugins {
+            self.remove_old_versions(plugin).await;
             if !self.is_installed(plugin) {
                 log::error!(
                     "Plugin registry: plugin [{}] is registered but its files are missing at [{}]; nodes using it can't start",
@@ -268,19 +279,21 @@ impl Service {
             Err(ServiceError::NotFound) => {}
             Err(e) => return Err(e),
         }
-        let target = self.install_dir(&id);
-        if target.exists() {
+        let folder = self.plugin_dir(&id);
+        if folder.exists() {
             let parked = self.trash_dir().join(format!("{id}-{}", Ulid::generate()));
             log::warn!(
                 "Plugin registry: folder [{}] exists but isn't registered; moving it aside",
-                target.display()
+                folder.display()
             );
-            tokio::fs::rename(&target, &parked).await?;
+            tokio::fs::rename(&folder, &parked).await?;
             let _ = tokio::fs::remove_dir_all(&parked).await;
         }
+        tokio::fs::create_dir_all(&folder).await?;
+        let mut installed_cleanup = Cleanup(Some(folder));
+        let target = self.install_dir(&id, &package.manifest.version);
         tokio::fs::rename(&staged, &target).await?;
         staged_cleanup.disarm();
-        let mut installed_cleanup = Cleanup(Some(target.clone()));
 
         let new = NewPlugin::from_package(package, &target, sha);
         let mut conn = self.conn().await?;
@@ -332,10 +345,17 @@ impl Service {
         }
         self.check_nodes_against(&package).await?;
 
-        // Swap folders: current → trash, staged → current. Undo on failure.
-        let target = PathBuf::from(&existing.install_path);
+        // A new version goes into its own folder; the old one stays until
+        // the next start (running nodes may still use it). The same version
+        // again swaps folders: current → trash, staged → current. Undo on failure.
+        let target = self.install_dir(id, &package.manifest.version);
+        let same_folder = Path::new(&existing.install_path) == target;
+        if !same_folder && target.exists() {
+            tokio::fs::remove_dir_all(&target).await?; // a leftover
+        }
+        tokio::fs::create_dir_all(self.plugin_dir(id)).await?;
         let parked = self.trash_dir().join(format!("{id}-{}", Ulid::generate()));
-        let had_folder = target.exists();
+        let had_folder = same_folder && target.exists();
         if had_folder {
             tokio::fs::rename(&target, &parked).await?;
         }
@@ -382,7 +402,7 @@ impl Service {
     /// node uses it.
     pub(crate) async fn delete(&self, id: &str) -> Result<(), ServiceError> {
         let _guard = self.lock.lock().await;
-        let plugin = self.get(id).await?;
+        self.get(id).await?; // NotFound for an unknown id
         let mut conn = self.conn().await?;
         // Nodes don't reference plugins with a foreign key (imported scenes
         // may name plugins this server lacks), so the check and the delete
@@ -398,7 +418,7 @@ impl Service {
             return Err(ServiceError::NotFound);
         }
         tx.commit().await?;
-        let folder = PathBuf::from(&plugin.install_path);
+        let folder = self.plugin_dir(id);
         if folder.exists() {
             let parked = self.trash_dir().join(format!("{id}-{}", Ulid::generate()));
             let removed = match tokio::fs::rename(&folder, &parked).await {
@@ -414,6 +434,34 @@ impl Service {
         }
         log::info!("Plugin registry: removed [{id}]");
         Ok(())
+    }
+
+    /// Removes `<dir>/<id>/<version>` folders other than the registered one.
+    async fn remove_old_versions(&self, plugin: &Plugin) {
+        let folder = self.plugin_dir(&plugin.id);
+        let current = Path::new(&plugin.install_path);
+        // Installs from before versioned folders keep their layout.
+        if current.parent() != Some(folder.as_path()) {
+            return;
+        }
+        let Ok(mut entries) = tokio::fs::read_dir(&folder).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path != current && path.is_dir() {
+                match tokio::fs::remove_dir_all(&path).await {
+                    Ok(()) => log::info!(
+                        "Plugin registry: removed [{}]'s replaced version folder [{}]",
+                        plugin.id,
+                        path.display()
+                    ),
+                    Err(e) => {
+                        log::warn!("Plugin registry: couldn't remove [{}]: {e}", path.display())
+                    }
+                }
+            }
+        }
     }
 
     /// Hashes and unpacks the upload into a fresh staging folder. Runs on a
@@ -443,26 +491,22 @@ impl Service {
         }
     }
 
-    /// Re-validates the `launch_args` of every node using the plugin against
-    /// the new package's manifest.
+    /// Re-validates every node using the plugin against the new package:
+    /// local nodes' `launch_args` (schema, delivery, code), and every node's
+    /// payload schemas when the package takes them from the node.
     async fn check_nodes_against(&self, package: &Package) -> Result<(), ServiceError> {
         let mut conn = self.conn().await?;
         let nodes = query_sqlite::nodes_using(&mut conn, &package.manifest.id).await?;
         if nodes.is_empty() {
             return Ok(());
         }
-        let validator = match &package.launch_args_schema {
-            Some(schema) => {
-                let value: serde_json::Value = serde_json::from_str(schema).map_err(|e| {
-                    ServiceError::Internal(format!("stored schema isn't JSON: {e}"))
-                })?;
-                Some(
-                    jsonschema::validator_for(&value)
-                        .map_err(|e| ServiceError::Internal(e.to_string()))?,
-                )
-            }
-            None => None,
-        };
+        let rules = NodeRules::from_parts(
+            package.manifest.clone(),
+            &package.launch_args_schema,
+            &package.in_schema,
+            &package.out_schema,
+        )
+        .map_err(ServiceError::Internal)?;
         let mut problems = vec![];
         for (node_id, config) in nodes {
             let config: serde_json::Value = serde_json::from_str(&config).unwrap_or_default();
@@ -470,13 +514,16 @@ impl Service {
                 .get("launch_args")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            for error in manifest::validate_launch_args(
-                validator.as_ref(),
-                package.manifest.launch_args_style,
-                &args,
-            ) {
-                problems.push(format!("node {node_id}: {error}"));
+            let remote = config.get("launch").and_then(|l| l.as_str()) == Some("remote");
+            let mut errors = vec![];
+            if !remote {
+                errors.extend(rules.validate_launch_args(&args));
+                errors.extend(rules.code_problems(&args).unwrap_or_default());
             }
+            if rules.has_node_schemas() {
+                errors.extend(rules.node_schema_problems(&args));
+            }
+            problems.extend(errors.into_iter().map(|e| format!("node {node_id}: {e}")));
         }
         if problems.is_empty() {
             Ok(())
@@ -566,7 +613,12 @@ pub(crate) mod tests {
             ("test-sink", "SINK", "1.0.0")
         );
         assert!(f.service.is_installed(&plugin));
-        assert!(f.dir.path().join("plugins/test-sink/bin/run").is_file());
+        assert!(
+            f.dir
+                .path()
+                .join("plugins/test-sink/1.0.0/bin/run")
+                .is_file()
+        );
         assert!(!upload.exists(), "upload file removed");
         assert_eq!(f.service.list().await.unwrap().len(), 1);
         assert!(f.service.check_installations().await.unwrap().is_empty());
@@ -635,6 +687,23 @@ pub(crate) mod tests {
                 .count(),
             0
         );
+        // each version has its own folder; the replaced one stays until the
+        // next start, which removes it
+        let plugins = f.dir.path().join("plugins/test-sink");
+        assert!(plugins.join("1.1.0/bin/run").is_file());
+        assert!(plugins.join("1.0.0/bin/run").is_file());
+        assert!(f.service.check_installations().await.unwrap().is_empty());
+        assert!(!plugins.join("1.0.0").exists());
+        // the same version again replaces its folder in place
+        let again = f
+            .service
+            .upgrade("test-sink", &f.upload("test-sink", "1.1.0"))
+            .await
+            .unwrap();
+        assert_eq!(again.install_path, upgraded.install_path);
+        assert!(f.service.is_installed(&again));
+        // delete removes every version
+        f.service.delete("test-sink").await.unwrap_err(); // n1 uses it
     }
 
     #[tokio::test]

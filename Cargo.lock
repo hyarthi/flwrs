@@ -839,6 +839,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "filetime"
+version = "0.2.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1255e7a9f1902190d4c10a75f2f7f495d3d3ce13e9ba26e6c48683a0f4dbed7"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -908,9 +918,11 @@ dependencies = [
  "flwrs-core",
  "flwrs-plugin",
  "fs4",
+ "futures-util",
  "getrandom 0.4.3",
  "http-body-util",
  "jsonschema",
+ "junction",
  "log",
  "mlua",
  "nix",
@@ -929,6 +941,7 @@ dependencies = [
  "serde_json",
  "sha256",
  "sqlx",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",
@@ -984,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "flwrs-plugin"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "bytes",
  "clap",
@@ -1029,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "flwrs-trellis"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "clap",
  "flwrs-plugin",
@@ -1816,6 +1829,16 @@ dependencies = [
  "num-traits",
  "serde_json",
  "zmij",
+]
+
+[[package]]
+name = "junction"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cde48f36530cbd91b65f050101e6c056d6eb743cea2a8f0f19beef69c6742ff8"
+dependencies = [
+ "scopeguard",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3569,6 +3592,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
  "libc",
 ]
 

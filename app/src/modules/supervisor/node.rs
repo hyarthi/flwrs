@@ -299,26 +299,24 @@ impl Supervisor {
                 s.pid = None;
             });
             let started = Instant::now();
-            let (startup, mut process) =
-                match PluginProcess::spawn(launch, &self.spec.node_id, &token, &self.tag) {
-                    Ok(mut process) => {
-                        log::info!(
-                            "{} launched plugin [{}] (pid {})",
-                            self.tag,
-                            self.spec.plugin_id,
-                            process.pid().map_or("?".into(), |p| p.to_string())
-                        );
-                        self.update(|s| s.pid = process.pid());
-                        (self.until_running(&mut process).await, Some(process))
-                    }
-                    Err(err) => (
-                        Startup::Failed(format!(
-                            "couldn't start {}: {err}",
-                            launch.program.display()
-                        )),
-                        None,
-                    ),
-                };
+            let spawned = match prepare_workdir(launch).await {
+                Ok(()) => PluginProcess::spawn(launch, &self.spec.node_id, &token, &self.tag)
+                    .map_err(|err| format!("couldn't start {}: {err}", launch.program.display())),
+                Err(err) => Err(err),
+            };
+            let (startup, mut process) = match spawned {
+                Ok(mut process) => {
+                    log::info!(
+                        "{} launched plugin [{}] (pid {})",
+                        self.tag,
+                        self.spec.plugin_id,
+                        process.pid().map_or("?".into(), |p| p.to_string())
+                    );
+                    self.update(|s| s.pid = process.pid());
+                    (self.until_running(&mut process).await, Some(process))
+                }
+                Err(err) => (Startup::Failed(err), None),
+            };
 
             let mut ran_for = Duration::ZERO;
             match startup {
@@ -585,4 +583,17 @@ impl Supervisor {
 fn jitter(delay: Duration) -> Duration {
     let random = RandomState::new().hash_one(Instant::now());
     delay.mul_f64(0.9 + (random % 2001) as f64 / 10_000.0)
+}
+
+/// Brings the node's folder up to date before a launch (links to the package,
+/// `config/`), on a blocking thread.
+async fn prepare_workdir(launch: &LocalLaunch) -> Result<(), String> {
+    let workdir = launch.workdir.clone();
+    let dir = workdir.dir.display().to_string();
+    let prepare = move || super::workdir::prepare(&workdir, &|name| workdir.upload(name));
+    match tokio::task::spawn_blocking(prepare).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(format!("couldn't prepare the node folder {dir}: {err}")),
+        Err(err) => Err(format!("couldn't prepare the node folder {dir}: {err}")),
+    }
 }

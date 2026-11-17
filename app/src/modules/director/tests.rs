@@ -459,6 +459,8 @@ impl Setup {
             ),
             max_hops,
             log_level: "info".into(),
+            nodes_dir: self.dir.path().join("nodes"),
+            files_dir: self.dir.path().join("files"),
         };
         let (handle, commands): (DirectorHandle, mpsc::Receiver<DirectorCommand>) =
             DirectorHandle::channel();

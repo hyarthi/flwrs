@@ -153,7 +153,7 @@ public final class HttpSink {
         String token = args.getOrDefault("token", System.getenv().getOrDefault("FLWRS_TOKEN", ""));
 
         Payload.SchemaDefinition.Builder schema = Payload.SchemaDefinition.newBuilder();
-        JsonFormat.parser().merge(Files.readString(Path.of("schema", "in.json")), schema); // cwd = install folder
+        JsonFormat.parser().merge(Files.readString(Path.of("schema", "in.json")), schema); // cwd = the node's folder, with the package's files linked in
         Initialize initialize = Initialize.newBuilder()
                 .setInstanceId(args.get("id")).setPluginVersion(VERSION).setPluginType(PluginType.Enum.SINK)
                 .setToken(token).setInSchema(schema)

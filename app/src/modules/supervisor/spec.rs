@@ -1,15 +1,18 @@
 //! Everything needed to run one node, resolved from the node's config and its
 //! plugin's registry entry.
 
+use super::workdir::{self, Workdir};
 use crate::modules::hub::{ExpectedNode, NodeAuth};
 use crate::modules::node_config::{
     EffectiveAuth, LaunchMode, NodeConfig, QueueConfig, RuntimeConfig, SceneDefaults, SpillConfig,
     WhenFull,
 };
-use crate::modules::plugin::manifest::{self, PluginType};
+use crate::modules::plugin::manifest::PluginType;
+use crate::modules::plugin::node_rules::{NodeRules, Side};
 use crate::modules::plugin::service::Plugin;
+use crate::modules::scene::service::NodeUpload;
+use flwrs_plugin::package::{CONFIG_DIR, ConfigContent};
 use flwrs_plugin::schema::payload::SchemaDefinition;
-use flwrs_plugin::schema::rules;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -56,16 +59,19 @@ pub(crate) enum Launch {
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalLaunch {
-    /// Absolute path of the executable.
+    /// Absolute path of the executable (in the install folder).
     pub program: PathBuf,
-    /// Working directory: the plugin's install folder.
-    pub cwd: PathBuf,
+    /// The node's folder: the working directory, prepared before each launch.
+    pub workdir: Workdir,
     /// The hub address the plugin connects to.
     pub hub_addr: SocketAddr,
     /// `--log-level` value.
     pub log_level: String,
-    /// The node's `launch_args`, converted; appended after the bootstrap args.
+    /// The node's `launch_args` delivered as arguments (file settings as
+    /// paths into `config/`); appended after the bootstrap args.
     pub args: Vec<String>,
+    /// The node's `launch_args` delivered as environment variables.
+    pub env: Vec<(String, String)>,
 }
 
 impl LocalLaunch {
@@ -317,6 +323,12 @@ pub(crate) struct Surroundings<'a> {
     pub tls_available: bool,
     pub log_level: &'a str,
     pub scene_defaults: &'a SceneDefaults,
+    /// `[director] nodes_dir`: where local nodes' folders go.
+    pub nodes_dir: &'a Path,
+    /// `[director] files_dir`: uploaded files.
+    pub files_dir: &'a Path,
+    /// The files uploaded to this node.
+    pub uploads: &'a [NodeUpload],
 }
 
 impl NodeSpec {
@@ -334,6 +346,9 @@ impl NodeSpec {
             tls_available,
             log_level,
             scene_defaults,
+            nodes_dir,
+            files_dir,
+            uploads,
         } = *at;
         let mut errors = vec![];
         let manifest = plugin
@@ -348,15 +363,17 @@ impl NodeSpec {
         };
         errors.extend(config.runtime.validate("config.runtime"));
 
-        let parse_schema = |json: &Option<String>, side: &str, errors: &mut Vec<String>| {
-            json.as_deref().and_then(|j| {
-                rules::parse_json(j)
-                    .map_err(|e| errors.push(format!("plugin {side} schema: {e}")))
-                    .ok()
-            })
+        let rules = NodeRules::of(plugin).map_err(|e| vec![e])?;
+        // The plugin's, or the node's own (from its launch_args).
+        let mut schema = |side: Side| {
+            rules
+                .node_schema(side, &config.launch_args)
+                .map_err(|e| errors.push(format!("config.{e}")))
+                .ok()
+                .flatten()
         };
-        let in_schema = parse_schema(&plugin.in_schema, "in", &mut errors);
-        let out_schema = parse_schema(&plugin.out_schema, "out", &mut errors);
+        let in_schema = schema(Side::In);
+        let out_schema = schema(Side::Out);
 
         let launch = match config.launch {
             LaunchMode::Remote => {
@@ -392,20 +409,45 @@ impl NodeSpec {
                 }
             }
             LaunchMode::Local => {
-                let args =
-                    manifest::launch_args_to_argv(manifest.launch_args_style, &config.launch_args)
-                        .unwrap_or_else(|e| {
-                            errors.extend(e.into_iter().map(|e| format!("config.{e}")));
-                            vec![]
-                        });
-                let cwd = std::path::absolute(Path::new(&plugin.install_path))
+                let dir = workdir::node_dir(nodes_dir, scene_id, node_id);
+                let plan = rules
+                    .spec
+                    .plan(&config.launch_args, &dir.join(CONFIG_DIR))
+                    .unwrap_or_else(|e| {
+                        errors.extend(e.into_iter().map(|e| format!("config.{e}")));
+                        Default::default()
+                    });
+                // The uploads its launch args name, from the store.
+                let mut linked = vec![];
+                for file in &plan.files {
+                    let ConfigContent::Upload(name) = &file.content else {
+                        continue;
+                    };
+                    match uploads.iter().find(|u| u.name == *name) {
+                        Some(upload) => {
+                            let stored = files_dir.join(upload.stored_name());
+                            let stored = std::path::absolute(&stored).unwrap_or(stored);
+                            linked.push((name.clone(), stored));
+                        }
+                        None => errors.push(format!(
+                            "config.launch_args: the node has no uploaded file named {name:?}"
+                        )),
+                    }
+                }
+                let install_dir = std::path::absolute(Path::new(&plugin.install_path))
                     .unwrap_or_else(|_| PathBuf::from(&plugin.install_path));
                 Launch::Local(LocalLaunch {
-                    program: cwd.join(&manifest.executable),
-                    cwd,
+                    program: install_dir.join(&manifest.executable),
+                    workdir: Workdir {
+                        dir,
+                        install_dir,
+                        files: plan.files,
+                        uploads: linked,
+                    },
                     hub_addr: local_hub_addr(hub_addr),
                     log_level: log_level.to_string(),
-                    args,
+                    args: plan.argv,
+                    env: plan.env,
                 })
             }
         };

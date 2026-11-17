@@ -1,15 +1,18 @@
-//! Scene export and import (`.flwr` files), for moving a scene to another
-//! server. An import gets new ids, arrives disabled, and goes through even if
-//! this server lacks the plugins it names: those show up as problems in
-//! [`Service::check`] until they're installed.
+//! Scene export and import (`.flwr` files, and `.far` archives with the
+//! nodes' uploaded files), for moving a scene to another server. An import
+//! gets new ids, arrives disabled, and goes through even if this server lacks
+//! the plugins it names or an uploaded file: those show up as problems in
+//! [`Service::check`] until they're there.
 
 use super::query_sqlite::{self, EdgeValues, NodeValues};
 use super::*;
 use crate::modules::node_config::LaunchMode;
 use crate::modules::node_config::SceneDefaults;
 use crate::modules::plugin::manifest::is_valid_id;
+use crate::modules::scene::archive::{self, Kind};
 use crate::modules::scene::scene_file::{self, pb};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 const MAX_NODES: usize = 10_000;
 const MAX_EDGES: usize = 100_000;
@@ -19,6 +22,14 @@ const MAX_VERSION_CHARS: usize = 64;
 pub(crate) struct Export {
     pub file_name: String,
     pub bytes: Vec<u8>,
+    /// The uploads an archive carries: (name in `files/`, stored file).
+    files: Vec<(String, PathBuf)>,
+}
+
+/// An exported `.far` archive in a temporary file (the caller removes it).
+pub(crate) struct ArchiveExport {
+    pub file_name: String,
+    pub path: PathBuf,
 }
 
 /// An imported scene and what it still needs before it can run here.
@@ -30,8 +41,8 @@ pub(crate) struct Imported {
 impl Service {
     /// Serializes a scene with its whole graph. Remote nodes always carry
     /// their `remote_id` (their node id if none was set), so remote plugins
-    /// keep working after an import, where node ids change. Tokens are left
-    /// out unless `include_secrets`.
+    /// keep working after an import, where node ids change. Tokens and
+    /// launch-args secrets are left out unless `include_secrets`.
     pub(crate) async fn export_scene(
         &self,
         id: &str,
@@ -43,16 +54,61 @@ impl Service {
             .await
             .map_err(not_found("scene"))?;
         let mut nodes = vec![];
+        let mut files: Vec<(String, PathBuf)> = vec![];
         for row in query_sqlite::list_nodes(&mut conn, id).await? {
             let node = Node::try_from(row)?;
             let mut config = node.config.clone();
             if config.launch == LaunchMode::Remote {
                 config.remote_id.get_or_insert_with(|| node.id.clone());
             }
+            let mut omitted_secrets = vec![];
+            // The plugin says which launch args are secrets; without it
+            // installed, none are known.
+            let rules = match self.plugins.get(&node.plugin_id).await {
+                Ok(plugin) => NodeRules::of(&plugin).ok(),
+                Err(_) => None,
+            };
+            let secret_uploads: Vec<String> = rules
+                .as_ref()
+                .map(|r| {
+                    r.uploads_referenced(&node.config.launch_args)
+                        .into_iter()
+                        .filter(|(_, _, secret)| *secret)
+                        .map(|(_, name, _)| name)
+                        .collect()
+                })
+                .unwrap_or_default();
             if !include_secrets {
                 config.token = None;
+                if let Some(rules) = &rules {
+                    omitted_secrets = rules
+                        .secrets_set(&config.launch_args)
+                        .into_iter()
+                        .filter_map(|(pointer, set)| set.then_some(pointer))
+                        .collect();
+                    config.launch_args = rules.without_secrets(&config.launch_args);
+                }
+            }
+            let uploads = query_sqlite::list_uploads(&mut conn, &node.id).await?;
+            for upload in &uploads {
+                if include_secrets || !secret_uploads.contains(&upload.name) {
+                    let stored = upload.stored_name();
+                    if !files.iter().any(|(n, _)| *n == stored) {
+                        let path = self.files.files_dir.join(&stored);
+                        files.push((stored, path));
+                    }
+                }
             }
             nodes.push(pb::Node {
+                omitted_secrets,
+                files: uploads
+                    .into_iter()
+                    .map(|u| pb::NodeFile {
+                        name: u.name,
+                        sha256: u.sha256,
+                        size: u64::try_from(u.size).unwrap_or_default(),
+                    })
+                    .collect(),
                 key: node.id,
                 name: node.name,
                 r#type: plugin_type_to_pb(&node.node_type) as i32,
@@ -89,7 +145,87 @@ impl Service {
         Ok(Export {
             file_name: scene_file::file_name(&scene.name),
             bytes: scene_file::encode(&file),
+            files,
         })
+    }
+
+    /// Like [`Service::export_scene`], as a `.far` archive: the scene file
+    /// plus its nodes' uploaded files (a secret launch arg's file only with
+    /// `include_secrets`), written to a temporary file.
+    pub(crate) async fn export_archive(
+        &self,
+        id: &str,
+        include_secrets: bool,
+    ) -> Result<ArchiveExport, ServiceError> {
+        let export = self.export_scene(id, include_secrets).await?;
+        let path = self.incoming_path().await?;
+        let (out, bytes, files) = (path.clone(), export.bytes, export.files);
+        tokio::task::spawn_blocking(move || archive::write_far(&out, &bytes, &files))
+            .await
+            .map_err(|e| ServiceError::Unknown(format!("writing an archive: {e}")))?
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&path);
+                ServiceError::Unknown(format!("writing an archive: {e}"))
+            })?;
+        let file_name = export
+            .file_name
+            .strip_suffix(&format!(".{}", scene_file::EXTENSION))
+            .unwrap_or(&export.file_name)
+            .to_string()
+            + ".far";
+        Ok(ArchiveExport { file_name, path })
+    }
+
+    /// Imports the file at `path` (removed afterwards): a `.flwr`, or a ZIP,
+    /// tar or tar.gz archive with one `.flwr` at its root, whose files are
+    /// the nodes' uploads (found by content). See [`Service::import_scene`].
+    pub(crate) async fn import_file(&self, path: &Path) -> Result<Imported, ServiceError> {
+        let _upload = scopeguard_file(path);
+        let mut head = vec![0u8; 512];
+        let read = {
+            use tokio::io::AsyncReadExt;
+            let mut f = tokio::fs::File::open(path)
+                .await
+                .map_err(|e| ServiceError::Unknown(format!("reading an import: {e}")))?;
+            let mut n = 0;
+            while n < head.len() {
+                match f.read(&mut head[n..]).await {
+                    Ok(0) => break,
+                    Ok(k) => n += k,
+                    Err(e) => return Err(ServiceError::Unknown(format!("reading an import: {e}"))),
+                }
+            }
+            n
+        };
+        head.truncate(read);
+        let kind = Kind::detect(&head).ok_or_else(|| {
+            ServiceError::Invalid(vec![
+                "not a scene file (.flwr) or an archive (ZIP, tar, tar.gz) with one".into(),
+            ])
+        })?;
+        if kind == Kind::Scene {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| ServiceError::Unknown(format!("reading an import: {e}")))?;
+            return self.import_scene(&bytes).await;
+        }
+        let work = self.incoming_path().await?;
+        tokio::fs::create_dir(&work)
+            .await
+            .map_err(|e| ServiceError::Unknown(format!("unpacking an import: {e}")))?;
+        let _work = scopeguard_dir(&work);
+        let limits = archive::Limits {
+            max_bytes: self.files.max_import_bytes,
+            max_entries: self.files.max_import_entries,
+        };
+        let (archive_path, dir) = (path.to_path_buf(), work.clone());
+        let unpacked =
+            tokio::task::spawn_blocking(move || archive::unpack(&archive_path, kind, &dir, limits))
+                .await
+                .map_err(|e| ServiceError::Unknown(format!("unpacking an import: {e}")))?
+                .map_err(|e| ServiceError::Invalid(vec![e]))?;
+        self.import_with_files(&unpacked.scene, unpacked.files)
+            .await
     }
 
     /// Creates a new (disabled) scene from a `.flwr` file, with new ids. The
@@ -97,6 +233,16 @@ impl Service {
     /// stored on failure); whether this server's plugins fit is not: that's
     /// reported in [`Imported::check`].
     pub(crate) async fn import_scene(&self, bytes: &[u8]) -> Result<Imported, ServiceError> {
+        self.import_with_files(bytes, HashMap::new()).await
+    }
+
+    /// [`Service::import_scene`] with the content of uploads by SHA-256
+    /// (files under the work folder; moved or copied into the store).
+    async fn import_with_files(
+        &self,
+        bytes: &[u8],
+        mut files: HashMap<String, PathBuf>,
+    ) -> Result<Imported, ServiceError> {
         let file = scene_file::decode(bytes).map_err(|e| ServiceError::Invalid(vec![e]))?;
         let plan = plan_import(file)?;
 
@@ -122,6 +268,10 @@ impl Service {
                 .to_string()
         };
         let mut ids: HashMap<&str, String> = HashMap::new();
+        let mut missing = vec![];
+        tokio::fs::create_dir_all(&self.files.files_dir)
+            .await
+            .map_err(|e| ServiceError::Unknown(format!("storing imported files: {e}")))?;
         for node in &plan.nodes {
             let id = next_id();
             let values = NodeValues {
@@ -132,6 +282,32 @@ impl Service {
                 config: &node.config_json,
             };
             query_sqlite::insert_node(&mut tx, &scene_id, &id, &values).await?;
+            for upload in &node.files {
+                let Some(source) = files.get(&upload.sha256).cloned() else {
+                    missing.push(format!(
+                        "node {id}: the uploaded file {:?} isn't in the import; upload it again",
+                        upload.name
+                    ));
+                    continue;
+                };
+                let stored = self
+                    .files
+                    .files_dir
+                    .join(stored_name(&upload.name, &upload.sha256));
+                if !stored.exists() {
+                    // Moved the first time; later uses (another name) copy it.
+                    let moved = source.starts_with(self.files.files_dir.join(".incoming"))
+                        && tokio::fs::rename(&source, &stored).await.is_ok();
+                    if !moved {
+                        tokio::fs::copy(&source, &stored).await.map_err(|e| {
+                            ServiceError::Unknown(format!("storing an imported file: {e}"))
+                        })?;
+                    }
+                    files.insert(upload.sha256.clone(), stored.clone());
+                }
+                let size = i64::try_from(upload.size).unwrap_or(i64::MAX);
+                query_sqlite::put_upload(&mut tx, &id, &upload.name, &upload.sha256, size).await?;
+            }
             ids.insert(node.key.as_str(), id);
         }
         for edge in &plan.edges {
@@ -154,8 +330,20 @@ impl Service {
         // Edge direction by node type, no `block` on a cycle.
         check_graph(&mut tx, &scene_id).await?;
         tx.commit().await?;
+        // Files stored for an import that failed above go here too.
+        self.collect_garbage(&mut conn).await?;
 
-        let check = self.check_nodes(&mut conn, &scene_id).await?;
+        let mut check = self.check_nodes(&mut conn, &scene_id).await?;
+        check.warnings.extend(missing);
+        for node in &plan.nodes {
+            if !node.omitted_secrets.is_empty() {
+                check.warnings.push(format!(
+                    "node {}: the export left out its secrets {}; set them before enabling the scene",
+                    ids[node.key.as_str()],
+                    node.omitted_secrets.join(", ")
+                ));
+            }
+        }
         log::info!(
             "Scene service: imported scene [{scene_id}] ({} nodes, {} edges, {} problems)",
             plan.nodes.len(),
@@ -166,6 +354,32 @@ impl Service {
     }
 }
 
+/// Removes a file when dropped.
+struct RemoveFile(PathBuf);
+
+impl Drop for RemoveFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Removes a folder when dropped.
+struct RemoveDir(PathBuf);
+
+impl Drop for RemoveDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scopeguard_file(path: &Path) -> RemoveFile {
+    RemoveFile(path.to_path_buf())
+}
+
+fn scopeguard_dir(path: &Path) -> RemoveDir {
+    RemoveDir(path.to_path_buf())
+}
+
 struct PlannedNode {
     key: String,
     name: Option<String>,
@@ -173,6 +387,8 @@ struct PlannedNode {
     plugin_id: String,
     plugin_version: Option<String>,
     config_json: String,
+    omitted_secrets: Vec<String>,
+    files: Vec<pb::NodeFile>,
 }
 
 struct PlannedEdge {
@@ -247,6 +463,25 @@ fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
             ));
         }
         let name = optional_name(node.name, &mut node_errors);
+        let mut file_names = HashSet::new();
+        for f in &node.files {
+            if let Err(e) = flwrs_plugin::package::launch::check_file_name(&f.name) {
+                node_errors.push(format!("files: {:?}: {e}", f.name));
+            } else if !file_names.insert(f.name.as_str()) {
+                node_errors.push(format!("files: {:?} is listed twice", f.name));
+            }
+            if f.sha256.len() != 64
+                || !f
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                node_errors.push(format!(
+                    "files: {:?}: sha256 must be 64 lowercase hex digits",
+                    f.name
+                ));
+            }
+        }
         let config_json = match serde_json::from_str::<Value>(&node.config_json)
             .map_err(|e| format!("config isn't JSON: {e}"))
             .and_then(|value| NodeConfig::parse(&value))
@@ -268,6 +503,8 @@ fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
             plugin_id: node.plugin_id,
             plugin_version: Some(node.plugin_version).filter(|v| !v.is_empty()),
             config_json,
+            omitted_secrets: node.omitted_secrets,
+            files: node.files,
         });
     }
 

@@ -1,10 +1,14 @@
 mod query_sqlite;
 mod transfer;
+mod uploads;
+
+pub(crate) use uploads::{NodeFiles, NodeUpload, stored_name};
 
 use crate::modules::director::DirectorHandle;
 use crate::modules::director::handle::{SceneState, SceneStatus};
 use crate::modules::mapping::{self, MappingSpec};
-use crate::modules::node_config::{NodeConfig, PluginRules, SceneDefaults, WhenFull};
+use crate::modules::node_config::{NodeConfig, SceneDefaults, WhenFull};
+use crate::modules::plugin::node_rules::{NodeRules, Side};
 use crate::modules::plugin::service::{
     Plugin, Service as PluginService, ServiceError as PluginError,
 };
@@ -12,12 +16,11 @@ use crate::modules::scene::graph;
 use chrono::Local;
 use flwrs_core::db::{Database, DbError};
 use flwrs_plugin::schema::payload::SchemaDefinition;
-use flwrs_plugin::schema::rules;
 use query_sqlite::{EdgeValues, NodeValues};
 use serde_json::Value;
 use sqlx::Connection;
 use sqlx::error::ErrorKind;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use ulid::Ulid;
@@ -70,6 +73,13 @@ pub(crate) struct Node {
     pub config: NodeConfig,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
+    /// The launch-args secrets the plugin declares (JSON pointers) and
+    /// whether this node has each set. Filled by the API-facing reads and
+    /// writes; empty when the plugin isn't installed.
+    pub secrets: BTreeMap<String, bool>,
+    /// The files uploaded to the node. Filled for the director's snapshot
+    /// and for `check`.
+    pub uploads: Vec<NodeUpload>,
 }
 
 impl TryFrom<NodeRow> for Node {
@@ -92,6 +102,8 @@ impl TryFrom<NodeRow> for Node {
             config,
             create_time: row.create_time,
             update_time: row.update_time,
+            secrets: BTreeMap::new(),
+            uploads: vec![],
         })
     }
 }
@@ -182,6 +194,9 @@ pub(crate) enum ServiceError {
     /// A service this one needs (e.g. the director) isn't answering.
     #[error("{0}")]
     Unavailable(String),
+    /// Not something the API hands out (e.g. a secret upload's content).
+    #[error("{0}")]
+    Forbidden(String),
 }
 
 impl From<sqlx::Error> for ServiceError {
@@ -226,7 +241,10 @@ pub(crate) struct Service {
     db: &'static Database,
     plugins: &'static PluginService,
     director: DirectorHandle,
+    /// Where nodes' folders and uploaded files are.
+    files: NodeFiles,
     /// Serializes graph changes, so whole-scene checks see a stable graph.
+    /// Also held while uploaded files are stored or removed.
     lock: Mutex<()>,
 }
 
@@ -242,11 +260,13 @@ impl Service {
         db: &'static Database,
         plugins: &'static PluginService,
         director: DirectorHandle,
+        files: NodeFiles,
     ) -> Self {
         Self {
             db,
             plugins,
             director,
+            files,
             lock: Mutex::new(()),
         }
     }
@@ -303,13 +323,15 @@ impl Service {
     pub(crate) async fn delete_scene(&self, id: &str) -> Result<(), ServiceError> {
         let _guard = self.lock.lock().await;
         let mut conn = self.conn().await?;
-        let scene = query_sqlite::get_scene(&mut conn, id)
+        query_sqlite::get_scene(&mut conn, id)
             .await
             .map_err(not_found("scene"))?;
         query_sqlite::delete_scene(&mut conn, id).await?;
-        if scene.enabled {
-            self.director.request_stop(id);
-        }
+        // Its nodes' uploads went with them (cascade); so do unused files.
+        self.collect_garbage(&mut conn).await?;
+        // A reload of a scene that's gone stops it (if it runs) and removes
+        // its node folders and spool files, enabled or not.
+        self.director.request_reload(id);
         Ok(())
     }
 
@@ -437,6 +459,26 @@ impl Service {
                     .into_iter()
                     .map(|p| format!("{label}: {p}")),
             );
+            let rules = NodeRules::of(&plugin).map_err(ServiceError::Unknown)?;
+            if !rules.spec.code_fields().is_empty()
+                && rules.code_problems(&node.config.launch_args).is_none()
+            {
+                check.warnings.push(format!(
+                    "{label}: its code isn't checked here (this server is built without Lua); the plugin reports errors when it runs it"
+                ));
+            }
+            // Uploaded files its launch args name (a local node gets them).
+            if node.config.launch == crate::modules::node_config::LaunchMode::Local {
+                let uploads = query_sqlite::list_uploads(conn, &node.id).await?;
+                for (field, name, _) in rules.uploads_referenced(&node.config.launch_args) {
+                    if !uploads.iter().any(|u| u.name == name) {
+                        check.problems.push(format!(
+                            "{label}: launch_args/{field} names the uploaded file {name:?}, which the node doesn't have (upload it to …/nodes/by-id/{}/uploads/{name})",
+                            node.id
+                        ));
+                    }
+                }
+            }
         }
         // Mappings, against this server's plugin schemas.
         for edge in query_sqlite::list_edges(conn, scene_id).await? {
@@ -475,7 +517,8 @@ impl Service {
     }
 
     /// The source node's `out` and the target node's `in` schema, from their
-    /// plugins, where those are installed with the node's type.
+    /// plugins (or the nodes' own, when the plugin takes them from the node),
+    /// where those are installed with the node's type.
     async fn edge_schemas(
         &self,
         conn: &mut sqlx::SqliteConnection,
@@ -488,20 +531,22 @@ impl Service {
             .iter_mut()
             .zip([(source_node_id, "out"), (target_node_id, "in")])
         {
-            let Ok(node) = query_sqlite::get_node(conn, scene_id, node_id).await else {
+            let Ok(row) = query_sqlite::get_node(conn, scene_id, node_id).await else {
                 continue;
             };
+            let node = Node::try_from(row)?;
             let plugin = match self.plugins.get(&node.plugin_id).await {
                 Ok(plugin) if plugin.plugin_type == node.node_type => plugin,
                 Ok(_) | Err(PluginError::NotFound) => continue,
                 Err(e) => return Err(ServiceError::Unknown(e.to_string())),
             };
-            let json = if side == "out" {
-                plugin.out_schema
-            } else {
-                plugin.in_schema
-            };
-            *slot = json.as_deref().and_then(|j| rules::parse_json(j).ok());
+            let rules = NodeRules::of(&plugin).map_err(ServiceError::Unknown)?;
+            let side = if side == "out" { Side::Out } else { Side::In };
+            // A node's broken schema is its own problem (reported with it).
+            *slot = rules
+                .node_schema(side, &node.config.launch_args)
+                .ok()
+                .flatten();
         }
         let [source, target] = schemas;
         Ok((source, target))
@@ -564,11 +609,15 @@ impl Service {
         let scene = query_sqlite::get_scene(&mut conn, id)
             .await
             .map_err(not_found("scene"))?;
-        let nodes = query_sqlite::list_nodes(&mut conn, id)
+        let mut nodes = query_sqlite::list_nodes(&mut conn, id)
             .await?
             .into_iter()
             .map(Node::try_from)
             .collect::<Result<Vec<_>, _>>()?;
+        let mut uploads = query_sqlite::list_scene_uploads(&mut conn, id).await?;
+        for node in &mut nodes {
+            node.uploads = uploads.extract_if(.., |u| u.node_id == node.id).collect();
+        }
         let edges: Vec<Edge> = query_sqlite::list_edges(&mut conn, id)
             .await?
             .into_iter()
@@ -602,19 +651,34 @@ impl Service {
         query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        query_sqlite::list_nodes(&mut conn, scene_id)
-            .await?
-            .into_iter()
-            .map(Node::try_from)
-            .collect()
+        let mut nodes = vec![];
+        for row in query_sqlite::list_nodes(&mut conn, scene_id).await? {
+            nodes.push(self.with_secrets(row.try_into()?).await?);
+        }
+        Ok(nodes)
     }
 
     pub(crate) async fn get_node(&self, scene_id: &str, id: &str) -> Result<Node, ServiceError> {
         let mut conn = self.conn().await?;
-        query_sqlite::get_node(&mut conn, scene_id, id)
+        let node = query_sqlite::get_node(&mut conn, scene_id, id)
             .await
             .map_err(not_found("node"))?
-            .try_into()
+            .try_into()?;
+        self.with_secrets(node).await
+    }
+
+    /// Fills in which of its plugin's secrets the node has.
+    async fn with_secrets(&self, mut node: Node) -> Result<Node, ServiceError> {
+        match self.plugins.get(&node.plugin_id).await {
+            Ok(plugin) => {
+                if let Ok(rules) = NodeRules::of(&plugin) {
+                    node.secrets = rules.secrets_set(&node.config.launch_args);
+                }
+                Ok(node)
+            }
+            Err(PluginError::NotFound) => Ok(node),
+            Err(e) => Err(ServiceError::Unknown(e.to_string())),
+        }
     }
 
     pub(crate) async fn create_node(
@@ -638,7 +702,7 @@ impl Service {
         .await?;
         tx.commit().await?;
         self.changed(&scene);
-        row.try_into()
+        self.with_secrets(row.try_into()?).await
     }
 
     pub(crate) async fn update_node(
@@ -665,7 +729,7 @@ impl Service {
         check_graph(&mut tx, scene_id).await?;
         tx.commit().await?;
         self.changed(&scene);
-        row.try_into()
+        self.with_secrets(row.try_into()?).await
     }
 
     /// Deletes a node and (by cascade) its edges.
@@ -678,12 +742,30 @@ impl Service {
         if query_sqlite::delete_node(&mut conn, scene_id, id).await? == 0 {
             return Err(ServiceError::NotFound("node"));
         }
+        self.collect_garbage(&mut conn).await?;
+        if !scene.enabled {
+            // Nothing runs it: its folder goes now. (A running scene's
+            // reload removes it once the node has stopped.)
+            let dir =
+                crate::modules::supervisor::workdir::node_dir(&self.files.nodes_dir, scene_id, id);
+            let shown = dir.display().to_string();
+            match tokio::task::spawn_blocking(move || {
+                crate::modules::supervisor::workdir::remove(&dir)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!("Scene service: couldn't remove node folder {shown}: {e}"),
+                Err(e) => log::warn!("Scene service: couldn't remove node folder {shown}: {e}"),
+            }
+        }
         self.changed(&scene);
         Ok(())
     }
 
     /// Validates a node request against its plugin. `existing` is the node
-    /// being updated: a remote node's token is kept if the request omits it.
+    /// being updated: a remote node's token and its launch-args secrets are
+    /// kept if the request omits them.
     async fn prepare_node(
         &self,
         input: NodeInput,
@@ -715,6 +797,15 @@ impl Service {
             && config.launch == existing.config.launch
         {
             config.token = existing.config.token.clone();
+        }
+        // Secrets the request leaves out are kept (same plugin); `null` clears one.
+        if let (Some(plugin), Some(config)) = (&plugin, config.as_mut()) {
+            let rules = NodeRules::of(plugin).map_err(ServiceError::Unknown)?;
+            let empty = Value::Null;
+            let before = existing
+                .filter(|e| e.plugin_id == plugin.id)
+                .map_or(&empty, |e| &e.config.launch_args);
+            config.launch_args = rules.merge_secrets(&config.launch_args, before);
         }
         if let (Some(plugin), Some(t)) = (&plugin, &input.node_type)
             && *t != plugin.plugin_type
@@ -914,28 +1005,8 @@ fn validate_against_plugin(
     plugin: &Plugin,
     defaults: &SceneDefaults,
 ) -> Result<Vec<String>, ServiceError> {
-    let manifest = plugin.parsed_manifest().ok_or_else(|| {
-        ServiceError::Unknown(format!("plugin {} has an unreadable manifest", plugin.id))
-    })?;
-    let validator = match &plugin.launch_args_schema {
-        None => None,
-        Some(schema) => {
-            let value: Value = serde_json::from_str(schema).map_err(|e| {
-                ServiceError::Unknown(format!("plugin {} schema isn't JSON: {e}", plugin.id))
-            })?;
-            Some(
-                jsonschema::validator_for(&value)
-                    .map_err(|e| ServiceError::Unknown(e.to_string()))?,
-            )
-        }
-    };
-    Ok(config.validate(
-        &PluginRules {
-            launch_args_schema: validator.as_ref(),
-            launch_args_style: manifest.launch_args_style,
-        },
-        defaults,
-    ))
+    let rules = NodeRules::of(plugin).map_err(ServiceError::Unknown)?;
+    Ok(config.validate(&rules.plugin_rules(), defaults))
 }
 
 /// Whole-scene rules the DB can't express, checked before commit:
@@ -1104,10 +1175,18 @@ pub(crate) mod tests {
             .unwrap();
         install_other_types(&plugins).await;
         let (director, rx) = DirectorHandle::channel();
+        let files = NodeFiles {
+            nodes_dir: plugins.dir.path().join("nodes"),
+            files_dir: plugins.dir.path().join("files"),
+            max_upload_bytes: 64 * 1024,
+            max_import_bytes: 1024 * 1024,
+            max_import_entries: 100,
+        };
         let service: &'static Service = Box::leak(Box::new(Service::new(
             plugins.service.db(),
             plugins.service,
             director,
+            files,
         )));
         Fixture {
             plugins,
@@ -1116,11 +1195,25 @@ pub(crate) mod tests {
         }
     }
 
-    /// Registers a SOURCE (`test-source`) and a TRANSFORM (`test-transform`)
-    /// straight in the DB; their files aren't needed for config-time tests.
+    /// Registers a SOURCE (`test-source`), a TRANSFORM (`test-transform`) and
+    /// a manifest v2 TRANSFORM (`test-script`: payload schemas from its
+    /// launch args, a Lua code field, secrets) straight in the DB; their
+    /// files aren't needed for config-time tests.
     async fn install_other_types(plugins: &PluginFixture) {
         let Database::SQLite(db) = plugins.service.db();
         let mut conn = db.get_connection().await.unwrap();
+        sqlx::query("INSERT INTO plugins (id, name, version, \"type\", manifest, launch_args_schema, out_schema, install_path, archive_sha256) VALUES ('test-script', 'Script', '1.0.0', 'TRANSFORM', $1, $2, $3, '/nonexistent/test-script', 'x')")
+            .bind(r#"{"manifest_version":2,"id":"test-script","name":"Script","version":"1.0.0","type":"TRANSFORM","executable":"run","launch_args_schema":"l.json","payload_schemas":{"in":{"from_launch_args":"/schemas/in"},"out":{"from_launch_args":"/schemas/out","default":"o.json"}}}"#)
+            .bind(r#"{"type":"object","additionalProperties":false,"properties":{
+                "schemas":{"type":"object","properties":{"in":{"type":"object"},"out":{"type":"object"}}},
+                "script":{"type":"string","x-flwrs-launch":{"via":"file"},"x-flwrs-code":{"language":"lua","params":["payload","meta"]}},
+                "api_key":{"type":"string","writeOnly":true,"x-flwrs-launch":{"via":"env"}},
+                "model":{"type":"string","x-flwrs-launch":{"via":"file","source":"upload"}},
+                "key":{"type":"string","writeOnly":true,"x-flwrs-launch":{"via":"file","source":"upload"}}}}"#)
+            .bind(r#"{"fields":[{"key":"text","type":"STRING"}]}"#)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
         for (id, t, manifest) in [
             (
                 "test-source",
@@ -1556,7 +1649,12 @@ pub(crate) mod tests {
         f.service.set_enabled(&s.id, true).await.unwrap();
         f.commands().await;
         f.service.delete_scene(&s.id).await.unwrap();
-        assert_eq!(f.commands().await, [format!("stop {}", s.id)]);
+        // A reload of a deleted scene stops it and removes its files.
+        assert_eq!(f.commands().await, [format!("reload {}", s.id)]);
+        // A disabled one too: its node folders and durable spool files go.
+        let s2 = f.scene().await;
+        f.service.delete_scene(&s2.id).await.unwrap();
+        assert_eq!(f.commands().await, [format!("reload {}", s2.id)]);
     }
 
     #[tokio::test]
@@ -1671,5 +1769,336 @@ pub(crate) mod tests {
         }
         assert!(!f.service.get_scene(&s.id).await.unwrap().enabled);
         assert!(f.commands().await.is_empty());
+    }
+
+    fn script_config(extra: Value) -> Value {
+        let mut args = json!({
+            "schemas": {"in": {"fields": [{"key": "msg", "type": "STRING"}]}},
+            "script": "return { url = payload.msg }"
+        });
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"launch_args": args})
+    }
+
+    #[tokio::test]
+    async fn secrets_are_reported_kept_and_cleared() {
+        let f = fixture().await;
+        let s = f.scene().await;
+        let node = f
+            .node(
+                &s.id,
+                "test-script",
+                script_config(json!({"api_key": "k1"})),
+            )
+            .await;
+        assert_eq!(
+            node.secrets,
+            BTreeMap::from([("/api_key".into(), true), ("/key".into(), false)])
+        );
+        // left out: kept
+        let update = |config: Value| {
+            f.service
+                .update_node(&s.id, &node.id, node_input("test-script", config))
+        };
+        let kept = update(script_config(json!({}))).await.unwrap();
+        assert_eq!(kept.config.launch_args["api_key"], "k1");
+        assert!(kept.secrets["/api_key"]);
+        // null: cleared
+        let cleared = update(script_config(json!({"api_key": null})))
+            .await
+            .unwrap();
+        assert!(cleared.config.launch_args.get("api_key").is_none());
+        assert!(!cleared.secrets["/api_key"]);
+        // a value: replaced
+        let replaced = update(script_config(json!({"api_key": "k2"})))
+            .await
+            .unwrap();
+        assert_eq!(replaced.config.launch_args["api_key"], "k2");
+        assert!(f.service.get_node(&s.id, &node.id).await.unwrap().secrets["/api_key"]);
+
+        // exports leave them out (and say so), unless asked
+        let export = f.service.export_scene(&s.id, false).await.unwrap();
+        let file = crate::modules::scene::scene_file::decode(&export.bytes).unwrap();
+        let config: Value = serde_json::from_str(&file.nodes[0].config_json).unwrap();
+        assert!(config["launch_args"].get("api_key").is_none());
+        assert_eq!(file.nodes[0].omitted_secrets, ["/api_key"]);
+        let imported = f.service.import_scene(&export.bytes).await.unwrap();
+        assert!(
+            imported
+                .check
+                .warnings
+                .iter()
+                .any(|w| w.contains("left out its secrets /api_key")),
+            "{:?}",
+            imported.check
+        );
+        let with = f.service.export_scene(&s.id, true).await.unwrap();
+        let file = crate::modules::scene::scene_file::decode(&with.bytes).unwrap();
+        let config: Value = serde_json::from_str(&file.nodes[0].config_json).unwrap();
+        assert_eq!(config["launch_args"]["api_key"], "k2");
+        assert!(file.nodes[0].omitted_secrets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn node_schemas_and_code_are_checked_when_saved() {
+        let f = fixture().await;
+        let s = f.scene().await;
+        let create = |config: Value| {
+            f.service
+                .create_node(&s.id, node_input("test-script", config))
+        };
+        let errors = invalid(
+            create(json!({"launch_args": {"script": "return 1"}}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            errors.iter().any(
+                |e| e.contains("launch_args/schemas/in: the node's payload schema is required")
+            ),
+            "{errors:?}"
+        );
+        let errors = invalid(
+            create(script_config(
+                json!({"schemas": {"in": {"fields": [{"key": "a"}]}}}),
+            ))
+            .await
+            .unwrap_err(),
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("launch_args/schemas/in")),
+            "{errors:?}"
+        );
+        #[cfg(feature = "mapping-lua")]
+        {
+            let errors = invalid(
+                create(script_config(json!({"script": "local x =\nreturn ("})))
+                    .await
+                    .unwrap_err(),
+            );
+            assert!(
+                errors[0].starts_with("config.launch_args/script: launch_args/script:2:"),
+                "{errors:?}"
+            );
+        }
+        assert!(create(script_config(json!({}))).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mappings_use_the_nodes_own_schemas() {
+        let f = fixture().await;
+        let s = f.scene().await;
+        let source = f.node(&s.id, "test-source", Value::Null).await;
+        // its out schema is the package's default: {text: STRING}
+        let script = f.node(&s.id, "test-script", script_config(json!({}))).await;
+        let sink = f.node(&s.id, "test-sink", Value::Null).await;
+        // into the script: its own in schema {msg: STRING}
+        let to_script = |mapping: Value| {
+            f.service
+                .create_edge(&s.id, edge_input(&source.id, &script.id, mapping))
+        };
+        let errors = invalid(
+            to_script(json!({"rules": [{"target": "text", "value": "x"}]}))
+                .await
+                .unwrap_err(),
+        );
+        assert!(errors[0].contains("no field \"text\""), "{errors:?}");
+        to_script(json!({"rules": [{"target": "msg", "value": "x"}]}))
+            .await
+            .unwrap();
+        // out of the script: the default out schema {text: STRING}
+        f.service
+            .create_edge(
+                &s.id,
+                edge_input(
+                    &script.id,
+                    &sink.id,
+                    json!({"rules": [{"target": "url", "source": "text"}]}),
+                ),
+            )
+            .await
+            .unwrap();
+        // the node changes its in schema: the mapping into it no longer fits
+        f.service
+            .update_node(
+                &s.id,
+                &script.id,
+                node_input(
+                    "test-script",
+                    script_config(json!({"schemas": {"in": {"fields": [{"key": "other", "type": "STRING"}]}}})),
+                ),
+            )
+            .await
+            .unwrap();
+        let check = f.service.check(&s.id).await.unwrap();
+        assert!(
+            check
+                .problems
+                .iter()
+                .any(|p| p.contains("no field \"msg\"")),
+            "{check:?}"
+        );
+    }
+
+    #[cfg(feature = "remote")] // creates remote nodes
+    #[tokio::test]
+    async fn remote_nodes_may_carry_launch_args_for_their_schemas() {
+        let f = fixture().await;
+        let s = f.scene().await;
+        let mut config = script_config(json!({}));
+        config["launch"] = json!("remote");
+        config["token"] = json!("a-long-enough-shared-secret");
+        assert!(
+            f.service
+                .create_node(&s.id, node_input("test-script", config))
+                .await
+                .is_ok()
+        );
+        // a plugin without per-node schemas: still refused
+        let errors = invalid(
+            f.service
+                .create_node(
+                    &s.id,
+                    node_input(
+                        "test-sink",
+                        json!({"launch": "remote", "token": "a-long-enough-shared-secret", "launch_args": {"timeout": 1}}),
+                    ),
+                )
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            errors[0].contains("only used for local nodes"),
+            "{errors:?}"
+        );
+    }
+
+    async fn upload(f: &Fixture, scene: &str, node: &str, name: &str, content: &[u8]) {
+        let path = f.service.incoming_path().await.unwrap();
+        std::fs::write(&path, content).unwrap();
+        f.service
+            .put_upload(scene, node, name, &path)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn archives_carry_uploads_and_leave_secret_ones_out() {
+        let f = fixture().await;
+        let s = f.scene().await;
+        let node = f
+            .node(
+                &s.id,
+                "test-script",
+                script_config(json!({"model": "model.onnx", "key": "k.pem"})),
+            )
+            .await;
+        upload(&f, &s.id, &node.id, "model.onnx", b"weights").await;
+        upload(&f, &s.id, &node.id, "k.pem", b"PRIVATE").await;
+
+        // the scene file lists every upload
+        let plain = f.service.export_scene(&s.id, false).await.unwrap();
+        let file = crate::modules::scene::scene_file::decode(&plain.bytes).unwrap();
+        let names: Vec<_> = file.nodes[0]
+            .files
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, ["k.pem", "model.onnx"]);
+
+        // .far without secrets: the secret field's file stays behind
+        let far = f.service.export_archive(&s.id, false).await.unwrap();
+        assert!(far.file_name.ends_with(".far"));
+        let imported = f.service.import_file(&far.path).await.unwrap();
+        assert!(!far.path.exists(), "the import removes its input");
+        let snapshot = f.service.snapshot(&imported.scene.id).await.unwrap();
+        let uploads: Vec<_> = snapshot.nodes[0]
+            .uploads
+            .iter()
+            .map(|u| u.name.as_str())
+            .collect();
+        assert_eq!(uploads, ["model.onnx"]);
+        assert!(
+            imported
+                .check
+                .warnings
+                .iter()
+                .any(|w| w.contains("\"k.pem\" isn't in the import")),
+            "{:?}",
+            imported.check
+        );
+        let content = f
+            .service
+            .upload_content(&imported.scene.id, &snapshot.nodes[0].id, "model.onnx")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(content.1).unwrap(), b"weights");
+
+        // with secrets: both
+        let far = f.service.export_archive(&s.id, true).await.unwrap();
+        let imported = f.service.import_file(&far.path).await.unwrap();
+        let snapshot = f.service.snapshot(&imported.scene.id).await.unwrap();
+        assert_eq!(snapshot.nodes[0].uploads.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn hand_made_tar_gz_imports_find_files_by_content() {
+        use std::io::Write;
+        let f = fixture().await;
+        let s = f.scene().await;
+        let node = f
+            .node(
+                &s.id,
+                "test-script",
+                script_config(json!({"model": "model.onnx"})),
+            )
+            .await;
+        upload(&f, &s.id, &node.id, "model.onnx", b"weights").await;
+        let plain = f.service.export_scene(&s.id, false).await.unwrap();
+
+        let mut builder = tar::Builder::new(vec![]);
+        for (name, data) in [
+            ("exported.flwr", &plain.bytes[..]),
+            ("models/whatever.bin", b"weights"),
+            ("notes.txt", b"unreferenced"),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, data).unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
+        gz.write_all(&builder.into_inner().unwrap()).unwrap();
+        let path = f.service.incoming_path().await.unwrap();
+        std::fs::write(&path, gz.finish().unwrap()).unwrap();
+
+        let imported = f.service.import_file(&path).await.unwrap();
+        let snapshot = f.service.snapshot(&imported.scene.id).await.unwrap();
+        assert_eq!(snapshot.nodes[0].uploads[0].name, "model.onnx");
+        // nothing left in the work area; one stored file serves both nodes
+        let incoming = f.service.files().files_dir.join(".incoming");
+        assert_eq!(std::fs::read_dir(&incoming).unwrap().count(), 0);
+        let stored = std::fs::read_dir(&f.service.files().files_dir)
+            .unwrap()
+            .filter(|e| {
+                !e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')
+            })
+            .count();
+        assert_eq!(stored, 1);
+
+        // not a scene or an archive
+        let path = f.service.incoming_path().await.unwrap();
+        std::fs::write(&path, b"hello").unwrap();
+        assert!(matches!(
+            f.service.import_file(&path).await,
+            Err(ServiceError::Invalid(_))
+        ));
     }
 }

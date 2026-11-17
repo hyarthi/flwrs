@@ -1,5 +1,5 @@
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "id": "ticker",
   "name": "Ticker",
   "version": "0.0.1",
@@ -8,5 +8,15 @@
   "executable": "bin/flwrs-ticker",
   "launch_args_schema": "schema/launch_args.json",
   "launch_args_style": "flags",
-  "payload_schemas": { "out": "schema/out.json" }
+  "payload_schemas": {
+    "out": "schema/out.json"
+  },
+  "ui": {
+    "icon": "ui/ticker.svg",
+    "categories": [
+      "Triggers",
+      "Time"
+    ],
+    "docs": "README.md"
+  }
 }

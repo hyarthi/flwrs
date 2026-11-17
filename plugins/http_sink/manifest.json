@@ -1,5 +1,5 @@
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "id": "http-sink",
   "name": "HTTP sink",
   "version": "0.0.1",
@@ -8,5 +8,15 @@
   "executable": "bin/flwrs-http-sink",
   "launch_args_schema": "schema/launch_args.json",
   "launch_args_style": "flags",
-  "payload_schemas": { "in": "schema/in.json" }
+  "payload_schemas": {
+    "in": "schema/in.json"
+  },
+  "ui": {
+    "icon": "ui/http-sink.svg",
+    "categories": [
+      "Outputs",
+      "HTTP"
+    ],
+    "docs": "README.md"
+  }
 }

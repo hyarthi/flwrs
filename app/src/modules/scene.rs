@@ -5,12 +5,16 @@ pub(crate) mod api;
 pub(crate) mod api_graph;
 pub(crate) mod api_status;
 pub(crate) mod api_transfer;
+pub(crate) mod api_uploads;
+pub(crate) mod archive;
+pub(crate) mod config;
 pub(crate) mod graph;
 pub(crate) mod scene_file;
 pub(crate) mod service;
 
 use crate::db::main_db;
 use crate::modules::director::DirectorHandle;
+use crate::modules::director::config::DirectorConfig;
 use crate::modules::plugin;
 use service::Service;
 use tokio::sync::OnceCell;
@@ -21,7 +25,22 @@ static SERVICE: OnceCell<Service> = OnceCell::const_new();
 /// registry and the director handle exist.
 pub(crate) async fn init(director: DirectorHandle) -> &'static Service {
     SERVICE
-        .get_or_init(|| async { Service::new(main_db().await, plugin::service(), director) })
+        .get_or_init(|| async {
+            let paths = DirectorConfig::read();
+            let limits = config::ScenesConfig::read();
+            let files = service::NodeFiles {
+                nodes_dir: paths.nodes_dir,
+                files_dir: paths.files_dir,
+                max_upload_bytes: limits.max_upload_bytes,
+                max_import_bytes: limits.max_import_bytes,
+                max_import_entries: limits.max_import_entries,
+            };
+            let service = Service::new(main_db().await, plugin::service(), director, files);
+            if let Err(e) = service.clean_files().await {
+                log::warn!("Scene service: couldn't clean up uploaded files: {e}");
+            }
+            service
+        })
         .await
 }
 

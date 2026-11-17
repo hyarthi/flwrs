@@ -13,76 +13,142 @@
     "interval": {
       "description": "Tick every this long, e.g. 500ms, 10s, 5m, 1h30m, 1d (at least 10ms). The default schedule when there's no cron.",
       "$ref": "#/$defs/duration",
-      "default": "1s"
+      "default": "1s",
+      "x-flwrs-group": "Schedule",
+      "x-flwrs-order": 1,
+      "x-flwrs-widget": "duration"
     },
     "cron": {
       "description": "Tick on a cron pattern: 5 fields (minute hour day-of-month month day-of-week), or 6 with seconds first; nicknames like @hourly too.",
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "x-flwrs-group": "Schedule",
+      "x-flwrs-order": 2,
+      "x-flwrs-widget": "cron"
     },
     "timezone": {
       "description": "Time zone for cron, e.g. Europe/Berlin (IANA name).",
       "type": "string",
-      "default": "UTC"
+      "default": "UTC",
+      "x-flwrs-group": "Schedule",
+      "x-flwrs-order": 3
     },
     "align": {
       "description": "Put interval ticks on wall-clock multiples of the interval since 1970-01-01 UTC (every 1m at :00), instead of counting from the start.",
       "type": "boolean",
-      "default": false
+      "default": false,
+      "x-flwrs-group": "Schedule",
+      "x-flwrs-order": 4
     },
     "fire_on_start": {
       "description": "Also tick at the start (when the plugin starts, or at start_time).",
       "type": "boolean",
-      "default": false
+      "default": false,
+      "x-flwrs-group": "Schedule",
+      "x-flwrs-order": 5
     },
     "jitter": {
       "description": "Delay each tick by a random amount below this; tick_time stays the scheduled time.",
-      "$ref": "#/$defs/duration"
+      "$ref": "#/$defs/duration",
+      "x-flwrs-group": "Schedule",
+      "x-flwrs-order": 6,
+      "x-flwrs-widget": "duration",
+      "x-flwrs-advanced": true
     },
     "start_time": {
       "description": "No ticks before this time (RFC 3339). An interval without align counts from it.",
       "type": "string",
-      "format": "date-time"
+      "format": "date-time",
+      "x-flwrs-group": "Schedule",
+      "x-flwrs-order": 7,
+      "x-flwrs-advanced": true
     },
     "end_time": {
       "description": "No ticks after this time (RFC 3339); then the source stops emitting.",
       "type": "string",
-      "format": "date-time"
+      "format": "date-time",
+      "x-flwrs-group": "Schedule",
+      "x-flwrs-order": 8,
+      "x-flwrs-advanced": true
     },
     "missed": {
       "description": "What happens to ticks that couldn't go out on time: skip (drop them; the next tick counts them), fire_once (one catch-up tick) or catch_up (each, up to max_catch_up).",
-      "enum": ["skip", "fire_once", "catch_up"],
-      "default": "skip"
+      "enum": [
+        "skip",
+        "fire_once",
+        "catch_up"
+      ],
+      "default": "skip",
+      "x-flwrs-group": "Missed ticks",
+      "x-flwrs-order": 9
     },
     "max_catch_up": {
       "description": "With missed = catch_up: at most this many missed ticks are sent.",
       "type": "integer",
       "minimum": 1,
       "maximum": 10000,
-      "default": 100
+      "default": 100,
+      "x-flwrs-group": "Missed ticks",
+      "x-flwrs-order": 10,
+      "x-flwrs-advanced": true
     },
     "max_late": {
       "description": "With missed = skip: a tick that would go out later than this after its time is dropped.",
       "$ref": "#/$defs/duration",
-      "default": "1s"
+      "default": "1s",
+      "x-flwrs-group": "Missed ticks",
+      "x-flwrs-order": 11,
+      "x-flwrs-widget": "duration",
+      "x-flwrs-advanced": true
     },
     "label": {
       "description": "Copied into every tick, to tell several tickers apart downstream.",
       "type": "string",
-      "default": ""
+      "default": "",
+      "x-flwrs-group": "Output",
+      "x-flwrs-order": 12
     },
     "confirmed": {
       "description": "Wait for the hub to take each tick before the next.",
       "type": "boolean",
-      "default": false
+      "default": false,
+      "x-flwrs-group": "Output",
+      "x-flwrs-order": 13,
+      "x-flwrs-advanced": true
     }
   },
-  "dependentRequired": { "timezone": ["cron"] },
+  "dependentRequired": {
+    "timezone": [
+      "cron"
+    ]
+  },
   "allOf": [
-    { "not": { "required": ["interval", "cron"] } },
     {
-      "if": { "properties": { "align": { "const": true } }, "required": ["align"] },
-      "then": { "not": { "required": ["cron"] } }
+      "not": {
+        "required": [
+          "interval",
+          "cron"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "align": {
+            "const": true
+          }
+        },
+        "required": [
+          "align"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "cron"
+          ]
+        }
+      }
     }
   ]
 }

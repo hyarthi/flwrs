@@ -1,0 +1,189 @@
+# flwrs plugin specification
+
+How a flwrs plugin is packaged, described and started: the **package** (a ZIP), its **manifest**, the **node settings** a plugin takes (its launch-args schema), and the **launch contract** (what a local plugin gets when the server starts it). It applies to plugins in any language.
+
+What a plugin says to the hub once it runs (framing, messages, lifecycle, delivery) is the [plugin protocol](protocol.md). The two documents together are the whole contract; the Rust SDK ([`flwrs-plugin`](https://crates.io/crates/flwrs-plugin)) is one implementation of it.
+
+The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
+
+## 1. Packages
+
+A plugin is installed as a ZIP with `manifest.json` at its root, the executable it names, and the files the manifest and the launch-args schema reference. Anything else (libraries, models, assets) is optional.
+
+```
+script-transform-0.1.0-linux-x86_64.zip
+├── manifest.json
+├── bin/flwrs-script-transform
+├── schema/launch_args.json     JSON Schema of a node's settings
+├── schema/out.json             payload schema(s), by plugin type
+├── types/script.d.lua          definitions for a code field's editor (optional)
+├── ui/script.svg               icon (optional)
+└── README.md                   help text (optional)
+```
+
+The server refuses a package that has:
+
+- an absolute path, a `..` component, a Windows drive letter or a backslash in an entry name;
+- a symbolic link, or anything but regular files and folders;
+- two entries with the same path;
+- a top-level entry named **`config`** (the name of a node's folder for the files the server provides, [section 5.3](#53-the-node-folder));
+- more entries, more unpacked bytes or a higher compression ratio than the server allows (by default 10 000 entries, 1 GiB, 200:1 for entries over 1 MiB);
+- a manifest that fails the rules below, or a referenced file that's missing.
+
+The executable is made executable when the package is unpacked; other permissions aren't kept. `flwrs-trellis package` builds a package and runs these checks.
+
+## 2. The manifest
+
+`manifest.json`, version 2:
+
+```json
+{
+  "manifest_version": 2,
+  "id": "script-transform",
+  "name": "Script",
+  "version": "0.1.0",
+  "type": "TRANSFORM",
+  "description": "Runs a Lua function on each event.",
+  "executable": "bin/flwrs-script-transform",
+  "platforms": ["linux-x86_64"],
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": {
+    "in":  { "from_launch_args": "/schemas/in" },
+    "out": { "from_launch_args": "/schemas/out", "default": "schema/out.json" }
+  },
+  "runtime_defaults": { "init_timeout_ms": 20000 },
+  "ui": { "icon": "ui/script.svg", "categories": ["Transform", "Scripting"], "color": "#4f7cff", "docs": "README.md" }
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `manifest_version` | yes | `2` (this document). Version 1 manifests are still read: they have no `ui`, no per-node payload schemas, and their launch-args schema's annotations ([section 3](#3-node-settings-the-launch-args-schema)) are ignored. |
+| `id` | yes | `^[a-z0-9][a-z0-9_-]{0,63}$`. Unique on a server. |
+| `name`, `version` | yes | A display name, and a semantic version (`1.2.3`, optionally `-pre` / `+build`). The plugin MUST report this version in `Initialize`. |
+| `type` | yes | `SOURCE`, `SINK` or `TRANSFORM`. |
+| `description` | no | Free text. |
+| `executable` | yes | A path in the package: a native binary, or a script with a shebang. |
+| `platforms` | no | `<os>-<arch>` targets (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `windows-x86_64`, …). The upload fails on another platform. Omit it for packages that run anywhere. |
+| `launch_args_schema` | no | A JSON Schema (draft 2020-12) of a node's settings. External `$ref`s aren't resolved. |
+| `launch_args_style` | no | `flags` (default; a node's settings are a JSON object) or `positional` (a list of strings, passed as they are; no annotations). |
+| `payload_schemas` | by type | `in` for a SINK, `out` for a SOURCE, both for a TRANSFORM. Each is either a path to a `SchemaDefinition` in proto3 JSON (`{"fields": [{"key": "url", "type": "STRING"}]}`), or `{"from_launch_args": "<JSON pointer>", "default": "<path>"?}`: the node's own schema, from its settings ([section 3.5](#35-per-node-payload-schemas)). The plugin MUST declare exactly the schemas in effect in `Initialize`. |
+| `runtime_defaults` | no | Defaults for the node's runtime settings (timeouts, restarts, queue, delivery); same keys as a node's `config.runtime`. |
+| `ui` | no | How a UI presents the plugin: `icon` (an `.svg` or `.png` in the package), `categories` (free tags, 1 to 64 characters, no duplicates), `color` (`#RRGGBB`), `docs` (a Markdown file in the package). |
+| `x-…` | no | Top-level fields starting with `x-` are ignored, with a warning at upload. Any other unknown field is an error. |
+
+## 3. Node settings: the launch-args schema
+
+A node's settings (`config.launch_args` in the scene API) are a JSON object checked against `launch_args_schema`. In manifest version 2 the schema's **top-level properties** also say how each setting reaches the plugin, and a few keywords mark secrets, code and presentation.
+
+```json
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemas", "script"],
+  "properties": {
+    "schemas": { "type": "object", "properties": { "in": { "type": "object" }, "out": { "type": "object" } } },
+    "script": {
+      "type": "string", "contentMediaType": "text/x-lua",
+      "x-flwrs-launch": { "via": "file" },
+      "x-flwrs-code": { "language": "lua", "params": ["payload", "meta"], "definitions": "types/script.d.lua",
+                        "signature": "fun(payload: In, meta: Meta): Out|nil" }
+    },
+    "model": { "type": "string", "x-flwrs-launch": { "via": "file", "source": "upload" } },
+    "api_key": { "type": "string", "writeOnly": true, "x-flwrs-launch": { "via": "env", "alias": "SCRIPT_API_KEY" } },
+    "timeout_ms": { "type": "integer", "minimum": 1, "default": 100, "x-flwrs-group": "Limits", "x-flwrs-advanced": true }
+  }
+}
+```
+
+### 3.1 Delivery: `x-flwrs-launch`
+
+On a top-level property only: `{"via": "arg" | "env" | "file", "alias"?, "file_name"?, "source"?: "upload"}`.
+
+| `via` | The plugin gets | Default for |
+|---|---|---|
+| `arg` | `--<name> <value>`; `true` → `--<name>`; `false` and `null` → nothing. | strings, numbers, booleans |
+| `env` | An environment variable. | (never a default) |
+| `file` | `--<name> <absolute path>` of a file in the node's `config/` folder ([section 5.3](#53-the-node-folder)). | objects and arrays |
+
+- **Names.** `alias` replaces the default name: `--<property with _ as ->` for arguments and files, `<PROPERTY_IN_UPPER_SNAKE>` for environment variables. Flags may use letters, digits and `-`, and can't be a bootstrap argument (`id`, `host`, `port`, `log-level`, `token`). Environment variable names must match `^[A-Z_][A-Z0-9_]*$` and can't start with `FLWRS_`, `LD_` or `DYLD_` or be one that changes how programs run (`PATH`, `HOME`, `PYTHONPATH`, `NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, …). No two settings may use the same flag, variable or file name.
+- **Values.** Strings are passed as they are, numbers and booleans as their JSON text. Objects and arrays MUST be delivered as files (`"via": "file"`), as JSON.
+- **Files.** A string is written as its UTF-8 bytes, anything else as JSON. The file is named `file_name`, else the property name plus an extension from `contentMediaType` (`text/x-lua` → `.lua`, `application/json` → `.json`, `application/yaml` → `.yaml`, `application/x-pem-file` → `.pem`, `text/plain` → `.txt`, …), else `.json` for objects and arrays, else no extension. File names: letters, digits, `.`, `_` and `-`, 1 to 100 characters, not starting with `.`.
+- **Uploads.** With `"source": "upload"` (a string property, `"via": "file"`), the value is the name of a file uploaded to the node through the scene API; the plugin gets the path of that file in `config/`.
+- Properties the schema doesn't declare (if it allows them) are delivered by the defaults.
+
+**Limits**, checked when a node is saved and the same on every platform, so a scene runs anywhere: the whole command line (as Windows quotes it) under 30 000 characters, and each environment variable's value under 30 000. Long values belong in files.
+
+### 3.2 Secrets: `writeOnly`
+
+`"writeOnly": true` on a top-level property marks a secret. It MUST be delivered by `env` or `file` (command lines are visible to other users of the machine). The server never returns a secret's value: the API lists which secrets a node has set, an update that leaves one out keeps it, and `null` clears it. Scene exports leave secrets out unless asked for them.
+
+### 3.3 Code: `x-flwrs-code`
+
+On a string property: `{"language": "lua", "params": [names], "definitions"?: "<file in the package>", "signature"?: "<text>"}`. The value is code the plugin runs, as the body of a function with `params`. The server checks its syntax when the node is saved (a server built without Lua accepts it with a warning). `definitions` is a LuaCATS `---@meta` file for an editor (completion, signature help), and `signature` the function's type in the same notation; `In` and `Out` there stand for the node's payload schemas.
+
+### 3.4 Presentation hints
+
+On any property, all optional: `x-flwrs-group` (a section name), `x-flwrs-order` (an integer), `x-flwrs-advanced` (collapsed by default), `x-flwrs-widget` (`duration`, `cron`, `file-path` or `code`). Standard keywords (`title`, `description`, `default`, `enum`, `minimum`, `format`, …) are used as they are. An unknown `x-flwrs-*` keyword is a warning at upload, and ignored.
+
+### 3.5 Per-node payload schemas
+
+`payload_schemas.in` / `out` may be `{"from_launch_args": "/schemas/in", "default": "schema/in.json"?}`: the JSON pointer leads (through `properties`) to an `object` property of the launch-args schema, and a node's value there is its `SchemaDefinition`. The server checks it, compiles edge mappings against it, and expects it in `Initialize`; without one, `default` applies, and without a default the node is invalid. The plugin MUST read the schema from its settings and declare it.
+
+## 4. Remote plugins
+
+A node with `launch = "remote"` runs a plugin someone else starts, possibly on another machine. It gets no node folder, and its launch args are never delivered; a remote node MAY carry launch args only for its per-node payload schemas, which the hub then expects. The plugin is started with the bootstrap arguments of [section 5.1](#51-the-command-line) pointing at the hub's reachable address, and authenticates with the node's pre-shared token or a client certificate ([protocol section 14](protocol.md#14-security)).
+
+## 5. Launching a local plugin
+
+### 5.1 The command line
+
+```
+<install folder>/<executable> --id <instance id> --host <hub host> --port <hub port> --log-level <trace|debug|info|warn|error> [the node's arg and file settings, by name]
+```
+
+- The executable is started directly (no shell), by its absolute path.
+- The bootstrap arguments come first, then the node's settings delivered as arguments, ordered by name.
+- A plugin MUST accept the bootstrap arguments in this long form and SHOULD ignore their order. It MUST NOT expect other arguments from the server than these and its own settings.
+
+### 5.2 The environment
+
+- `FLWRS_TOKEN`: a fresh random token for this launch, which the plugin sends in `Initialize`.
+- The node's settings delivered by `env`.
+- Otherwise the server's own environment. Child processes a plugin starts inherit all of it, secrets included: a plugin that starts other programs SHOULD give them only what they need.
+- Standard input is closed. Standard output and standard error go to the server log (one entry per line, cut at 8 KiB).
+
+### 5.3 The node folder
+
+The working directory is the node's own folder, `<nodes dir>/<scene id>/<node id>/` on the server:
+
+```
+<node folder>/
+├── bin/, schema/, …      a link to each top-level entry of the package
+├── config/               the server's: the node's file settings and uploads (read-only)
+└── …                     the plugin's own files
+```
+
+- **Package files** are reachable by relative path through the links (symbolic links on Unix; on Windows, junctions for folders and hard links or copies for files). Links to a newer version replace them when the plugin is upgraded.
+- **`config/`** holds exactly the node's `file` settings and links to its uploads, brought up to date before each launch and never changed while the plugin runs. It's read-only by permission; a plugin MUST NOT change it.
+- **Everything else is the plugin's**: state, caches, downloads. It's kept across restarts, reloads, disabling and enabling the scene, and plugin upgrades, and deleted with the node or its scene (or on request, while the scene is disabled). A plugin SHOULD keep its state here rather than in its install folder, which is shared by every node and replaced on upgrade.
+- The folder can hold secrets (`config/`), so only the server's user can enter it on Unix.
+
+### 5.4 Stopping
+
+To stop a local plugin the hub sends `Shutdown` and waits for the process to exit (10 s by default). Then it asks the OS to stop the process and everything it started (SIGTERM to its process group on Unix, Ctrl-Break to its console group on Windows), waits again (2 s by default), and kills it. A plugin SHOULD exit on `Shutdown`, and SHOULD treat SIGTERM or Ctrl-Break as a last request to stop. An exit the hub didn't ask for makes it relaunch the plugin after a delay.
+
+## 6. Guidance
+
+These aren't requirements, but plugins that follow them are easier to run.
+
+- **Read settings at start.** Read `file` settings and uploads when the plugin starts; they don't change while it runs (a change restarts the plugin).
+- **Report bad settings early.** Settings the schema can't express (a regex that doesn't compile, a URL that doesn't resolve) are best checked at start: log the problem and exit with a non-zero status, which the server shows as a failed launch.
+- **Describe the settings well.** The launch-args schema is all a UI has to build a form: give properties a `title` and `description`, `default`s, `enum`s and ranges, and group them with `x-flwrs-group`.
+- **Keep secrets out of logs** and out of child processes' environments.
+- **Test with trellis.** `flwrs-trellis audit` checks the protocol, `test` the plugin's behaviour, and `bench` its performance. They run the plugin the way the server does: in a node folder, with the settings delivered as described here (`[uploads]` in `trellis.toml` for uploaded files).
+
+## 7. Versions
+
+This document describes manifest version 2. A server reads every manifest version up to the newest it knows, and refuses newer ones outright rather than half-understanding them. Additions that older servers can safely ignore (presentation hints, `x-` fields) don't need a new manifest version.

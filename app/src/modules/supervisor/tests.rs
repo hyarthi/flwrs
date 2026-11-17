@@ -129,11 +129,21 @@ impl Env {
             in_schema,
             out_schema,
             launch: Launch::Local(LocalLaunch {
+                workdir: super::workdir::Workdir {
+                    dir: self.dir.path().join("nodes/scene/node"),
+                    install_dir: {
+                        let install = self.dir.path().join("install");
+                        std::fs::create_dir_all(&install).unwrap();
+                        install
+                    },
+                    files: vec![],
+                    uploads: vec![],
+                },
                 program,
-                cwd: self.dir.path().to_path_buf(),
                 hub_addr: self.hub.local_addr(),
                 log_level: "info".into(),
                 args: vec![],
+                env: vec![],
             }),
             timings,
             queue: super::spec::QueueSpec::resolve(
@@ -542,7 +552,8 @@ async fn stopping_a_plugin_stops_its_child_processes_too() {
         },
     ));
     wait_state(&handle, NodeState::Running).await;
-    let pid_file = env.dir.path().join("grandchild.pid");
+    // The plugin writes it in its working directory: the node's folder.
+    let pid_file = env.dir.path().join("nodes/scene/node/grandchild.pid");
     let deadline = Instant::now() + WAIT;
     let grandchild = loop {
         if let Ok(pid) = std::fs::read_to_string(&pid_file) {
@@ -682,6 +693,9 @@ async fn spec_from_an_installed_plugin() {
             tls_available: false,
             log_level: "debug",
             scene_defaults: &defaults,
+            nodes_dir: Path::new("nodes"),
+            files_dir: Path::new("files"),
+            uploads: &[],
         },
     )
     .unwrap();
@@ -689,7 +703,8 @@ async fn spec_from_an_installed_plugin() {
         panic!("expected a local launch");
     };
     assert!(local.program.is_absolute() && local.program.ends_with("bin/run"));
-    assert!(Path::new(&local.cwd).is_dir());
+    assert!(local.workdir.install_dir.is_dir());
+    assert!(local.workdir.dir.is_absolute() && local.workdir.dir.ends_with("nodes/s/n"));
     assert_eq!(
         local.argv("n"),
         [
@@ -719,6 +734,9 @@ async fn spec_from_an_installed_plugin() {
             tls_available: false,
             log_level: "debug",
             scene_defaults: &defaults,
+            nodes_dir: Path::new("nodes"),
+            files_dir: Path::new("files"),
+            uploads: &[],
         },
     )
     .unwrap();
@@ -740,8 +758,106 @@ async fn spec_from_an_installed_plugin() {
             tls_available: false,
             log_level: "debug",
             scene_defaults: &defaults,
+            nodes_dir: Path::new("nodes"),
+            files_dir: Path::new("files"),
+            uploads: &[],
         },
     )
     .unwrap_err();
     assert_eq!(errors.len(), 2, "{errors:?}");
+}
+
+#[cfg(unix)] // Unix-style absolute paths
+#[test]
+fn local_nodes_get_their_uploads_and_files() {
+    use crate::modules::scene::service::NodeUpload;
+    use flwrs_plugin::package::ConfigContent;
+    let plugin = crate::modules::plugin::service::Plugin {
+        id: "model".into(),
+        name: "Model".into(),
+        version: "1.0.0".into(),
+        plugin_type: "SINK".into(),
+        description: None,
+        manifest: r#"{"manifest_version":2,"id":"model","name":"Model","version":"1.0.0","type":"SINK","executable":"bin/run","launch_args_schema":"l.json","payload_schemas":{"in":"i.json"}}"#.into(),
+        launch_args_schema: Some(
+            r#"{"type":"object","properties":{
+                "model":{"type":"string","x-flwrs-launch":{"via":"file","source":"upload"}},
+                "settings":{"type":"object"},
+                "password":{"type":"string","writeOnly":true,"x-flwrs-launch":{"via":"env","alias":"MODEL_PASSWORD"}}}}"#
+                .into(),
+        ),
+        in_schema: Some(r#"{"fields":[{"key":"x","type":"STRING"}]}"#.into()),
+        out_schema: None,
+        install_path: "/opt/plugins/model/1.0.0".into(),
+        archive_sha256: "x".into(),
+        create_time: Default::default(),
+        update_time: Default::default(),
+    };
+    let config = NodeConfig::parse(&serde_json::json!({"launch_args": {
+        "model": "resnet.onnx", "settings": {"a": 1}, "password": "pw"
+    }}))
+    .unwrap();
+    let upload = NodeUpload {
+        node_id: "n".into(),
+        name: "resnet.onnx".into(),
+        sha256: "ab".repeat(32),
+        size: 3,
+        create_time: Default::default(),
+    };
+    let defaults = crate::modules::node_config::SceneDefaults::default();
+    let resolve = |uploads: &[NodeUpload]| {
+        NodeSpec::resolve(
+            "s",
+            "n",
+            &config,
+            &plugin,
+            &super::spec::Surroundings {
+                hub_addr: "127.0.0.1:7400".parse().unwrap(),
+                tls_available: false,
+                log_level: "info",
+                scene_defaults: &defaults,
+                nodes_dir: Path::new("/data/nodes"),
+                files_dir: Path::new("/data/files"),
+                uploads,
+            },
+        )
+    };
+    let spec = resolve(std::slice::from_ref(&upload)).unwrap();
+    let Launch::Local(local) = &spec.launch else {
+        panic!("expected a local launch");
+    };
+    let config_dir = Path::new("/data/nodes/s/n/config");
+    assert_eq!(local.workdir.dir, Path::new("/data/nodes/s/n"));
+    assert_eq!(
+        local.args,
+        [
+            "--model".to_string(),
+            config_dir
+                .join("resnet.onnx")
+                .to_string_lossy()
+                .into_owned(),
+            "--settings".into(),
+            config_dir
+                .join("settings.json")
+                .to_string_lossy()
+                .into_owned(),
+        ]
+    );
+    assert_eq!(
+        local.env,
+        [("MODEL_PASSWORD".to_string(), "pw".to_string())]
+    );
+    assert_eq!(
+        local.workdir.upload("resnet.onnx").unwrap(),
+        Path::new("/data/files").join(format!("resnet_{}.onnx", "ab".repeat(32)))
+    );
+    assert!(local.workdir.files.iter().any(
+        |f| f.name == "resnet.onnx" && f.content == ConfigContent::Upload("resnet.onnx".into())
+    ));
+    // not uploaded: the node can't start
+    let errors = resolve(&[]).unwrap_err();
+    assert!(
+        errors[0].contains("no uploaded file named \"resnet.onnx\""),
+        "{errors:?}"
+    );
 }

@@ -64,8 +64,8 @@ pub(super) async fn insert(
     Plugin::from_row(&row)
 }
 
-/// Replaces the package-derived columns of an existing plugin. `type` and
-/// `install_path` never change on upgrade.
+/// Replaces the package-derived columns of an existing plugin. `type` never
+/// changes on upgrade; `install_path` follows the version (`<dir>/<id>/<version>`).
 pub(super) async fn update_package(
     conn: &mut PoolConnection<Sqlite>,
     p: &NewPlugin,
@@ -75,7 +75,7 @@ pub(super) async fn update_package(
             sqlx::query_as::<Sqlite, Plugin>(
                 "UPDATE plugins SET name = $1, version = $2, description = $3, manifest = $4, \
                      launch_args_schema = $5, in_schema = $6, out_schema = $7, archive_sha256 = $8, \
-                     update_time = $9 \
+                     update_time = $9, install_path = $11 \
                  WHERE id = $10 RETURNING *",
             )
             .bind(&p.name)
@@ -87,7 +87,8 @@ pub(super) async fn update_package(
             .bind(&p.out_schema)
             .bind(&p.archive_sha256)
             .bind(Local::now())
-            .bind(&p.id),
+            .bind(&p.id)
+            .bind(&p.install_path),
         )
         .await?;
     Plugin::from_row(&row)

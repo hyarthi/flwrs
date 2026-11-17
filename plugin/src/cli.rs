@@ -19,11 +19,40 @@
 //! };
 //! ```
 //!
-//! The arguments are specified in `docs/protocol.md` (*Launching*); they have
-//! no short forms, so they don't take letters a plugin may want for its own flags.
+//! The arguments are specified in `docs/plugin-spec.md` (*Launching*); they
+//! have no short forms, so they don't take letters a plugin may want for its
+//! own flags.
+//!
+//! A node's own settings arrive as the plugin's flags, environment variables
+//! or files in the node's `config/` folder, as its manifest declares. A
+//! structured (`"via": "file"`) setting is a path flag; [`read_json`] and
+//! [`read_text`] read it:
+//!
+//! ```rust,ignore
+//! #[arg(long)]
+//! schemas: Option<std::path::PathBuf>,
+//! // …
+//! let schemas: Schemas = flwrs_plugin::cli::read_json(&path)?;
+//! ```
 
 use crate::plugin::core::{BOOTSTRAP_ARGS, ConnectionConfig};
 use crate::schema::protocol::log_level::Enum as LogLevel;
+use serde::de::DeserializeOwned;
+use std::path::Path;
+
+/// Reads a JSON file the server delivered (a `"via": "file"` setting), with
+/// the path in the error.
+pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let text = read_text(path)?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("{}: not the expected JSON: {e}", path.display()))
+}
+
+/// Reads a text file the server delivered (code, a spec, a PEM file), with
+/// the path in the error.
+pub fn read_text(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+}
 
 /// `--id --host --port --log-level --token`.
 #[derive(clap::Args, Debug, Clone, PartialEq, Eq)]
@@ -120,6 +149,19 @@ mod tests {
         assert_eq!(args.bootstrap.log_level(), LogLevel::Info);
         assert!(Args::try_parse_from(["plugin", "--port", "1"]).is_err());
         assert!(Args::try_parse_from(["plugin", "--id", "n"]).is_err());
+    }
+
+    #[test]
+    fn reads_delivered_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+        std::fs::write(&path, r#"{"in": {"fields": []}}"#).unwrap();
+        let v: serde_json::Value = read_json(&path).unwrap();
+        assert_eq!(v["in"]["fields"], serde_json::json!([]));
+        let e = read_json::<Vec<u8>>(&path).unwrap_err();
+        assert!(e.contains("schemas.json: not the expected JSON"), "{e}");
+        let e = read_text(&dir.path().join("missing.lua")).unwrap_err();
+        assert!(e.contains("missing.lua"), "{e}");
     }
 
     #[test]

@@ -42,7 +42,8 @@ pub(crate) struct PluginProcess {
 }
 
 impl PluginProcess {
-    /// Starts the plugin in its install folder, with the token in the
+    /// Starts the plugin in the node's folder (prepared by the caller), with
+    /// its launch-args environment variables and the token in the
     /// environment (not on the command line, where `ps` would show it), and
     /// stdout/stderr forwarded to the server log under `tag`. The plugin gets
     /// its own process group (Unix) or console process group and Job Object
@@ -57,7 +58,8 @@ impl PluginProcess {
         let mut command = Command::new(&launch.program);
         command
             .args(launch.argv(node_id))
-            .current_dir(&launch.cwd)
+            .current_dir(&launch.workdir.dir)
+            .envs(launch.env.iter().map(|(k, v)| (k, v)))
             .env(TOKEN_ENV, token)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

@@ -192,7 +192,7 @@ fn spawn(target: &Target, listener: &TcpListener, token: &str) -> Result<Child, 
             "debug",
         ])
         .args(target.argv())
-        .current_dir(&target.cwd)
+        .current_dir(target.workdir())
         .env("FLWRS_TOKEN", token)
         .envs(target.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())

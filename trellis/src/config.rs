@@ -16,6 +16,9 @@
 //! no_default_features = true
 //! manifest = "manifest.edge.json"
 //!
+//! [uploads]                       # files uploaded to the node (manifest v2)
+//! "model.onnx" = "tests/model.onnx"
+//!
 //! [audit]
 //! launch_args = "tests/node.json"
 //! args = ["--verbose"]
@@ -40,6 +43,9 @@ pub struct Config {
     pub build: Option<Build>,
     pub package: PackageSection,
     pub flavors: BTreeMap<String, Flavor>,
+    /// Files uploaded to the node, by name (paths relative to this file), for
+    /// `"source": "upload"` launch args. Used by audit, test and bench.
+    pub uploads: BTreeMap<String, String>,
     pub audit: AuditSection,
     pub test: FilesSection,
     pub bench: FilesSection,
