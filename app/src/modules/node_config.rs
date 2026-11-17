@@ -58,6 +58,145 @@ pub(crate) struct NodeConfig {
     /// Remote nodes with `mtls` auth only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<NodeTls>,
+    /// Remote nodes only: the endpoint of the plugin's configurator on the
+    /// remote side (`docs/plugin-spec.md` §4.1). Without it, a remote node
+    /// sets its plugin's configured fields itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configurator: Option<RemoteConfigurator>,
+}
+
+/// A remote node's configurator endpoint: the configurator contract, as a
+/// JSON POST.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteConfigurator {
+    /// `https://…`, or `http://…` on a trusted network only. Must be within
+    /// `[plugins] remote_configurator_urls`.
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ConfiguratorAuth>,
+    /// The node's uploaded PEM file with the CA(s) of the endpoint's
+    /// certificate. Default: the bundled Mozilla roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    /// Also send the node's secret launch args (default: left out).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub send_secrets: bool,
+}
+
+/// How the server authenticates to a remote configurator. Passwords and
+/// tokens are write-only, like the node's token.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ConfiguratorAuth {
+    Basic {
+        username: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+    },
+    Bearer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// The node's uploads: a client certificate (chain) and its key (PEM).
+    Mtls { cert: String, key: String },
+}
+
+impl RemoteConfigurator {
+    /// The secrets (basic password, bearer token) left out, for the API and exports.
+    pub(crate) fn without_secrets(&self) -> Self {
+        let mut copy = self.clone();
+        match &mut copy.auth {
+            Some(ConfiguratorAuth::Basic { password, .. }) => *password = None,
+            Some(ConfiguratorAuth::Bearer { token }) => *token = None,
+            _ => {}
+        }
+        copy
+    }
+
+    /// Fills in the secrets an update left out from the stored ones (same
+    /// auth type and user).
+    pub(crate) fn keep_secrets(&mut self, stored: &Self) {
+        match (&mut self.auth, &stored.auth) {
+            (
+                Some(ConfiguratorAuth::Basic {
+                    username,
+                    password: p @ None,
+                }),
+                Some(ConfiguratorAuth::Basic {
+                    username: u,
+                    password: Some(old),
+                }),
+            ) if username == u => *p = Some(old.clone()),
+            (
+                Some(ConfiguratorAuth::Bearer { token: t @ None }),
+                Some(ConfiguratorAuth::Bearer { token: Some(old) }),
+            ) => *t = Some(old.clone()),
+            _ => {}
+        }
+    }
+
+    /// Whether a change of this block calls for running the configurator
+    /// again: the endpoint or what it's sent, not the credentials.
+    pub(crate) fn same_target(&self, other: &Self) -> bool {
+        self.url == other.url && self.send_secrets == other.send_secrets
+    }
+
+    /// The uploads it names (CA, client certificate and key).
+    pub(crate) fn uploads(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.ca.iter().map(String::as_str).collect();
+        if let Some(ConfiguratorAuth::Mtls { cert, key }) = &self.auth {
+            names.push(cert);
+            names.push(key);
+        }
+        names
+    }
+
+    fn validate(&self) -> Vec<String> {
+        let mut errors = vec![];
+        let lower = self.url.to_ascii_lowercase();
+        let rest = lower
+            .strip_prefix("https://")
+            .or_else(|| lower.strip_prefix("http://"));
+        match rest {
+            Some(rest) if !rest.split(['/', '?', '#']).next().unwrap_or_default().is_empty() && !rest.contains('@') => {}
+            _ => errors.push(format!(
+                "config.configurator.url {:?} must be an http:// or https:// URL with a host (and no credentials in it)",
+                self.url
+            )),
+        }
+        match &self.auth {
+            Some(ConfiguratorAuth::Basic { username, .. }) if username.is_empty() => {
+                errors.push("config.configurator.auth.username can't be empty".into())
+            }
+            Some(ConfiguratorAuth::Mtls { cert, key }) if cert.is_empty() || key.is_empty() => {
+                errors.push(
+                    "config.configurator.auth: mtls needs cert and key (the node's uploads)".into(),
+                )
+            }
+            Some(ConfiguratorAuth::Mtls { .. }) if !lower.starts_with("https://") => {
+                errors.push("config.configurator.auth: mtls needs an https:// url".into())
+            }
+            _ => {}
+        }
+        if self.ca.is_some() && !lower.starts_with("https://") {
+            errors.push("config.configurator.ca needs an https:// url".into());
+        }
+        errors
+    }
+
+    /// The missing secret, if the auth needs one.
+    pub(crate) fn missing_secret(&self) -> Option<String> {
+        match &self.auth {
+            Some(ConfiguratorAuth::Basic { password: None, .. }) => {
+                Some("config.configurator.auth.password is required for basic auth".into())
+            }
+            Some(ConfiguratorAuth::Bearer { token: None }) => {
+                Some("config.configurator.auth.token is required for bearer auth".into())
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A remote node's client-certificate settings.
@@ -364,6 +503,14 @@ impl NodeConfig {
                     errors.extend(code.into_iter().map(|e| format!("config.{e}")));
                 }
             }
+            LaunchMode::Remote if self.configurator.is_some() => {
+                if plugin.launch_spec.configured_fields().is_empty() {
+                    errors.push("config.configurator: the plugin has no configurator (manifest `configurator`)".into());
+                }
+                if let Some(missing) = self.configurator.as_ref().and_then(|c| c.missing_secret()) {
+                    errors.push(missing);
+                }
+            }
             LaunchMode::Remote if !self.launch_args.is_null() && !node_schemas => errors.push(
                 "config.launch_args is only used for local nodes (and for a remote node's payload schemas, which this plugin doesn't take); a remote plugin gets its arguments from whoever starts it".into(),
             ),
@@ -396,6 +543,11 @@ impl NodeConfig {
                         "config.remote_id is only for remote nodes; a local plugin is started with its node id".into(),
                     );
                 }
+                if self.configurator.is_some() {
+                    errors.push(
+                        "config.configurator is only for remote nodes; a local node's configurator runs from its plugin's package".into(),
+                    );
+                }
                 if self.auth.is_some() || self.require_tls.is_some() || self.tls.is_some() {
                     errors.push(
                         "config.auth, config.require_tls and config.tls are only for remote nodes; local plugins use a per-launch token over loopback".into(),
@@ -416,6 +568,9 @@ impl NodeConfig {
                     errors.push(format!(
                         "config.remote_id must be 1 to {MAX_REMOTE_ID_LEN} characters of letters, digits, '.', '_', ':' and '-'"
                     ));
+                }
+                if let Some(c) = &self.configurator {
+                    errors.extend(c.validate());
                 }
                 if let Some(pin) = self
                     .tls
@@ -492,6 +647,7 @@ impl NodeConfig {
     pub(crate) fn redacted(&self) -> Value {
         let mut copy = self.clone();
         copy.token = None;
+        copy.configurator = copy.configurator.map(|c| c.without_secrets());
         serde_json::to_value(copy).expect("config serializes")
     }
 }

@@ -103,12 +103,19 @@ impl Service {
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        query_sqlite::get_node(&mut conn, scene_id, node_id)
+        let node: Node = query_sqlite::get_node(&mut conn, scene_id, node_id)
             .await
-            .map_err(not_found("node"))?;
+            .map_err(not_found("node"))?
+            .try_into()?;
         let existed = query_sqlite::get_upload(&mut conn, node_id, name)
             .await
             .is_ok();
+        // A file the settings name feeds the node's configurator (if its
+        // plugin has one): it runs on the new file first, and a failure
+        // refuses the upload.
+        let reconfigured = self
+            .configure_for_upload(&mut conn, &node, name, incoming)
+            .await?;
         let stored = self.files.files_dir.join(stored_name(name, &sha256));
         if !stored.exists() {
             tokio::fs::rename(incoming, &stored)
@@ -116,14 +123,20 @@ impl Service {
                 .map_err(io_error)?;
             read_only(&stored);
         }
+        let mut tx = conn.begin_with(WRITE_TX).await?;
         let upload = query_sqlite::put_upload(
-            &mut conn,
+            &mut tx,
             node_id,
             name,
             &sha256,
             i64::try_from(size).unwrap_or(i64::MAX),
         )
         .await?;
+        if let Some(prepared) = &reconfigured {
+            query_sqlite::update_node(&mut tx, scene_id, node_id, &prepared.values()).await?;
+            self.store_configured(&mut tx, node_id, prepared).await?;
+        }
+        tx.commit().await?;
         self.collect_garbage(&mut conn).await?;
         // A running node gets the new file when it restarts (the director's
         // diff restarts nodes whose uploads changed).
@@ -132,6 +145,80 @@ impl Service {
             "Scene service: node [{node_id}] got upload {name:?} ({size} bytes, sha256 {sha256})"
         );
         Ok((upload, !existed))
+    }
+
+    /// The node with its configurator run on a replaced upload `name` (at
+    /// `incoming`), if its plugin has one and its settings name the file.
+    async fn configure_for_upload(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        node: &Node,
+        name: &str,
+        incoming: &Path,
+    ) -> Result<Option<PreparedNode>, ServiceError> {
+        let remote = match node.config.launch {
+            crate::modules::node_config::LaunchMode::Local => None,
+            crate::modules::node_config::LaunchMode::Remote => match &node.config.configurator {
+                None => return Ok(None),
+                Some(c) => Some(c.clone()),
+            },
+        };
+        let Ok(plugin) = self.plugins.get(&node.plugin_id).await else {
+            return Ok(None);
+        };
+        let Some(package) = configurator::PackageRef::of(&plugin).filter(|p| p.has_configurator())
+        else {
+            return Ok(None);
+        };
+        let rules = NodeRules::of(&plugin).map_err(ServiceError::Unknown)?;
+        let named = rules.uploads_referenced(&node.config.launch_args);
+        let endpoint_files = remote.as_ref().map(|r| r.uploads()).unwrap_or_default();
+        // A file the settings name changes them: it runs. An endpoint file
+        // (CA, client certificate) only matters while it never ran.
+        let never_ran = !rules
+            .spec
+            .configured_fields()
+            .iter()
+            .any(|f| node.config.launch_args.get(f.as_str()).is_some());
+        if !named.iter().any(|(_, n, _)| n == name)
+            && !(never_ran && endpoint_files.contains(&name))
+        {
+            return Ok(None);
+        }
+        let mut uploads = configurator::uploads(conn, &self.files.files_dir, &node.id).await?;
+        uploads.insert(name.to_string(), incoming.to_path_buf());
+        // Still waiting for another file: it runs once that one arrives.
+        if named.iter().any(|(_, n, _)| !uploads.contains_key(n))
+            || endpoint_files.iter().any(|n| !uploads.contains_key(*n))
+        {
+            return Ok(None);
+        }
+        let configured = self
+            .run_configurator(
+                &package,
+                &node.id,
+                &node.config.launch_args,
+                uploads,
+                remote.as_ref(),
+            )
+            .await
+            .map_err(|mut errors| {
+                errors.insert(
+                    0,
+                    format!("the node's configurator refused the new {name:?}"),
+                );
+                ServiceError::Invalid(errors)
+            })?;
+        let mut config = node.config.clone();
+        config.launch_args = configured.launch_args.clone();
+        Ok(Some(PreparedNode {
+            name: node.name.clone(),
+            node_type: plugin.plugin_type.clone(),
+            plugin_id: plugin.id.clone(),
+            plugin_version: Some(plugin.version.clone()),
+            config_json: serde_json::to_string(&config).expect("config serializes"),
+            configured: Some(configured),
+        }))
     }
 
     pub(crate) async fn list_uploads(
@@ -182,6 +269,17 @@ impl Service {
                 "upload {name:?} is the node's secret launch_args/{field}; it can't be downloaded"
             )));
         }
+        if let Some(crate::modules::node_config::ConfiguratorAuth::Mtls { key, .. }) = node
+            .config
+            .configurator
+            .as_ref()
+            .and_then(|c| c.auth.as_ref())
+            && key == name
+        {
+            return Err(ServiceError::Forbidden(format!(
+                "upload {name:?} is the key of the node's configurator client certificate; it can't be downloaded"
+            )));
+        }
         let path = self.files.files_dir.join(upload.stored_name());
         Ok((upload, path))
     }
@@ -211,6 +309,15 @@ impl Service {
                 .filter(|(_, n, _)| n == name)
                 .map(|(field, _, _)| format!("launch_args/{field}"))
                 .collect();
+            let mut fields = fields;
+            if node
+                .config
+                .configurator
+                .as_ref()
+                .is_some_and(|c| c.uploads().contains(&name))
+            {
+                fields.push("configurator".into());
+            }
             if !fields.is_empty() {
                 return Err(ServiceError::Conflict(
                     format!("the node's launch args name upload {name:?}; change them first"),

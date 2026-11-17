@@ -1,0 +1,4 @@
+name = "oneOf has no flwrs type: refused, naming the place"
+launch_args = "oneof.json"
+expect = "error"
+errors_contain = ["#/components/schemas/Reading: oneOf isn't supported"]

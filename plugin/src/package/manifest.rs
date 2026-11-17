@@ -97,6 +97,19 @@ pub struct PayloadSchemas {
     pub output: Option<SchemaSource>,
 }
 
+/// A program in the package that fills some of a node's settings from its
+/// other settings (manifest version 2), e.g. an out schema derived from an
+/// OpenAPI document. The server runs it when a local node's settings change;
+/// see `docs/plugin-spec.md` and [`crate::package::configure`].
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Configurator {
+    /// Path of its executable, relative to the package root.
+    pub executable: String,
+    /// The top-level launch-args properties it sets.
+    pub fields: Vec<String>,
+}
+
 /// How the plugin is presented in a UI (manifest version 2).
 #[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -142,6 +155,8 @@ pub struct Manifest {
     pub runtime_defaults: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<Ui>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configurator: Option<Configurator>,
     /// Every other field. Only `x-*` ones are allowed (a warning); the rest
     /// are errors in [`Manifest::validate`].
     #[serde(flatten)]
@@ -250,6 +265,30 @@ impl Manifest {
                 ));
             }
         }
+        if let Some(configurator) = &self.configurator {
+            if !v2 {
+                errors.push("configurator needs manifest_version 2".into());
+            }
+            if self.launch_args_schema.is_none() {
+                errors.push(
+                    "configurator needs a launch_args_schema (its fields are launch args)".into(),
+                );
+            }
+            if configurator.fields.is_empty() {
+                errors.push("configurator.fields is empty".into());
+            }
+            let mut seen = HashSet::new();
+            for field in &configurator.fields {
+                if field.is_empty() || !seen.insert(field) {
+                    errors.push(format!(
+                        "configurator.fields: {field:?} is empty or listed twice"
+                    ));
+                }
+            }
+            if configurator.executable == self.executable {
+                errors.push("configurator.executable must not be the plugin's executable".into());
+            }
+        }
         if let Some(defaults) = &self.runtime_defaults
             && !defaults.is_object()
         {
@@ -273,6 +312,9 @@ impl Manifest {
     /// Every path the manifest points to, with the field it comes from.
     pub fn file_references(&self) -> Vec<(&'static str, &str)> {
         let mut refs = vec![("executable", self.executable.as_str())];
+        if let Some(c) = &self.configurator {
+            refs.push(("configurator.executable", c.executable.as_str()));
+        }
         if let Some(p) = &self.launch_args_schema {
             refs.push(("launch_args_schema", p));
         }
@@ -503,6 +545,7 @@ mod tests {
             },
             runtime_defaults: None,
             ui: None,
+            configurator: None,
             extensions: Default::default(),
         }
     }

@@ -33,7 +33,8 @@ zip.workspace = true
 sha256.workspace = true
 getrandom.workspace = true # per-launch plugin tokens
 fs4.workspace = true # free disk space for the spill guard (cross-platform, safe API)
-reqwest = { workspace = true, optional = true } # OTLP/HTTP export (feature otel)
+reqwest = { workspace = true, optional = true } # OTLP/HTTP export (feature otel); remote configurators (feature remote)
+webpki-roots = { workspace = true, optional = true } # remote configurators' default roots (feature remote)
 pbjson = { workspace = true, optional = true } # OTLP JSON telemetry files (feature otel)
 flate2.workspace = true # gzip: tar.gz scene imports, closed telemetry files (feature telemetry-file)
 tar.workspace = true # scene imports from tar / tar.gz archives
@@ -70,7 +71,7 @@ telemetry-file = []
 # and the TLS listener ([hub.tls], rustls) with optional client certificates
 # (mTLS). On by default; a bare build for a small edge device can leave it
 # out, and then only runs local plugins over loopback.
-remote = ["dep:rustls", "dep:tokio-rustls", "dep:x509-parser", "flwrs-plugin/tls"]
+remote = ["dep:rustls", "dep:tokio-rustls", "dep:x509-parser", "flwrs-plugin/tls", "dep:reqwest", "dep:webpki-roots"]
 
 [build-dependencies]
 prost-build.workspace = true
@@ -83,3 +84,4 @@ toml.workspace = true # parsing config snippets in tests
 tower.workspace = true
 http-body-util.workspace = true
 rcgen.workspace = true # test certificates (TLS / mTLS tests)
+flwrs-plugin-kit.workspace = true # an HTTPS server with client certificates (remote configurator tests)

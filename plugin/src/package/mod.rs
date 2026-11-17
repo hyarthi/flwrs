@@ -1,12 +1,14 @@
 //! Plugin packages (feature `package`): the manifest model, its validation,
 //! the rules for a node's `launch_args` and how they reach the plugin
-//! (`launch`), and the checks on a package ZIP.
+//! (`launch`), the checks on a package ZIP, and the configurator contract
+//! (`configure`).
 //!
 //! This is the format the server installs (`POST /api/plugins`) and
 //! `flwrs-trellis package` produces; both use this module, so they agree on
 //! what a valid package is.
 
 pub mod archive;
+pub mod configure;
 pub mod launch;
 pub mod manifest;
 
@@ -16,7 +18,8 @@ pub use launch::{
     SchemaReport, Via, validate_launch_args,
 };
 pub use manifest::{
-    FromLaunchArgs, LaunchArgsStyle, MANIFEST_FILE, MANIFEST_VERSION, Manifest, PayloadSchemas,
-    PluginType, RESERVED_ARGS, RESERVED_ENTRY, SchemaSource, Ui, check_relative_path,
-    current_platform, is_semver, is_valid_id, launch_args_to_argv, parse_pointer,
+    Configurator, FromLaunchArgs, LaunchArgsStyle, MANIFEST_FILE, MANIFEST_VERSION, Manifest,
+    PayloadSchemas, PluginType, RESERVED_ARGS, RESERVED_ENTRY, SchemaSource, Ui,
+    check_relative_path, current_platform, is_semver, is_valid_id, launch_args_to_argv,
+    parse_pointer,
 };

@@ -1,4 +1,5 @@
 pub(crate) mod api_error;
+pub(crate) mod configurator;
 pub(crate) mod director;
 pub(crate) mod hub;
 pub(crate) mod mapping;

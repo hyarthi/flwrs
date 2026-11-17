@@ -1,0 +1,15 @@
+{
+  "method": "POST",
+  "path": "/devices/{id}",
+  "uri": "/devices/d1?verbose=true",
+  "content_type": "application/json",
+  "paths": {
+    "/devices/{id}": {
+      "post": {
+        "path_params": { "id": "d1" },
+        "query": { "verbose": true },
+        "body": { "temp": 21.5, "tags": ["a", "b"] }
+      }
+    }
+  }
+}

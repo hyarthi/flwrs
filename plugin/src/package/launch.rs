@@ -133,6 +133,8 @@ pub struct LaunchSpec {
     code: Vec<CodeField>,
     input_pointer: Option<String>,
     output_pointer: Option<String>,
+    /// The fields the plugin's configurator sets.
+    configured: Vec<String>,
 }
 
 /// A file the server writes to (or links into) the node's `config/` folder.
@@ -182,12 +184,22 @@ impl LaunchSpec {
             code: vec![],
             input_pointer: pointer(&manifest.payload_schemas.input),
             output_pointer: pointer(&manifest.payload_schemas.output),
+            configured: manifest
+                .configurator
+                .as_ref()
+                .map(|c| c.fields.clone())
+                .unwrap_or_default(),
         };
         let Some(schema) = schema.filter(|_| v2) else {
             return (spec, report);
         };
         walk(schema, "", Place::Root, &mut spec.code, &mut report);
         if spec.style == LaunchArgsStyle::Positional {
+            if !spec.configured.is_empty() {
+                report
+                    .errors
+                    .push("configurator needs launch_args_style \"flags\"".into());
+            }
             if annotated(schema) {
                 report.errors.push(
                     "launch_args_schema: x-flwrs-launch, x-flwrs-code and writeOnly need launch_args_style \"flags\""
@@ -207,6 +219,17 @@ impl LaunchSpec {
             }
         }
         check_unique(&spec.fields, &mut report.errors);
+        for name in &spec.configured {
+            match spec.fields.get(name) {
+                None => report.errors.push(format!(
+                    "configurator.fields: {name:?} isn't a top-level property of the launch_args_schema"
+                )),
+                Some(f) if f.secret => report.errors.push(format!(
+                    "configurator.fields: {name:?} is a secret (writeOnly): a configurator's output is stored and shown"
+                )),
+                Some(_) => {}
+            }
+        }
         for (label, ptr) in [
             ("payload_schemas.in", &spec.input_pointer),
             ("payload_schemas.out", &spec.output_pointer),
@@ -231,7 +254,23 @@ impl LaunchSpec {
             code: vec![],
             input_pointer: None,
             output_pointer: None,
+            configured: vec![],
         }
+    }
+
+    /// The fields the plugin's configurator sets (empty without one).
+    pub fn configured_fields(&self) -> &[String] {
+        &self.configured
+    }
+
+    /// Whether `name` is set by the configurator.
+    pub fn is_configured(&self, name: &str) -> bool {
+        self.configured.iter().any(|c| c == name)
+    }
+
+    /// The field named `name`.
+    pub fn field(&self, name: &str) -> Option<&LaunchField> {
+        self.fields.get(name)
     }
 
     /// The declared fields with their delivery (manifest version 2).
@@ -964,6 +1003,7 @@ mod tests {
             },
             runtime_defaults: None,
             ui: None,
+            configurator: None,
             extensions: Default::default(),
         }
     }

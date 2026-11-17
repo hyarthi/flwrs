@@ -5,6 +5,7 @@
 //! arguments, environment variables and files in `config/`, and files
 //! uploaded to the node linked into `config/` too.
 
+use flwrs_plugin::package::configure::{self, Configured, Invocation};
 use flwrs_plugin::package::launch::check_file_name;
 use flwrs_plugin::package::{
     self, CONFIG_DIR, ConfigContent, LaunchSpec, Limits, MANIFEST_FILE, Manifest, SchemaSource,
@@ -43,6 +44,10 @@ pub struct Target {
     uploads: Vec<(String, PathBuf)>,
     /// Keeps an unpacked package's temporary folder alive.
     unpacked: Option<Arc<tempfile::TempDir>>,
+    /// Runs this instead of the manifest's configurator (e.g. cargo's build).
+    configurator_program: Option<PathBuf>,
+    /// The configurator's last run (its files are the node's uploads).
+    configured: Option<Arc<Configured>>,
     /// The node's folder: the plugin's working directory.
     node: Arc<tempfile::TempDir>,
 }
@@ -69,7 +74,10 @@ impl Target {
             .map_err(|e| format!("{MANIFEST_FILE}: {e}"))?;
         let mut problems = manifest.validate(&current_platform());
         for (field, path) in manifest.file_references() {
-            if field != "executable" && !dir.join(path).is_file() {
+            // Executables may come from cargo (`with_executable`, `with_configurator_executable`).
+            if !matches!(field, "executable" | "configurator.executable")
+                && !dir.join(path).is_file()
+            {
                 problems.push(format!("{field} {path:?} is missing"));
             }
         }
@@ -102,6 +110,8 @@ impl Target {
             show_output: false,
             uploads: vec![],
             unpacked: None,
+            configurator_program: None,
+            configured: None,
         })
     }
 
@@ -131,6 +141,77 @@ impl Target {
         self
     }
 
+    /// Runs `program` as the plugin's configurator (manifest `configurator`)
+    /// instead of the package's, e.g. `env!("CARGO_BIN_EXE_<name>-config")`.
+    pub fn with_configurator_executable(mut self, program: impl Into<PathBuf>) -> Self {
+        self.configurator_program = Some(program.into());
+        self
+    }
+
+    /// The configured fields' values from the configurator's last run (in
+    /// [`Target::with_launch_args`]).
+    pub fn configured_values(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.configured.as_ref().map(|c| &c.values)
+    }
+
+    /// Runs the plugin's configurator on `args` the way the server does
+    /// (`docs/plugin-spec.md`), with this target's uploads, and returns its
+    /// result. Values `args` gives for configured fields are refused, as the
+    /// server refuses them for a new local node.
+    pub fn configure(&self, args: &Value) -> Result<Configured, Vec<String>> {
+        let (schema, validator) = self.launch_schema().map_err(|e| vec![e])?;
+        let (spec, report) = LaunchSpec::new(&self.manifest, schema.as_ref());
+        if !report.errors.is_empty() {
+            return Err(report.errors);
+        }
+        let given: Vec<String> = spec
+            .configured_fields()
+            .iter()
+            .filter(|f| args.get(f.as_str()).is_some())
+            .map(|f| format!("launch_args/{f} is set by the plugin's configurator; leave it out"))
+            .collect();
+        if !given.is_empty() {
+            return Err(given);
+        }
+        let uploads = |name: &str| {
+            self.uploads
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, p)| p.clone())
+        };
+        configure::configure(&Invocation {
+            package_dir: &self.cwd,
+            executable: self.configurator_program.as_deref(),
+            manifest: &self.manifest,
+            spec: &spec,
+            schema: validator.as_ref(),
+            launch_args: args,
+            uploads: &uploads,
+            node_id: crate::hub::INSTANCE_ID,
+            limits: &configure::Limits::default(),
+        })
+    }
+
+    /// The launch-args schema and its validator.
+    fn launch_schema(&self) -> Result<(Option<Value>, Option<jsonschema::Validator>), String> {
+        let schema = match &self.manifest.launch_args_schema {
+            None => None,
+            Some(file) => {
+                let text = std::fs::read_to_string(self.cwd.join(file))
+                    .map_err(|e| format!("{file}: {e}"))?;
+                Some(serde_json::from_str::<Value>(&text).map_err(|e| format!("{file}: {e}"))?)
+            }
+        };
+        let validator = match &schema {
+            None => None,
+            Some(value) => Some(
+                jsonschema::validator_for(value)
+                    .map_err(|e| format!("launch_args_schema: not a valid JSON Schema: {e}"))?,
+            ),
+        };
+        Ok((schema, validator))
+    }
+
     /// A file uploaded to the node as `name` (what a `"source": "upload"`
     /// launch arg names). Add uploads before [`Target::with_launch_args`].
     pub fn with_upload(mut self, name: &str, file: impl Into<PathBuf>) -> Result<Self, String> {
@@ -151,21 +232,22 @@ impl Target {
     /// folder's `config/`. With manifest version 2, payload schemas the
     /// plugin takes from its launch args are taken from `args`.
     pub fn with_launch_args(mut self, args: Value) -> Result<Self, String> {
-        let schema = match &self.manifest.launch_args_schema {
-            None => None,
-            Some(file) => {
-                let text = std::fs::read_to_string(self.cwd.join(file))
-                    .map_err(|e| format!("{file}: {e}"))?;
-                Some(serde_json::from_str::<Value>(&text).map_err(|e| format!("{file}: {e}"))?)
+        // A configurator sets its fields first, as on the server.
+        let args = if self.manifest.configurator.is_some() {
+            let configured = self
+                .configure(&args)
+                .map_err(|e| format!("configurator: {}", e.join("; ")))?;
+            for file in &configured.files {
+                self.uploads.retain(|(n, _)| *n != file.name);
+                self.uploads.push((file.name.clone(), file.path.clone()));
             }
+            let args = configured.launch_args.clone();
+            self.configured = Some(Arc::new(configured));
+            args
+        } else {
+            args
         };
-        let validator = match &schema {
-            None => None,
-            Some(value) => Some(
-                jsonschema::validator_for(value)
-                    .map_err(|e| format!("launch_args_schema: not a valid JSON Schema: {e}"))?,
-            ),
-        };
+        let (schema, validator) = self.launch_schema()?;
         let (spec, report) = LaunchSpec::new(&self.manifest, schema.as_ref());
         if !report.errors.is_empty() {
             return Err(report.errors.join("; "));

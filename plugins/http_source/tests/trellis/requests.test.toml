@@ -1,0 +1,58 @@
+# Requests (sent by the stimulus in tests/trellis.rs, in order, each with its
+# expected status) and the events they become. `${http}` is the server's port.
+name = "requests become typed events"
+launch_args = "devices.json"
+
+# A JSON body, a path parameter and a query parameter, all typed.
+[[steps]]
+wait_ms = 1000
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ payload = "expected/reading.json", match = "subset" }]
+
+# Bytes for a media type without a schema.
+[[steps]]
+stimulus = true
+expect_outputs = [{ path = "content_type", eq = "application/octet-stream" }]
+
+# A form body, typed.
+[[steps]]
+stimulus = true
+expect_outputs = [{ path = 'paths["/forms"].post.body.count', eq = 3 }]
+
+# Refused: a body against the schema (400), the wrong content type (415), a
+# wrong query value (400), an unknown path (404). No events.
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+# GET: no body, still an event.
+[[steps]]
+stimulus = true
+expect_outputs = [{ path = "method", eq = "GET" }]
+
+# Swagger UI's document and the readiness check: answered, no events.
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+# Let the last answer go out before the plugin stops.
+[[steps]]
+wait_ms = 300

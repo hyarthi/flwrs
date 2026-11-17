@@ -1,0 +1,36 @@
+[package]
+name = "flwrs-plugin-kit"
+description = "Shared code for flwrs' own plugins: the HTTP server core (TLS / mTLS, HTTP/1.1 and HTTP/2, limits, health, inbound auth, header policy)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+flwrs-plugin = { workspace = true, features = ["cli"] } # read_json for settings files
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+x509-parser.workspace = true
+sha256.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true, features = ["ws"] } # a WebSocket route through the core
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+rcgen.workspace = true
+tempfile.workspace = true

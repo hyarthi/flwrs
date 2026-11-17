@@ -26,6 +26,7 @@ pub mod audit;
 pub mod bench;
 pub mod cli;
 pub mod config;
+pub mod configure_test;
 mod hub;
 pub mod package;
 pub mod payload;

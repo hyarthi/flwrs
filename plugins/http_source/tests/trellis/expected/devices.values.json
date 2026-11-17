@@ -1,0 +1,165 @@
+{
+  "out_schema": {
+    "fields": [
+      {
+        "description": "The request's method (POST)",
+        "key": "method",
+        "type": "STRING"
+      },
+      {
+        "description": "The matched path template (/devices/{id})",
+        "key": "path",
+        "type": "STRING"
+      },
+      {
+        "description": "The request's path and query, as sent",
+        "key": "uri",
+        "type": "STRING"
+      },
+      {
+        "description": "Request headers (lowercase names; credentials left out)",
+        "key": "headers",
+        "nestedTypeDefinition": {
+          "nestedTypeDefinition": {
+            "type": "STRING"
+          },
+          "type": "ARRAY"
+        },
+        "type": "MAP"
+      },
+      {
+        "description": "The body's media type",
+        "key": "content_type",
+        "type": "STRING"
+      },
+      {
+        "description": "The body, as sent",
+        "key": "body",
+        "type": "BYTES"
+      },
+      {
+        "description": "The client's address",
+        "key": "remote_addr",
+        "type": "STRING"
+      },
+      {
+        "description": "HTTP/1.1 or HTTP/2.0",
+        "key": "http_version",
+        "type": "STRING"
+      },
+      {
+        "description": "Who sent it: the token's label or the certificate's name",
+        "key": "principal",
+        "type": "STRING"
+      },
+      {
+        "description": "When the server received it",
+        "key": "receive_time",
+        "type": "DATETIME"
+      },
+      {
+        "description": "The request, typed by the matching operation: paths[\"<template>\"].<method>.{path_params, query, body}",
+        "key": "paths",
+        "objectFields": [
+          {
+            "key": "/devices/{id}",
+            "objectFields": [
+              {
+                "key": "get",
+                "objectFields": [
+                  {
+                    "key": "path_params",
+                    "objectFields": [
+                      {
+                        "key": "id",
+                        "type": "STRING"
+                      }
+                    ],
+                    "type": "OBJECT"
+                  }
+                ],
+                "type": "OBJECT"
+              },
+              {
+                "description": "Report a reading",
+                "key": "post",
+                "objectFields": [
+                  {
+                    "key": "path_params",
+                    "objectFields": [
+                      {
+                        "key": "id",
+                        "type": "STRING"
+                      }
+                    ],
+                    "type": "OBJECT"
+                  },
+                  {
+                    "key": "query",
+                    "objectFields": [
+                      {
+                        "key": "verbose",
+                        "type": "BOOL"
+                      }
+                    ],
+                    "type": "OBJECT"
+                  },
+                  {
+                    "key": "body",
+                    "objectFields": [
+                      {
+                        "key": "at",
+                        "type": "DATETIME"
+                      },
+                      {
+                        "key": "tags",
+                        "nestedTypeDefinition": {
+                          "type": "STRING"
+                        },
+                        "type": "ARRAY"
+                      },
+                      {
+                        "key": "temp",
+                        "type": "F64"
+                      }
+                    ],
+                    "type": "OBJECT"
+                  }
+                ],
+                "type": "OBJECT"
+              }
+            ],
+            "type": "OBJECT"
+          },
+          {
+            "key": "/forms",
+            "objectFields": [
+              {
+                "key": "post",
+                "objectFields": [
+                  {
+                    "key": "body",
+                    "objectFields": [
+                      {
+                        "key": "count",
+                        "type": "I64"
+                      },
+                      {
+                        "key": "name",
+                        "type": "STRING"
+                      }
+                    ],
+                    "type": "OBJECT"
+                  }
+                ],
+                "type": "OBJECT"
+              }
+            ],
+            "type": "OBJECT"
+          }
+        ],
+        "type": "OBJECT"
+      }
+    ]
+  }
+}

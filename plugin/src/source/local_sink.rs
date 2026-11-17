@@ -33,6 +33,18 @@ impl LocalSink {
     /// own clock, e.g. to drop a tick that would go out late rather than
     /// queue it. With one task emitting, the next `emit` then doesn't wait
     /// for credit.
+    /// Whether the hub has accepted the plugin on the current connection.
+    pub fn is_connected(&self) -> bool {
+        self.client.is_connected()
+    }
+
+    /// Whether an event could go out now without waiting: connected, and
+    /// credit left (or no credit-based flow control). Synchronous, for a
+    /// readiness endpoint; [`LocalSink::ready`] waits instead.
+    pub fn is_ready(&self) -> bool {
+        self.client.is_ready()
+    }
+
     pub async fn ready(&self) -> Result<(), SourceError> {
         self.client.ready().await.map_err(SourceError::new)
     }

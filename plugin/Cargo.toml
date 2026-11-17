@@ -38,6 +38,8 @@ rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 jsonschema = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true } # a configurator's working folder
+base64 = { workspace = true, optional = true } # remote configurators' inline files
 clap = { workspace = true, optional = true }
 
 [features]
@@ -46,8 +48,9 @@ default = ["tls"]
 # client certificate (mTLS). Plugins that only ever run locally can leave it out.
 tls = ["dep:rustls", "dep:tokio-rustls"]
 # Plugin packages: the manifest model and validation, launch-args rules and
-# the ZIP checks, shared by the server and flwrs-trellis.
-package = ["dep:jsonschema", "dep:zip"]
+# the ZIP checks and the configurator contract, shared by the server and
+# flwrs-trellis.
+package = ["dep:jsonschema", "dep:zip", "dep:tempfile", "dep:base64"]
 # The bootstrap arguments (`--id --host --port --log-level --token`) as a
 # clap struct to flatten into a plugin's own arguments.
 cli = ["dep:clap"]

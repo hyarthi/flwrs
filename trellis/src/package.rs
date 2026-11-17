@@ -92,6 +92,14 @@ pub fn package(opts: &PackageOptions) -> Result<Packaged, String> {
 
     // Build.
     let profile = if opts.release { "release" } else { "debug" };
+    // A Rust plugin's configurator is another binary of the crate, named as the file.
+    let configurator_bin = manifest.configurator.as_ref().map(|c| {
+        Path::new(&c.executable)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let mut configurator_built = None;
     let (executable, platform, default_out) = if let Some(build) = &config.build {
         let (program, args) = build
             .command
@@ -114,7 +122,8 @@ pub fn package(opts: &PackageOptions) -> Result<Packaged, String> {
         }
         (dir.join(&build.executable), None, dir.join("dist"))
     } else if dir.join("Cargo.toml").is_file() {
-        let built = cargo_build(dir, opts, flavor)?;
+        let built = cargo_build(dir, opts, flavor, configurator_bin.as_deref())?;
+        configurator_built = built.configurator.clone();
         if built.version != manifest.version {
             return Err(format!(
                 "{manifest_file} version {} doesn't match Cargo.toml version {}",
@@ -143,8 +152,20 @@ pub fn package(opts: &PackageOptions) -> Result<Packaged, String> {
     // Files: path in the ZIP → (source, mode).
     let mut files: BTreeMap<String, (PathBuf, u32)> = BTreeMap::new();
     files.insert(manifest.executable.clone(), (executable.clone(), 0o755));
+    if let Some(c) = &manifest.configurator {
+        let source = configurator_built
+            .clone()
+            .unwrap_or_else(|| dir.join(&c.executable));
+        if !source.is_file() {
+            return Err(format!(
+                "the configurator {} doesn't exist",
+                source.display()
+            ));
+        }
+        files.insert(c.executable.clone(), (source, 0o755));
+    }
     for (field, path) in manifest.file_references() {
-        if field != "executable" {
+        if !matches!(field, "executable" | "configurator.executable") {
             files.insert(path.to_string(), (dir.join(path), 0o644));
         }
     }
@@ -253,6 +274,8 @@ fn write_zip(
 
 struct Built {
     binary: PathBuf,
+    /// The configurator's binary (a second binary of the crate).
+    configurator: Option<PathBuf>,
     version: String,
     target_dir: PathBuf,
 }
@@ -266,6 +289,7 @@ fn cargo_build(
     dir: &Path,
     opts: &PackageOptions,
     flavor: Option<&Flavor>,
+    configurator_bin: Option<&str>,
 ) -> Result<Built, String> {
     let manifest_path = dir.join("Cargo.toml");
     let output = cargo()
@@ -314,7 +338,19 @@ fn cargo_build(
         })
         .filter_map(|t| t["name"].as_str().map(str::to_string))
         .collect();
-    let bin = match bins.as_slice() {
+    if let Some(c) = configurator_bin
+        && !bins.iter().any(|b| b == c)
+    {
+        return Err(format!(
+            "the manifest's configurator is {c:?}, but the crate {name} has no binary of that name"
+        ));
+    }
+    let plugin_bins: Vec<String> = bins
+        .iter()
+        .filter(|b| Some(b.as_str()) != configurator_bin)
+        .cloned()
+        .collect();
+    let bin = match plugin_bins.as_slice() {
         [one] => one.clone(),
         [] => return Err(format!("the crate {name} has no binary")),
         _ if bins.contains(&name) => name.clone(),
@@ -332,6 +368,9 @@ fn cargo_build(
         .args(["build", "--manifest-path"])
         .arg(&manifest_path)
         .args(["--package", &name, "--bin", &bin]);
+    if let Some(c) = configurator_bin {
+        build.args(["--bin", c]);
+    }
     if opts.release {
         build.arg("--release");
     }
@@ -361,8 +400,10 @@ fn cargo_build(
         Some(t) => t.contains("windows"),
         None => cfg!(windows),
     };
+    let exe = |b: &str| binary_dir.join(format!("{b}{}", if windows { ".exe" } else { "" }));
     Ok(Built {
-        binary: binary_dir.join(format!("{bin}{}", if windows { ".exe" } else { "" })),
+        configurator: configurator_bin.map(exe),
+        binary: exe(&bin),
         version,
         target_dir,
     })

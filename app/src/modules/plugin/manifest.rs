@@ -46,6 +46,7 @@ mod tests {
             },
             runtime_defaults: None,
             ui: None,
+            configurator: None,
             extensions: Default::default(),
         };
         assert!(check_runtime_defaults(&m).is_empty());

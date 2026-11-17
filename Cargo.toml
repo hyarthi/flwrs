@@ -15,6 +15,8 @@ members = [
     "plugins/mqtt_sink",
     "plugins/mqtt_source",
     "plugins/ws_sink",
+    "plugins/kit",
+    "plugins/http_source",
     "trellis",
 ]
 
@@ -37,6 +39,7 @@ flwrs-plugin = { path = "plugin", version = "0.0.7", default-features = false }
 flwrs-types = { path = "types" }
 # The script transform's state store and Lua host (the accumulator builds on them).
 flwrs-script-transform = { path = "plugins/script_transform" }
+flwrs-plugin-kit = { path = "plugins/kit" }
 # The developer toolkit, as a dev-dependency of the plugins here (their tests run it).
 flwrs-trellis = { path = "trellis" }
 
@@ -119,6 +122,9 @@ rumqttd = { version = "0.20.0", default-features = false }
 webpki-roots = "1.0.12"
 # WebSocket sink: rustls through our own ring config (no aws-lc), no default connector
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "__rustls-tls"] }
+# HTTP source: OpenAPI 3.1 (without preserve-order: it would switch serde_json's maps to insertion order workspace-wide), YAML specs
+oas3 = { version = "0.22.0", default-features = false }
+yaml_serde = "0.10.7"
 x509-parser = "0.18.1"
 
 # testing
@@ -129,6 +135,9 @@ sysinfo = { version = "0.40.3", default-features = false, features = ["system"] 
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.5"
+# The plugins' HTTP server core (plugins/kit): HTTP/1.1 + HTTP/2 (+ h2c) on our own accept loop
+hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["server", "server-auto", "tokio", "service"] }
 
 [workspace.lints.rust]
 # Denied everywhere; the single allowed exception is the Windows process

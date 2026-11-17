@@ -1,0 +1,6 @@
+# flwrs-trellis settings for the HTTP source.
+# The behaviour tests need the requests tests/trellis.rs sends, so they run
+# with `cargo test`; configurator tests (*.configure.toml) run with either.
+
+[audit]
+launch_args = "tests/trellis/audit.json"

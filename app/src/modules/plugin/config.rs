@@ -22,6 +22,15 @@ pub(crate) struct PluginsConfig {
     pub max_entries: usize,
     /// Maximum compression ratio of a single large entry (zip-bomb guard).
     pub max_compression_ratio: u64,
+    /// A plugin's configurator (manifest `configurator`) must finish within this.
+    pub configure_timeout_ms: u64,
+    /// The most a configurator's `response.json` may hold.
+    pub configure_max_response_bytes: u64,
+    /// URL prefixes remote nodes' configurators (`config.configurator.url`)
+    /// and the files they return may be at. Empty (the default): remote
+    /// configurators are off. A prefix matches itself and what follows it
+    /// after a `/` or `?`.
+    pub remote_configurator_urls: Vec<String>,
 }
 
 impl Default for PluginsConfig {
@@ -34,6 +43,9 @@ impl Default for PluginsConfig {
             max_unpacked_bytes: 1024 * 1024 * 1024,
             max_entries: 10_000,
             max_compression_ratio: 200,
+            configure_timeout_ms: 30_000,
+            configure_max_response_bytes: 1024 * 1024,
+            remote_configurator_urls: vec![],
         }
     }
 }

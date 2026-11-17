@@ -70,6 +70,7 @@ The executable is made executable when the package is unpacked; other permission
 | `launch_args_style` | no | `flags` (default; a node's settings are a JSON object) or `positional` (a list of strings, passed as they are; no annotations). |
 | `payload_schemas` | by type | `in` for a SINK, `out` for a SOURCE, both for a TRANSFORM. Each is either a path to a `SchemaDefinition` in proto3 JSON (`{"fields": [{"key": "url", "type": "STRING"}]}`), or `{"from_launch_args": "<JSON pointer>", "default": "<path>"?}`: the node's own schema, from its settings ([section 3.5](#35-per-node-payload-schemas)). The plugin MUST declare exactly the schemas in effect in `Initialize`. |
 | `runtime_defaults` | no | Defaults for the node's runtime settings (timeouts, restarts, queue, delivery); same keys as a node's `config.runtime`. |
+| `configurator` | no | `{"executable", "fields"}`: a program in the package that sets some of a node's settings from its others, e.g. an out schema derived from an OpenAPI document ([section 3.6](#36-configured-settings-the-configurator)). Version 2 only. |
 | `ui` | no | How a UI presents the plugin: `icon` (an `.svg` or `.png` in the package), `categories` (free tags, 1 to 64 characters, no duplicates), `color` (`#RRGGBB`), `docs` (a Markdown file in the package). |
 | `x-…` | no | Top-level fields starting with `x-` are ignored, with a warning at upload. Any other unknown field is an error. |
 
@@ -131,9 +132,84 @@ On any property, all optional: `x-flwrs-group` (a section name), `x-flwrs-order`
 
 `payload_schemas.in` / `out` may be `{"from_launch_args": "/schemas/in", "default": "schema/in.json"?}`: the JSON pointer leads (through `properties`) to an `object` property of the launch-args schema, and a node's value there is its `SchemaDefinition`. The server checks it, compiles edge mappings against it, and expects it in `Initialize`; without one, `default` applies, and without a default the node is invalid. The plugin MUST read the schema from its settings and declare it.
 
+### 3.6 Configured settings: the configurator
+
+Some settings follow from others: an HTTP source's out schema from the OpenAPI document it serves, a gRPC source's from its `.proto` files. A plugin can derive them with a **configurator**, a second program in its package that the server runs when a node's settings change, so the server knows the result (to check mappings and the plugin's `Initialize`) before the plugin ever runs:
+
+```json
+"configurator": { "executable": "bin/my-plugin-config", "fields": ["out_schema"] }
+```
+
+- `fields` are top-level properties of the launch-args schema, typed and validated like any other setting. They can't be secrets (`writeOnly`), and the plugin must use the `flags` style. With per-node payload schemas ([section 3.5](#35-per-node-payload-schemas)), point `from_launch_args` at a configured field.
+- On a local node, the configured fields belong to the configurator: a request that sends another value for one is refused (sending the stored value back is fine). A remote node's configurator runs at an endpoint on the remote side, if the node names one ([section 4.1](#41-configuring-a-remote-node)); otherwise its configured fields are set by hand.
+
+**When it runs.** When a local node is saved and its other settings (or the plugin's version) changed; when an upload its settings name is replaced (a failure refuses the upload); for every local node when the plugin is upgraded (a failure refuses the upgrade); and on request (`POST /api/scenes/by-id/{id}/nodes/by-id/{node_id}/configure`, e.g. after importing a scene configured by another version). While an upload its settings name is missing (a new node can't have uploads yet), it waits: the node is saved without its configured settings, and the server's check lists the node until the file is uploaded.
+
+**How it runs** (contract version 1):
+
+1. The server makes a fresh temporary folder, the configurator's working directory, and deletes it afterwards. It holds `config/`, laid out as the node's folder would have it ([section 5.3](#53-the-node-folder)): the setting files and uploads, as copies.
+2. It writes `request.json` there:
+   ```json
+   { "contract": 1, "plugin": { "id": "http-source", "version": "1.2.0" }, "node_id": "01J…",
+     "launch_args": { "listen": "0.0.0.0:8080", "openapi": "…" }, "fields": ["out_schema"] }
+   ```
+   `launch_args` are the node's settings without secrets and without the configured fields.
+3. It runs the configurator with exactly `--request request.json --response response.json`, in that folder. The environment holds only the variables the plugin would get from its settings (secrets delivered by `env` included), the `PATH` (and `SystemRoot` on Windows), and `TMPDIR` / `TEMP` / `TMP` pointing into the folder.
+4. The configurator writes `response.json` and exits with status 0:
+   ```json
+   { "values": { "out_schema": { "fields": [ … ] } },
+     "files": { "descriptor": "out/api.pb" },
+     "warnings": ["paths./legacy: no requestBody schema; its body is passed as bytes"],
+     "errors": [] }
+   ```
+   - `values`: the configured fields' values. Only fields from `fields`, and not those delivered as uploaded files.
+   - `files`: for configured fields that are uploads (`"source": "upload"`): a path inside the folder to a file it wrote. The server stores the file as one of the node's uploads, under its file name, and sets the field to that name.
+   - `warnings` are logged. Any `errors` (or a non-zero exit, or no `response.json`) refuse the change, and the user sees the `errors` (or the program's last lines of stderr).
+5. The server checks the result: only the requested fields, files inside the folder, regular, and within `[scenes] max_upload_bytes`, and the node's settings with the configured values in place against the launch-args schema and the delivery rules. A configurator that takes longer than `[plugins] configure_timeout_ms` (30 s) is stopped, and `response.json` may hold at most `[plugins] configure_max_response_bytes` (1 MiB).
+
+A configurator must be deterministic for the same input and must not depend on the network: it runs whenever the server needs the result, possibly on another day. It's code from the package, like the plugin, run by the server with the same trust. `flwrs-trellis configure` runs one the way the server does, and `*.configure.toml` test files check it ([trellis](../trellis/README.md)).
+
 ## 4. Remote plugins
 
-A node with `launch = "remote"` runs a plugin someone else starts, possibly on another machine. It gets no node folder, and its launch args are never delivered; a remote node MAY carry launch args only for its per-node payload schemas, which the hub then expects. The plugin is started with the bootstrap arguments of [section 5.1](#51-the-command-line) pointing at the hub's reachable address, and authenticates with the node's pre-shared token or a client certificate ([protocol section 14](protocol.md#14-security)).
+A node with `launch = "remote"` runs a plugin someone else starts, possibly on another machine. It gets no node folder, and its launch args are never delivered; a remote node MAY carry launch args only for its per-node payload schemas, which the hub then expects. Its plugin's configurator ([section 3.6](#36-configured-settings-the-configurator)) can't run on the server for it (the package may be built for the remote machine's platform): either the remote side offers it as an endpoint ([section 4.1](#41-configuring-a-remote-node)), or the remote node sets the configured fields itself, so its out schema is fixed up front.
+
+### 4.1 Configuring a remote node
+
+A remote node whose plugin has a configurator can name an **endpoint** on the remote side that runs it: the same contract ([section 3.6](#36-configured-settings-the-configurator)), as a JSON `POST`. In the node's `config`:
+
+```json
+"configurator": {
+  "url": "https://plugins.example.com/configure",
+  "auth": { "type": "bearer", "token": "…" },
+  "ca": "remote-ca.pem",
+  "send_secrets": false
+}
+```
+
+- `url`: `https://…`, or `http://…` **on a trusted network only** (settings and credentials then cross the network unencrypted; the server's check warns about it). The server must allow it: `[plugins] remote_configurator_urls` lists URL prefixes (a prefix matches itself and what follows it after a `/` or `?`); empty, the default, turns remote configurators off.
+- `auth`: `{"type": "basic", "username", "password"}`, `{"type": "bearer", "token"}`, or `{"type": "mtls", "cert", "key"}` (the node's uploaded PEM files: a client certificate and its key). Passwords, tokens and the key are secrets: never shown by the API, kept when an update leaves them out, and left out of exports unless secrets are included.
+- `ca`: the node's uploaded PEM file with the CA(s) of the endpoint's certificate (default: the bundled Mozilla roots).
+- `send_secrets`: also send the node's secret settings (default: they're left out).
+
+**The request** is the contract's `request.json`, plus `files`: the files `config/` would hold (setting files and uploads), by name, base64-encoded:
+
+```json
+{ "contract": 1, "plugin": { "id": "http-source", "version": "1.2.0" }, "node_id": "01J…",
+  "launch_args": { "openapi": "…" }, "fields": ["out_schema"],
+  "files": { "openapi.json": "eyJvcGVuYXBpIjo…" } }
+```
+
+**The answer** is `200` (any 2xx) with the contract's `response.json`, except that a returned file is a URL the server downloads (with the same credentials and TLS settings):
+
+```json
+{ "values": { "out_schema": { "fields": [ … ] } },
+  "files": { "descriptor": { "name": "api.pb", "url": "https://plugins.example.com/files/api.pb" } },
+  "warnings": [], "errors": [] }
+```
+
+Any other status, `errors`, or a file that can't be downloaded refuses the change; the user sees the errors (or the status and the start of the body). The server sends nothing else to the endpoint and follows no redirects; the request has `[plugins] configure_timeout_ms` to finish, the answer may hold at most `configure_max_response_bytes`, each file `[scenes] max_upload_bytes`, and every URL (the endpoint's and the files') must be within `remote_configurator_urls`.
+
+**When it runs:** as for a local node: when the node's settings, its endpoint (`url`, `send_secrets`) or the plugin's version change (a changed password or token alone doesn't), when a file its settings name is replaced, on a plugin upgrade, and on `POST …/configure`. While a file it needs is missing (a named upload, or the endpoint's CA, certificate or key: a new node has no uploads yet), it waits, and the server's check lists the node. An endpoint that can't be reached refuses the change like any other failure: it likely means the remote node can't be reached either. The plugin is started with the bootstrap arguments of [section 5.1](#51-the-command-line) pointing at the hub's reachable address, and authenticates with the node's pre-shared token or a client certificate ([protocol section 14](protocol.md#14-security)).
 
 ## 5. Launching a local plugin
 

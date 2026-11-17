@@ -75,6 +75,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = TestFormat::Text)]
         format: TestFormat,
     },
+    /// Run the plugin's configurator (manifest `configurator`) the way the
+    /// server does, on --launch-args (and --upload files), and print its result.
+    Configure {
+        #[command(flatten)]
+        plugin: PluginArgs,
+    },
     /// Measure timings and resource use (*.bench.toml, or a default closed loop).
     Bench {
         #[command(flatten)]
@@ -281,6 +287,43 @@ async fn run(command: Command) -> Result<ExitCode, String> {
                     .iter()
                     .any(|r| matches!(r.outcome, Outcome::Fail(_))),
             ))
+        }
+        Command::Configure { plugin } => {
+            let (target, _) = open(&plugin, Profile::Debug)?;
+            let args = match &plugin.launch_args {
+                Some(path) => read_json(path)?,
+                None => serde_json::json!({}),
+            };
+            let ran = tokio::task::spawn_blocking(move || {
+                target.configure(&args).map(|c| {
+                    let files: Vec<serde_json::Value> = c
+                        .files
+                        .iter()
+                        .map(|f| {
+                            let size = std::fs::metadata(&f.path).map(|m| m.len()).unwrap_or(0);
+                            serde_json::json!({"field": f.field, "name": f.name, "size": size})
+                        })
+                        .collect();
+                    serde_json::json!({"values": c.values, "files": files, "warnings": c.warnings})
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            match ran {
+                Ok(result) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(errors) => {
+                    for e in errors {
+                        eprintln!("{e}");
+                    }
+                    Ok(ExitCode::FAILURE)
+                }
+            }
         }
         Command::Bench {
             plugin,

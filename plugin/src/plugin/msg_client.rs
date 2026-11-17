@@ -221,6 +221,24 @@ impl HubClient {
     /// connection is ready and has credit (or the hub didn't enable
     /// `CREDITS`). Sends nothing, so it's cancel-safe. Fails while not
     /// connected, like [`HubClient::send_event`].
+    /// Accepted by the hub, on the current connection.
+    pub(crate) fn is_connected(&self) -> bool {
+        self.stage() >= Stage::Ready
+    }
+
+    /// Whether an event could go out now, without waiting for credit (a
+    /// synchronous probe, e.g. for a readiness endpoint). While the
+    /// connection is busy (another task holds it), it answers yes.
+    pub(crate) fn is_ready(&self) -> bool {
+        if !self.is_connected() {
+            return false;
+        }
+        match self.conn.try_lock() {
+            Ok(guard) => guard.as_ref().is_some_and(|c| c.credit != Some(0)),
+            Err(_) => true,
+        }
+    }
+
     pub(crate) async fn ready(&self) -> io::Result<()> {
         loop {
             let credit = self.credit.notified();

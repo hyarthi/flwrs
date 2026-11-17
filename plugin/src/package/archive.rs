@@ -100,13 +100,11 @@ pub fn extract_and_validate(
         .map_err(|e| invalid(format!("not a valid ZIP archive: {e}")))?;
     let entries = inspect_entries(&mut archive, limits)?;
     let package = read_package(&mut archive, &entries, platform, extra)?;
-    extract(
-        &mut archive,
-        &entries,
-        dest,
-        limits,
-        &package.manifest.executable,
-    )?;
+    let mut executables = vec![package.manifest.executable.as_str()];
+    if let Some(c) = &package.manifest.configurator {
+        executables.push(c.executable.as_str());
+    }
+    extract(&mut archive, &entries, dest, limits, &executables)?;
     Ok(package)
 }
 
@@ -356,7 +354,7 @@ fn extract(
     entries: &[Entry],
     dest: &Path,
     limits: &Limits,
-    executable: &str,
+    executables: &[&str],
 ) -> Result<(), PackageError> {
     fs::create_dir(dest)?;
     let mut written: u64 = 0;
@@ -390,7 +388,9 @@ fn extract(
         set_permissions(&target, entry.unix_mode)?;
     }
     // ZIPs made on Windows don't carry the executable bit.
-    make_executable(&dest.join(executable))?;
+    for executable in executables {
+        make_executable(&dest.join(executable))?;
+    }
     Ok(())
 }
 

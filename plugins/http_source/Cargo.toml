@@ -1,0 +1,46 @@
+[package]
+name = "flwrs-http-source"
+description = "flwrs source plugin: an HTTP server that turns requests into events, routed and validated by an OpenAPI 3.1 document."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "flwrs-http-source"
+path = "src/main.rs"
+
+[[bin]]
+name = "flwrs-http-source-config"
+path = "src/bin/config.rs"
+
+[features]
+default = ["swagger-ui"]
+# Serve Swagger UI for the node's OpenAPI document (its assets are embedded: ~1.5–3 MB).
+swagger-ui = ["dep:utoipa-swagger-ui"]
+
+[dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls"] }
+flwrs-plugin-kit.workspace = true
+flwrs-types.workspace = true
+axum.workspace = true
+tokio.workspace = true
+clap.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+jsonschema.workspace = true
+oas3.workspace = true
+yaml_serde.workspace = true
+pbjson-types.workspace = true
+utoipa-swagger-ui = { workspace = true, features = ["vendored"], optional = true }
+
+[dev-dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls", "package"] }
+flwrs-trellis.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true

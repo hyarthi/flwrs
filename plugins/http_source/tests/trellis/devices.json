@@ -1,0 +1,119 @@
+{
+  "listen": "127.0.0.1:${http}",
+  "openapi": {
+    "openapi": "3.1.0",
+    "info": {
+      "title": "Devices",
+      "version": "1"
+    },
+    "paths": {
+      "/devices/{id}": {
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "post": {
+          "summary": "Report a reading",
+          "parameters": [
+            {
+              "name": "verbose",
+              "in": "query",
+              "schema": {
+                "type": "boolean"
+              }
+            }
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Reading"
+                }
+              },
+              "application/octet-stream": {}
+            }
+          },
+          "responses": {
+            "201": {
+              "description": "Taken"
+            },
+            "400": {
+              "description": "Bad"
+            }
+          }
+        },
+        "get": {
+          "responses": {
+            "200": {
+              "description": "Ping"
+            }
+          }
+        }
+      },
+      "/forms": {
+        "post": {
+          "requestBody": {
+            "content": {
+              "application/x-www-form-urlencoded": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "count": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "204": {
+              "description": "Taken"
+            }
+          }
+        }
+      }
+    },
+    "components": {
+      "schemas": {
+        "Reading": {
+          "type": "object",
+          "required": [
+            "temp"
+          ],
+          "properties": {
+            "temp": {
+              "type": "number",
+              "maximum": 100
+            },
+            "at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "enqueue_timeout_ms": 500,
+  "swagger_ui": {
+    "enabled": true,
+    "path": "/docs"
+  }
+}

@@ -809,7 +809,11 @@ async fn drive(
                 if slept {
                     if counted {
                         let late = woke.saturating_duration_since(at).as_micros().max(1) as u64;
-                        let _ = shared.pacing.lock().unwrap().record(late.min(3_600_000_000));
+                        let _ = shared
+                            .pacing
+                            .lock()
+                            .unwrap()
+                            .record(late.min(3_600_000_000));
                     }
                     woke
                 } else {

@@ -130,6 +130,20 @@ pub(super) async fn set_nodes_plugin_version(
     Ok(())
 }
 
+/// A node's config, rewritten by an upgrade (its configurator's results).
+pub(super) async fn set_node_config(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    config: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE scene_nodes SET config = $1 WHERE id = $2")
+        .bind(config)
+        .bind(node_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Ids of enabled scenes with at least one node using the plugin.
 pub(super) async fn enabled_scenes_using(
     conn: &mut PoolConnection<Sqlite>,

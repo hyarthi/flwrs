@@ -507,25 +507,87 @@ fn subset_value(
 /// The value at a dot path in plain JSON (`a.b`, `a[0]`, `a.b[2].c`).
 pub fn at_path<'a>(json: &'a Json, path: &str) -> Option<&'a Json> {
     let mut current = json;
-    for part in path.split('.') {
-        let (key, indexes) = match part.find('[') {
-            Some(i) => (&part[..i], &part[i..]),
-            None => (part, ""),
+    for step in path_steps(path)? {
+        current = match step {
+            Step::Key(key) => current.get(key)?,
+            Step::Index(n) => current.get(n)?,
         };
-        if !key.is_empty() {
-            current = current.get(key)?;
-        }
-        for index in indexes.split('[').filter(|s| !s.is_empty()) {
-            let n: usize = index.strip_suffix(']')?.parse().ok()?;
-            current = current.get(n)?;
-        }
     }
     Some(current)
+}
+
+enum Step {
+    Key(String),
+    Index(usize),
+}
+
+/// `a.b`, `a[0]`, `a["any key"]` (quoted keys may hold `.`, `/`, `{`, …;
+/// `\"` and `\\` inside them): the dot paths flwrs mappings use.
+fn path_steps(path: &str) -> Option<Vec<Step>> {
+    let mut steps = vec![];
+    let mut chars = path.chars().peekable();
+    let mut key = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '.' => {
+                if !key.is_empty() {
+                    steps.push(Step::Key(std::mem::take(&mut key)));
+                }
+            }
+            '[' => {
+                if !key.is_empty() {
+                    steps.push(Step::Key(std::mem::take(&mut key)));
+                }
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    let mut quoted = String::new();
+                    loop {
+                        match chars.next()? {
+                            '\\' => quoted.push(chars.next()?),
+                            '"' => break,
+                            c => quoted.push(c),
+                        }
+                    }
+                    if chars.next()? != ']' {
+                        return None;
+                    }
+                    steps.push(Step::Key(quoted));
+                } else {
+                    let mut digits = String::new();
+                    loop {
+                        match chars.next()? {
+                            ']' => break,
+                            c => digits.push(c),
+                        }
+                    }
+                    steps.push(Step::Index(digits.parse().ok()?));
+                }
+            }
+            c => key.push(c),
+        }
+    }
+    if !key.is_empty() {
+        steps.push(Step::Key(key));
+    }
+    Some(steps)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_with_quoted_keys() {
+        let json = serde_json::json!({"paths": {"/devices/{id}": {"post": {"body": {"temp": 21.5}}}}, "a": [{"b": 1}], "x.y": 2});
+        assert_eq!(
+            at_path(&json, r#"paths["/devices/{id}"].post.body.temp"#),
+            Some(&serde_json::json!(21.5))
+        );
+        assert_eq!(at_path(&json, "a[0].b"), Some(&serde_json::json!(1)));
+        assert_eq!(at_path(&json, r#"["x.y"]"#), Some(&serde_json::json!(2)));
+        assert_eq!(at_path(&json, "a[x]"), None);
+        assert_eq!(at_path(&json, r#"paths["/devices"#), None);
+    }
     use flwrs_plugin::schema::rules::parse_json;
     use serde_json::json;
 

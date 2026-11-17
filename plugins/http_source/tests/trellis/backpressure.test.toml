@@ -1,0 +1,28 @@
+# Without credit, a request waits enqueue_timeout_ms (500) and gets 503.
+# With credit again, requests go through.
+name = "backpressure is HTTP 503"
+launch_args = "backpressure.json"
+initial_credit = 0
+return_credit = false
+
+[[steps]]
+wait_ms = 1000
+
+# No credit: the request waits 500 ms, then 503 (no event).
+[[steps]]
+stimulus = true
+
+[[steps]]
+wait_ms = 800
+expect_outputs = [{ count = 0 }]
+
+[[steps]]
+grant = 1
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ path = "method", eq = "POST" }]
+
+# Let the last answer go out before the plugin stops.
+[[steps]]
+wait_ms = 300

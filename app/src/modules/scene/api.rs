@@ -266,6 +266,7 @@ async fn disable_scene(
         api_graph::get_node,
         api_graph::update_node,
         api_graph::delete_node,
+        api_graph::configure_node,
         api_graph::list_edges,
         api_graph::create_edge,
         api_graph::get_edge,

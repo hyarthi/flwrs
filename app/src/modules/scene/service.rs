@@ -1,9 +1,12 @@
+#[cfg(all(test, unix))]
+mod configure_tests;
 mod query_sqlite;
 mod transfer;
 mod uploads;
 
 pub(crate) use uploads::{NodeFiles, NodeUpload, stored_name};
 
+use crate::modules::configurator;
 use crate::modules::director::DirectorHandle;
 use crate::modules::director::handle::{SceneState, SceneStatus};
 use crate::modules::mapping::{self, MappingSpec};
@@ -15,6 +18,7 @@ use crate::modules::plugin::service::{
 use crate::modules::scene::graph;
 use chrono::Local;
 use flwrs_core::db::{Database, DbError};
+use flwrs_plugin::package::configure::{self, Configured};
 use flwrs_plugin::schema::payload::SchemaDefinition;
 use query_sqlite::{EdgeValues, NodeValues};
 use serde_json::Value;
@@ -460,6 +464,51 @@ impl Service {
                     .map(|p| format!("{label}: {p}")),
             );
             let rules = NodeRules::of(&plugin).map_err(ServiceError::Unknown)?;
+            // A local node's configured fields come from its plugin's configurator.
+            if let Some(c) = &node.config.configurator {
+                if !configurator::url_allowed(
+                    &self.plugins.config().remote_configurator_urls,
+                    &c.url,
+                ) {
+                    check.problems.push(format!(
+                        "{label}: config.configurator.url {} isn't within [plugins] remote_configurator_urls",
+                        c.url
+                    ));
+                }
+                if c.url.to_ascii_lowercase().starts_with("http://") {
+                    check.warnings.push(format!(
+                        "{label}: config.configurator.url is plain http: the node's settings (and credentials) cross the network unencrypted; use it on a trusted network only"
+                    ));
+                }
+            }
+            let configured_here = node.config.launch
+                == crate::modules::node_config::LaunchMode::Local
+                || node.config.configurator.is_some();
+            if configured_here && !rules.spec.configured_fields().is_empty() {
+                // A configurator may leave some of its fields unset; none set
+                // means it hasn't run (e.g. waiting for an upload, or imported).
+                let never_ran = !rules
+                    .spec
+                    .configured_fields()
+                    .iter()
+                    .any(|f| node.config.launch_args.get(f.as_str()).is_some());
+                let stale = node.plugin_version.as_deref() != Some(plugin.version.as_str());
+                if never_ran || stale {
+                    let why = if never_ran {
+                        "its plugin's configurator hasn't set its configured settings yet"
+                            .to_string()
+                    } else {
+                        format!(
+                            "its configured settings come from another version of plugin {} than {}",
+                            plugin.id, plugin.version
+                        )
+                    };
+                    check.problems.push(format!(
+                        "{label}: {why}; run its configurator: POST …/nodes/by-id/{}/configure (or save the node)",
+                        node.id
+                    ));
+                }
+            }
             if !rules.spec.code_fields().is_empty()
                 && rules.code_problems(&node.config.launch_args).is_none()
             {
@@ -691,15 +740,11 @@ impl Service {
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        let prepared = self.prepare_node(input, None, &scene.defaults).await?;
+        let id = Ulid::generate().to_string();
+        let prepared = self.prepare_node(&id, input, None, &scene.defaults).await?;
         let mut tx = conn.begin_with(WRITE_TX).await?;
-        let row = query_sqlite::insert_node(
-            &mut tx,
-            scene_id,
-            &Ulid::generate().to_string(),
-            &prepared.values(),
-        )
-        .await?;
+        let row = query_sqlite::insert_node(&mut tx, scene_id, &id, &prepared.values()).await?;
+        self.store_configured(&mut tx, &id, &prepared).await?;
         tx.commit().await?;
         self.changed(&scene);
         self.with_secrets(row.try_into()?).await
@@ -721,10 +766,11 @@ impl Service {
             .map_err(not_found("node"))?
             .try_into()?;
         let prepared = self
-            .prepare_node(input, Some(&existing), &scene.defaults)
+            .prepare_node(id, input, Some(&existing), &scene.defaults)
             .await?;
         let mut tx = conn.begin_with(WRITE_TX).await?;
         let row = query_sqlite::update_node(&mut tx, scene_id, id, &prepared.values()).await?;
+        self.store_configured(&mut tx, id, &prepared).await?;
         // A new plugin type or queue policy can break edges that were valid before.
         check_graph(&mut tx, scene_id).await?;
         tx.commit().await?;
@@ -768,6 +814,7 @@ impl Service {
     /// kept if the request omits them.
     async fn prepare_node(
         &self,
+        node_id: &str,
         input: NodeInput,
         existing: Option<&Node>,
         defaults: &SceneDefaults,
@@ -798,6 +845,15 @@ impl Service {
         {
             config.token = existing.config.token.clone();
         }
+        // The configurator endpoint's secrets too (same auth type and user).
+        if let (Some(config), Some(existing)) = (config.as_mut(), existing)
+            && let (Some(new), Some(old)) = (
+                config.configurator.as_mut(),
+                existing.config.configurator.as_ref(),
+            )
+        {
+            new.keep_secrets(old);
+        }
         // Secrets the request leaves out are kept (same plugin); `null` clears one.
         if let (Some(plugin), Some(config)) = (&plugin, config.as_mut()) {
             let rules = NodeRules::of(plugin).map_err(ServiceError::Unknown)?;
@@ -806,6 +862,26 @@ impl Service {
                 .filter(|e| e.plugin_id == plugin.id)
                 .map_or(&empty, |e| &e.config.launch_args);
             config.launch_args = rules.merge_secrets(&config.launch_args, before);
+        }
+        let mut configured = None;
+        let mut pending: &[String] = &[];
+        let rules = plugin
+            .as_ref()
+            .map(NodeRules::of)
+            .transpose()
+            .map_err(ServiceError::Unknown)?;
+        if let (Some(plugin), Some(config)) = (&plugin, config.as_mut())
+            && errors.is_empty()
+        {
+            match self.configure(node_id, plugin, config, existing).await? {
+                // The configurator's own errors are the answer.
+                Err(problems) => return Err(ServiceError::Invalid(problems)),
+                Ok(Configure::Ran(c)) => configured = Some(c),
+                Ok(Configure::Pending) => {
+                    pending = rules.as_ref().map_or(&[], |r| r.spec.configured_fields());
+                }
+                Ok(Configure::Kept | Configure::NotApplicable) => {}
+            }
         }
         if let (Some(plugin), Some(t)) = (&plugin, &input.node_type)
             && *t != plugin.plugin_type
@@ -816,7 +892,17 @@ impl Service {
             ));
         }
         if let (Some(plugin), Some(config)) = (&plugin, &config) {
-            errors.extend(validate_against_plugin(config, plugin, defaults)?);
+            // Waiting for an upload, the configured fields aren't set yet:
+            // that's for `check` to report, not a reason to refuse the node.
+            errors.extend(
+                validate_against_plugin(config, plugin, defaults)?
+                    .into_iter()
+                    .filter(|e| {
+                        !pending
+                            .iter()
+                            .any(|f| e.starts_with(&format!("config.launch_args/{f}")))
+                    }),
+            );
         }
         if !errors.is_empty() {
             return Err(ServiceError::Invalid(errors));
@@ -829,7 +915,237 @@ impl Service {
             plugin_id: plugin.id,
             plugin_version: Some(plugin.version),
             config_json: serde_json::to_string(&config).expect("config serializes"),
+            configured,
         })
+    }
+
+    /// The configurator step of saving a local node whose plugin has one:
+    /// values sent for its fields must be the stored ones (it sets them);
+    /// it runs when the other settings (or the plugin's version) changed, and
+    /// the stored values are kept otherwise. `Ok(Err(..))`: the request's
+    /// problems.
+    async fn configure(
+        &self,
+        node_id: &str,
+        plugin: &Plugin,
+        config: &mut NodeConfig,
+        existing: Option<&Node>,
+    ) -> Result<Result<Configure, Vec<String>>, ServiceError> {
+        // A remote node runs its configurator at its endpoint, if it has one;
+        // without one, it sets the configured fields itself.
+        let remote = match config.launch {
+            crate::modules::node_config::LaunchMode::Local => None,
+            crate::modules::node_config::LaunchMode::Remote => match &config.configurator {
+                None => return Ok(Ok(Configure::NotApplicable)),
+                Some(c) => Some(c.clone()),
+            },
+        };
+        let Some(package) = configurator::PackageRef::of(plugin).filter(|p| p.has_configurator())
+        else {
+            return Ok(Ok(Configure::NotApplicable));
+        };
+        let rules = NodeRules::of(plugin).map_err(ServiceError::Unknown)?;
+        let stored =
+            existing.filter(|e| e.plugin_id == plugin.id && e.config.launch == config.launch);
+        let mut errors = vec![];
+        for field in rules.spec.configured_fields() {
+            if let Some(value) = config.launch_args.get(field)
+                && stored.and_then(|e| e.config.launch_args.get(field)) != Some(value)
+            {
+                errors.push(format!(
+                    "launch_args/{field} is set by the plugin's configurator (leave it out, or send the stored value)"
+                ));
+            }
+        }
+        if !errors.is_empty() {
+            return Ok(Err(errors));
+        }
+        let user_part = |args: &Value| configure::without_configured(&rules.spec, args);
+        // It runs when the settings, the endpoint or the plugin's version changed.
+        if let Some(stored) = stored
+            && stored.plugin_version.as_deref() == Some(plugin.version.as_str())
+            && user_part(&stored.config.launch_args) == user_part(&config.launch_args)
+            && match (&remote, &stored.config.configurator) {
+                (None, _) => true,
+                (Some(r), Some(s)) => r.same_target(s),
+                (Some(_), None) => false,
+            }
+        {
+            config.launch_args = stored.config.launch_args.clone();
+            return Ok(Ok(Configure::Kept));
+        }
+        let mut conn = self.conn().await?;
+        let uploads = configurator::uploads(&mut conn, &self.files.files_dir, node_id).await?;
+        drop(conn);
+        // A file the settings name may not be uploaded yet (a new node can't
+        // have uploads): the configurator runs once it is (`put_upload`);
+        // meanwhile the node lacks its configured settings (a `check` problem).
+        let endpoint_files = remote.as_ref().map(|r| r.uploads()).unwrap_or_default();
+        if rules
+            .uploads_referenced(&config.launch_args)
+            .iter()
+            .any(|(_, name, _)| !uploads.contains_key(name))
+            || endpoint_files
+                .iter()
+                .any(|name| !uploads.contains_key(*name))
+        {
+            config.launch_args = user_part(&config.launch_args);
+            return Ok(Ok(Configure::Pending));
+        }
+        Ok(self
+            .run_configurator(
+                &package,
+                node_id,
+                &config.launch_args,
+                uploads,
+                remote.as_ref(),
+            )
+            .await
+            .map(|c| {
+                config.launch_args = c.launch_args.clone();
+                Configure::Ran(c)
+            }))
+    }
+
+    async fn run_configurator(
+        &self,
+        package: &configurator::PackageRef,
+        node_id: &str,
+        launch_args: &Value,
+        uploads: HashMap<String, std::path::PathBuf>,
+        remote: Option<&crate::modules::node_config::RemoteConfigurator>,
+    ) -> Result<Configured, Vec<String>> {
+        let limits = self.configure_limits();
+        let ran = match remote {
+            None => configurator::run(package, launch_args, node_id, uploads, &limits).await,
+            #[cfg(feature = "remote")]
+            Some(remote) => {
+                let allowed = &self.plugins.config().remote_configurator_urls;
+                configurator::run_remote(
+                    package,
+                    remote,
+                    launch_args,
+                    node_id,
+                    uploads,
+                    &limits,
+                    allowed,
+                )
+                .await
+            }
+            #[cfg(not(feature = "remote"))]
+            Some(_) => Err(vec!["remote nodes aren't supported by this build".into()]),
+        };
+        let configured = ran.map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|e| format!("configurator: {e}"))
+                .collect::<Vec<_>>()
+        })?;
+        for warning in &configured.warnings {
+            log::info!("Scene service: node [{node_id}]: configurator: {warning}");
+        }
+        Ok(configured)
+    }
+
+    pub(crate) fn configure_limits(&self) -> configurator::Limits {
+        let c = self.plugins.config();
+        configurator::Limits {
+            timeout: std::time::Duration::from_millis(c.configure_timeout_ms),
+            max_response_bytes: c.configure_max_response_bytes,
+            max_file_bytes: self.files.max_upload_bytes,
+        }
+    }
+
+    /// Stores a configurator's files as the node's uploads (in `tx`).
+    async fn store_configured(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        node_id: &str,
+        prepared: &PreparedNode,
+    ) -> Result<(), ServiceError> {
+        if let Some(configured) = &prepared.configured {
+            configurator::store_files(tx, &self.files.files_dir, node_id, configured)
+                .await
+                .map_err(ServiceError::Unknown)?;
+        }
+        Ok(())
+    }
+
+    /// Runs a local node's configurator again (e.g. after an import from a
+    /// server with another version of the plugin) and stores the result.
+    pub(crate) async fn reconfigure_node(
+        &self,
+        scene_id: &str,
+        id: &str,
+    ) -> Result<Node, ServiceError> {
+        let _guard = self.lock.lock().await;
+        let mut conn = self.conn().await?;
+        let scene = query_sqlite::get_scene(&mut conn, scene_id)
+            .await
+            .map_err(not_found("scene"))?;
+        let node: Node = query_sqlite::get_node(&mut conn, scene_id, id)
+            .await
+            .map_err(not_found("node"))?
+            .try_into()?;
+        let plugin = match self.plugins.get(&node.plugin_id).await {
+            Ok(p) => p,
+            Err(PluginError::NotFound) => {
+                return Err(ServiceError::Invalid(vec![format!(
+                    "plugin {} isn't installed",
+                    node.plugin_id
+                )]));
+            }
+            Err(e) => return Err(ServiceError::Unknown(e.to_string())),
+        };
+        let package = configurator::PackageRef::of(&plugin)
+            .filter(|p| p.has_configurator())
+            .ok_or_else(|| {
+                ServiceError::Invalid(vec![format!("plugin {} has no configurator", plugin.id)])
+            })?;
+        let remote = match node.config.launch {
+            crate::modules::node_config::LaunchMode::Local => None,
+            crate::modules::node_config::LaunchMode::Remote => match &node.config.configurator {
+                Some(c) => Some(c.clone()),
+                None => {
+                    return Err(ServiceError::Invalid(vec![
+                        "a remote node without config.configurator sets its configured fields itself".into(),
+                    ]));
+                }
+            },
+        };
+        let uploads = configurator::uploads(&mut conn, &self.files.files_dir, id).await?;
+        let configured = self
+            .run_configurator(
+                &package,
+                id,
+                &node.config.launch_args,
+                uploads,
+                remote.as_ref(),
+            )
+            .await
+            .map_err(ServiceError::Invalid)?;
+        let mut config = node.config.clone();
+        config.launch_args = configured.launch_args.clone();
+        let mut errors = validate_against_plugin(&config, &plugin, &scene.defaults)?;
+        if !errors.is_empty() {
+            errors.insert(0, "the configured node isn't valid".into());
+            return Err(ServiceError::Invalid(errors));
+        }
+        let prepared = PreparedNode {
+            name: node.name.clone(),
+            node_type: plugin.plugin_type.clone(),
+            plugin_id: plugin.id.clone(),
+            plugin_version: Some(plugin.version.clone()),
+            config_json: serde_json::to_string(&config).expect("config serializes"),
+            configured: Some(configured),
+        };
+        let mut tx = conn.begin_with(WRITE_TX).await?;
+        let row = query_sqlite::update_node(&mut tx, scene_id, id, &prepared.values()).await?;
+        self.store_configured(&mut tx, id, &prepared).await?;
+        tx.commit().await?;
+        self.collect_garbage(&mut conn).await?;
+        self.changed(&scene);
+        self.with_secrets(row.try_into()?).await
     }
 
     // ----- edges -----
@@ -979,12 +1295,26 @@ impl Service {
     }
 }
 
+/// What the configurator step of saving a node did.
+enum Configure {
+    /// It ran: its result.
+    Ran(Configured),
+    /// The settings didn't change: the stored configured values are kept.
+    Kept,
+    /// A file the settings name isn't uploaded yet: it runs once it is.
+    Pending,
+    /// A remote node, or a plugin without a configurator.
+    NotApplicable,
+}
+
 struct PreparedNode {
     name: Option<String>,
     node_type: String,
     plugin_id: String,
     plugin_version: Option<String>,
     config_json: String,
+    /// The configurator's run, if it ran: its files become the node's uploads.
+    configured: Option<flwrs_plugin::package::configure::Configured>,
 }
 
 impl PreparedNode {
@@ -1166,7 +1496,14 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn fixture() -> Fixture {
-        let plugins = plugin_fixture(|_| {}).await;
+        fixture_with(|_| {}).await
+    }
+
+    /// A fixture with the plugin registry's settings adjusted.
+    pub(crate) async fn fixture_with(
+        config: impl FnOnce(&mut crate::modules::plugin::config::PluginsConfig),
+    ) -> Fixture {
+        let plugins = plugin_fixture(config).await;
         // test-sink: a SINK with a launch-args schema (timeout: integer >= 1)
         plugins
             .service

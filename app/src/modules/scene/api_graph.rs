@@ -8,7 +8,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -356,6 +356,26 @@ pub(crate) async fn delete_edge(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    post,
+    path = "/by-id/{id}/nodes/by-id/{node_id}/configure",
+    operation_id = "configure-node",
+    summary = "Run a node's configurator again",
+    description = "For a local node whose plugin has a configurator (manifest `configurator`): runs it on the node's current settings and stores the fields it sets. Saving a node does this by itself when its settings change; this is for the cases where they didn't, e.g. after importing a scene that was configured by another version of the plugin.",
+    params(("id" = String, Path, description = "Scene ID"), ("node_id" = String, Path, description = "Node ID")),
+    responses(
+        (status = 200, description = "The node, configured", body = Node),
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 422, description = "No configurator, a remote node, or the configurator failed", body = ErrorBody),
+    )
+)]
+pub(crate) async fn configure_node(
+    State(service): State<Svc>,
+    Path((id, node_id)): Path<(String, String)>,
+) -> Result<Json<Node>, ApiError> {
+    Ok(Json(service.reconfigure_node(&id, &node_id).await?.into()))
+}
+
 pub(super) fn routes() -> Router<Svc> {
     Router::new()
         .route(
@@ -365,6 +385,10 @@ pub(super) fn routes() -> Router<Svc> {
         .route(
             "/scenes/by-id/{id}/nodes/by-id/{node_id}",
             get(get_node).put(update_node).delete(delete_node),
+        )
+        .route(
+            "/scenes/by-id/{id}/nodes/by-id/{node_id}/configure",
+            post(configure_node),
         )
         .route(
             "/scenes/by-id/{id}/edges",

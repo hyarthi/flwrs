@@ -119,7 +119,7 @@ expect_outputs = [{ match = "subset", payload = "expected/in.json" }]
 - **`expect_outputs`**:
   - Positional items: the first item checks the first output, and so on.
     - `payload`: compare with a file, `match = "exact"` (the default) or `"subset"`.
-    - `path` with `eq`, `ne`, `gt`, `ge`, `lt`, `le`, `contains` or `exists`: check a value inside the output.
+    - `path` with `eq`, `ne`, `gt`, `ge`, `lt`, `le`, `contains` or `exists`: check a value inside the output. Paths are dot paths: `a.b`, `items[0]`, and quoted keys for unusual names, `paths["/devices/{id}"].post.body.temp`.
   - `count`: how many outputs came.
   - `same_as_step = N`: the outputs equal step N's.
   - Without `count`, the number of positional items is the number of outputs expected.
@@ -127,6 +127,31 @@ expect_outputs = [{ match = "subset", payload = "expected/in.json" }]
 - **Settings** for the whole file: `args`, `env`, `setup` / `teardown` commands, `initial_credit`, `return_credit` and `within_ms` (how long a step waits).
 - **Variables**: `${port}` is a free port for the run (also in `TRELLIS_PORT`). `${name}` comes from `--var name=value` or `Tester::var`. Both are replaced in payload files, launch args, args and commands.
 - **Payload files**: a file named `*.pb.json` holds proto3 JSON of a `PluginPayload` instead of plain JSON. In plain JSON, DATETIME values are RFC 3339 strings, and BYTES are a UTF-8 string or an array of numbers.
+
+## `configure`
+
+For plugins with a **configurator** (manifest `configurator`: a program that sets some of a node's settings from its others; see the plugin specification). `configure` runs it the way the server does, on `--launch-args` (and `--upload` files), and prints its result:
+
+```sh
+flwrs-trellis configure path/to/plugin --launch-args node.json
+```
+
+`with_launch_args` (and so `test`, `audit` and `bench`) run the configurator too, so the plugin gets what it would get on the server. Values the launch args give for configured fields are refused, as the server refuses them.
+
+Configurator tests are `*.configure.toml` files, run by `test` next to the behavioural ones:
+
+```toml
+# tests/devices.configure.toml
+name = "derives the out schema"
+launch_args = "devices.json"                 # the node's settings (configured fields left out)
+uploads = { "api.yaml" = "api.yaml" }        # optional
+expect = "ok"                                # or "error"
+values = "expected/devices.values.json"      # optional: the configured values, exactly (--update writes them)
+warnings_contain = ["webhooks"]              # optional
+# errors_contain = ["oneOf"]                 # with expect = "error"
+```
+
+In Rust, `Target::with_configurator_executable(env!("CARGO_BIN_EXE_<name>-config"))` runs the configurator cargo built, and `Target::configure(&args)` runs it alone.
 
 ## `bench`
 

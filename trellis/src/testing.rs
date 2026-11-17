@@ -267,6 +267,10 @@ impl Tester {
     }
 
     pub async fn run_file(&mut self, path: &Path) -> TestResult {
+        if crate::configure_test::is_configure_test(path) {
+            return crate::configure_test::run_file(&self.target, path, &self.vars, self.update)
+                .await;
+        }
         match TestFile::read(path) {
             Ok(file) => {
                 let mut result = self.run(&file).await;

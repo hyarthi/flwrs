@@ -35,6 +35,16 @@ pub(crate) async fn init(director: DirectorHandle) -> &'static Service {
                 max_import_bytes: limits.max_import_bytes,
                 max_import_entries: limits.max_import_entries,
             };
+            plugin::service().set_configure_env(crate::modules::configurator::Env {
+                files_dir: files.files_dir.clone(),
+                limits: crate::modules::configurator::Limits {
+                    timeout: std::time::Duration::from_millis(
+                        plugin::service().config().configure_timeout_ms,
+                    ),
+                    max_response_bytes: plugin::service().config().configure_max_response_bytes,
+                    max_file_bytes: files.max_upload_bytes,
+                },
+            });
             let service = Service::new(main_db().await, plugin::service(), director, files);
             if let Err(e) = service.clean_files().await {
                 log::warn!("Scene service: couldn't clean up uploaded files: {e}");

@@ -110,6 +110,17 @@ pub(crate) struct Service {
     director: DirectorHandle,
     /// Serializes registry changes, so folder swaps and DB writes never interleave.
     lock: Mutex<()>,
+    /// Where uploads are and a configurator's limits (set by the scene
+    /// service at start-up): an upgrade runs the new package's configurator.
+    configure_env: std::sync::OnceLock<crate::modules::configurator::Env>,
+}
+
+/// A node an upgrade re-configured: its new config, and the run (its files
+/// become the node's uploads).
+struct Reconfigured {
+    node_id: String,
+    config: String,
+    configured: flwrs_plugin::package::configure::Configured,
 }
 
 /// Removes a file or folder when dropped (unless disarmed).
@@ -154,7 +165,13 @@ impl Service {
             platform,
             director,
             lock: Mutex::new(()),
+            configure_env: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Where uploads are and a configurator's limits; set once at start-up.
+    pub(crate) fn set_configure_env(&self, env: crate::modules::configurator::Env) {
+        let _ = self.configure_env.set(env);
     }
 
     #[cfg(test)]
@@ -343,7 +360,7 @@ impl Service {
         if !errors.is_empty() {
             return Err(ServiceError::InvalidPackage(errors));
         }
-        self.check_nodes_against(&package).await?;
+        let reconfigured = self.check_nodes_against(&package, &staged).await?;
 
         // A new version goes into its own folder; the old one stays until
         // the next start (running nodes may still use it). The same version
@@ -377,7 +394,23 @@ impl Service {
                 return Err(e.into());
             }
         };
-        query_sqlite::set_nodes_plugin_version(&mut conn, &plugin.id, &plugin.version).await?;
+        // The nodes now follow the new version (and its configurator's results).
+        let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
+        query_sqlite::set_nodes_plugin_version(&mut tx, &plugin.id, &plugin.version).await?;
+        if let Some(env) = self.configure_env.get() {
+            for node in &reconfigured {
+                query_sqlite::set_node_config(&mut tx, &node.node_id, &node.config).await?;
+                crate::modules::configurator::store_files(
+                    &mut tx,
+                    &env.files_dir,
+                    &node.node_id,
+                    &node.configured,
+                )
+                .await
+                .map_err(ServiceError::Internal)?;
+            }
+        }
+        tx.commit().await?;
         if had_folder && let Err(e) = tokio::fs::remove_dir_all(&parked).await {
             log::warn!(
                 "Plugin registry: couldn't remove old package [{}]: {e}",
@@ -493,13 +526,27 @@ impl Service {
 
     /// Re-validates every node using the plugin against the new package:
     /// local nodes' `launch_args` (schema, delivery, code), and every node's
-    /// payload schemas when the package takes them from the node.
-    async fn check_nodes_against(&self, package: &Package) -> Result<(), ServiceError> {
+    /// payload schemas when the package takes them from the node. With a
+    /// configurator, it runs (from `staged`) for every local node first;
+    /// their new configs are returned, to be stored with the upgrade.
+    async fn check_nodes_against(
+        &self,
+        package: &Package,
+        staged: &Path,
+    ) -> Result<Vec<Reconfigured>, ServiceError> {
         let mut conn = self.conn().await?;
         let nodes = query_sqlite::nodes_using(&mut conn, &package.manifest.id).await?;
         if nodes.is_empty() {
-            return Ok(());
+            return Ok(vec![]);
         }
+        let configurator = package.manifest.configurator.is_some().then(|| {
+            crate::modules::configurator::PackageRef {
+                dir: staged.to_path_buf(),
+                manifest: package.manifest.clone(),
+                launch_args_schema: package.launch_args_schema.clone(),
+            }
+        });
+        let mut reconfigured = vec![];
         let rules = NodeRules::from_parts(
             package.manifest.clone(),
             &package.launch_args_schema,
@@ -509,13 +556,74 @@ impl Service {
         .map_err(ServiceError::Internal)?;
         let mut problems = vec![];
         for (node_id, config) in nodes {
-            let config: serde_json::Value = serde_json::from_str(&config).unwrap_or_default();
-            let args = config
+            let mut config: serde_json::Value = serde_json::from_str(&config).unwrap_or_default();
+            let mut args = config
                 .get("launch_args")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
             let remote = config.get("launch").and_then(|l| l.as_str()) == Some("remote");
             let mut errors = vec![];
+            // A remote node runs it at its endpoint, if it has one.
+            let endpoint: Option<crate::modules::node_config::RemoteConfigurator> = config
+                .get("configurator")
+                .and_then(|c| serde_json::from_value(c.clone()).ok());
+            if let Some(package_ref) = &configurator
+                && (!remote || endpoint.is_some())
+            {
+                let Some(env) = self.configure_env.get() else {
+                    return Err(ServiceError::Internal(
+                        "configurators can't run: no uploads folder set".into(),
+                    ));
+                };
+                let uploads =
+                    crate::modules::configurator::uploads(&mut conn, &env.files_dir, &node_id)
+                        .await?;
+                let ran = match &endpoint {
+                    None => {
+                        crate::modules::configurator::run(
+                            package_ref,
+                            &args,
+                            &node_id,
+                            uploads,
+                            &env.limits,
+                        )
+                        .await
+                    }
+                    #[cfg(feature = "remote")]
+                    Some(endpoint) => {
+                        crate::modules::configurator::run_remote(
+                            package_ref,
+                            endpoint,
+                            &args,
+                            &node_id,
+                            uploads,
+                            &env.limits,
+                            &self.config.remote_configurator_urls,
+                        )
+                        .await
+                    }
+                    #[cfg(not(feature = "remote"))]
+                    Some(_) => Err(vec!["remote nodes aren't supported by this build".into()]),
+                };
+                match ran {
+                    Ok(configured) => {
+                        args = configured.launch_args.clone();
+                        config["launch_args"] = args.clone();
+                        reconfigured.push(Reconfigured {
+                            node_id: node_id.clone(),
+                            config: config.to_string(),
+                            configured,
+                        });
+                    }
+                    Err(e) => {
+                        problems.extend(
+                            e.into_iter()
+                                .map(|e| format!("node {node_id}: configurator: {e}")),
+                        );
+                        continue;
+                    }
+                }
+            }
             if !remote {
                 errors.extend(rules.validate_launch_args(&args));
                 errors.extend(rules.code_problems(&args).unwrap_or_default());
@@ -526,7 +634,7 @@ impl Service {
             problems.extend(errors.into_iter().map(|e| format!("node {node_id}: {e}")));
         }
         if problems.is_empty() {
-            Ok(())
+            Ok(reconfigured)
         } else {
             Err(ServiceError::IncompatibleNodes(problems))
         }

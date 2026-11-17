@@ -68,7 +68,7 @@ impl Service {
                 Ok(plugin) => NodeRules::of(&plugin).ok(),
                 Err(_) => None,
             };
-            let secret_uploads: Vec<String> = rules
+            let mut secret_uploads: Vec<String> = rules
                 .as_ref()
                 .map(|r| {
                     r.uploads_referenced(&node.config.launch_args)
@@ -78,8 +78,18 @@ impl Service {
                         .collect()
                 })
                 .unwrap_or_default();
+            // The configurator endpoint's client key is a secret too.
+            if let Some(crate::modules::node_config::ConfiguratorAuth::Mtls { key, .. }) = node
+                .config
+                .configurator
+                .as_ref()
+                .and_then(|c| c.auth.as_ref())
+            {
+                secret_uploads.push(key.clone());
+            }
             if !include_secrets {
                 config.token = None;
+                config.configurator = config.configurator.map(|c| c.without_secrets());
                 if let Some(rules) = &rules {
                     omitted_secrets = rules
                         .secrets_set(&config.launch_args)
