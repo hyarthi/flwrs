@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WebSocket sink settings",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "url"
+  ],
+  "properties": {
+    "url": {
+      "type": "string",
+      "pattern": "^(?i)wss?://",
+      "title": "URL",
+      "description": "ws://… or wss://… (TLS).",
+      "x-flwrs-order": 1
+    },
+    "allowed_urls": {
+      "title": "Allowed URLs",
+      "description": "URL prefixes events may name their own url within (a prefix matches itself, and what follows it after a / or ?). Without them, an event can't choose a URL.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(?i)wss?://"
+      },
+      "x-flwrs-order": 2
+    },
+    "ack": {
+      "title": "Acknowledge",
+      "description": "write: once the message is written to the connection (at most once over the wire: a message in flight when the connection drops is lost). reply: once the server answered it (at least once).",
+      "enum": [
+        "write",
+        "reply"
+      ],
+      "default": "write",
+      "x-flwrs-order": 3
+    },
+    "message_type": {
+      "title": "Message type",
+      "description": "For events that don't set one. Text must be UTF-8.",
+      "enum": [
+        "text",
+        "binary"
+      ],
+      "default": "text",
+      "x-flwrs-order": 4
+    },
+    "request_id_path": {
+      "title": "Request id path",
+      "description": "ack reply: a JSON path (e.g. id or meta.request_id) where a generated id (or the event's correlation_id) is put into the outgoing JSON. Without it, the data must carry the event's correlation_id itself.",
+      "type": "string",
+      "minLength": 1,
+      "x-flwrs-group": "Replies",
+      "x-flwrs-order": 10
+    },
+    "reply_id_path": {
+      "title": "Reply id path",
+      "description": "ack reply: where a reply's id is in the incoming JSON.",
+      "type": "string",
+      "minLength": 1,
+      "x-flwrs-group": "Replies",
+      "x-flwrs-order": 11
+    },
+    "reply_error_path": {
+      "title": "Reply error path",
+      "description": "ack reply: a reply with a value here (not null or false) is a failure (NACK, not retried).",
+      "type": "string",
+      "minLength": 1,
+      "x-flwrs-group": "Replies",
+      "x-flwrs-order": 12
+    },
+    "reply_timeout_ms": {
+      "title": "Reply timeout (ms)",
+      "description": "ack reply: no reply in time is a retryable NACK.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295,
+      "default": 10000,
+      "x-flwrs-group": "Replies",
+      "x-flwrs-order": 13
+    },
+    "authorization": {
+      "title": "Authorization",
+      "description": "The Authorization header's value (e.g. Bearer …), for every URL.",
+      "type": "string",
+      "writeOnly": true,
+      "x-flwrs-launch": {
+        "via": "env",
+        "alias": "WS_AUTHORIZATION"
+      },
+      "x-flwrs-group": "Handshake",
+      "x-flwrs-order": 20
+    },
+    "headers": {
+      "title": "Headers",
+      "description": "Extra handshake headers (not secret).",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "x-flwrs-group": "Handshake",
+      "x-flwrs-order": 21
+    },
+    "subprotocols": {
+      "title": "Subprotocols",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "x-flwrs-group": "Handshake",
+      "x-flwrs-order": 22
+    },
+    "origin": {
+      "title": "Origin",
+      "type": "string",
+      "x-flwrs-group": "Handshake",
+      "x-flwrs-order": 23
+    },
+    "tls_ca": {
+      "title": "CA certificate",
+      "description": "Uploaded PEM file with the CA(s) of the server's certificate. Default: the bundled Mozilla roots.",
+      "type": "string",
+      "x-flwrs-launch": {
+        "via": "file",
+        "source": "upload"
+      },
+      "x-flwrs-group": "TLS",
+      "x-flwrs-order": 20
+    },
+    "tls_cert": {
+      "title": "Client certificate",
+      "description": "Uploaded PEM file: a client certificate (mTLS), with tls_key.",
+      "type": "string",
+      "x-flwrs-launch": {
+        "via": "file",
+        "source": "upload"
+      },
+      "x-flwrs-group": "TLS",
+      "x-flwrs-order": 21
+    },
+    "tls_key": {
+      "title": "Client key",
+      "description": "Uploaded PEM file: the client certificate's private key.",
+      "type": "string",
+      "x-flwrs-launch": {
+        "via": "file",
+        "source": "upload"
+      },
+      "x-flwrs-group": "TLS",
+      "x-flwrs-order": 22,
+      "writeOnly": true
+    },
+    "insecure_skip_verify": {
+      "title": "Skip certificate checks",
+      "description": "Development only: accept any server certificate.",
+      "type": "boolean",
+      "default": false,
+      "x-flwrs-group": "TLS",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 23
+    },
+    "lazy_connect": {
+      "title": "Connect lazily",
+      "description": "Connect with the first event instead of at start (where a wrong URL or credentials show at once).",
+      "type": "boolean",
+      "default": false,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 30
+    },
+    "ping_interval_s": {
+      "title": "Ping interval (s)",
+      "description": "A ping unanswered by the next one means a dead connection (then it's redialled).",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400,
+      "default": 20,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 31
+    },
+    "max_message_bytes": {
+      "title": "Max message size",
+      "description": "Bytes, sent or received; a larger event is rejected (not retried).",
+      "type": "integer",
+      "minimum": 1024,
+      "maximum": 4294967295,
+      "default": 16777216,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 32
+    },
+    "max_connections": {
+      "title": "Max connections",
+      "description": "One per URL; when full, the longest-idle one is closed.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10000,
+      "default": 16,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 33
+    },
+    "idle_timeout_s": {
+      "title": "Idle timeout (s)",
+      "description": "A connection to an event's URL unused this long is closed (never the url's).",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295,
+      "default": 300,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 34
+    },
+    "max_concurrent": {
+      "title": "Concurrent events",
+      "description": "Events handled at once. 1 keeps the order; more is for ack reply with a server that answers out of order.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096,
+      "default": 1,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 35
+    }
+  }
+}

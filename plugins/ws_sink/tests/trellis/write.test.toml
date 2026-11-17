@@ -1,0 +1,18 @@
+# ack: write against the server tests/trellis.rs starts (`${ws}` is its port).
+name = "acknowledged once written"
+launch_args = "write.json"
+env = { WS_AUTHORIZATION = "Bearer secret" }
+
+[[steps]]
+send = "payloads/text.json"
+expect_ack = "ack"
+
+# A URL within allowed_urls gets its own connection.
+[[steps]]
+send = "payloads/binary.json"
+expect_ack = "ack"
+
+# Outside allowed_urls (a prefix match must end at a / or ?): never sent.
+[[steps]]
+send = "payloads/outside.json"
+expect_ack = { nack = { retryable = false } }

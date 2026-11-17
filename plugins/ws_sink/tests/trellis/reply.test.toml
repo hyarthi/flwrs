@@ -1,0 +1,20 @@
+# ack: reply: /echo answers each message with its id (and an error for
+# "fail"), after an unrelated message the sink must ignore; /silent never answers.
+name = "acknowledged once the server replied"
+launch_args = "reply.json"
+
+[[steps]]
+send = "payloads/ok.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/fail.json"
+expect_ack = { nack = { retryable = false } }
+
+[[steps]]
+send = "payloads/silent.json"
+expect_ack = { nack = { retryable = true } }
+
+[[steps]]
+send = "payloads/given_id.json"
+expect_ack = "ack"

@@ -1,0 +1,7 @@
+# A handshake refused with 401: events are NACKed, retryably.
+name = "a refused handshake"
+launch_args = "reject.json"
+
+[[steps]]
+send = "payloads/ok.json"
+expect_ack = { nack = { retryable = true } }

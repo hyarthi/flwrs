@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "id": "ws-sink",
+  "name": "WebSocket sink",
+  "version": "0.0.1",
+  "type": "SINK",
+  "description": "Sends each event as a WebSocket message over a long-lived connection; acknowledged when written, or when the server replies.",
+  "executable": "bin/flwrs-ws-sink",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": {
+    "in": "schema/in.json"
+  },
+  "ui": {
+    "icon": "ui/ws-sink.svg",
+    "categories": [
+      "Outputs",
+      "WebSocket"
+    ],
+    "docs": "README.md"
+  }
+}

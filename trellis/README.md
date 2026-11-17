@@ -151,7 +151,7 @@ in_flight = 64
 ```
 
 **What it measures:**
-- **Latency.** For sinks and transforms: from sending an event to the plugin's ACK or NACK, so the plugin needs the ACKS capability. In open and step loops it counts from when each event was meant to go out, so a stalled plugin can't hide its delays. For sources: events per second against a credit window, and with a stimulus, latency from stimulus to event.
+- **Latency.** For sinks and transforms: from sending an event to the plugin's ACK or NACK, so the plugin needs the ACKS capability. In open and step loops a thread paces the sends (an OS sleep: tokio's timer would wake about a millisecond late). When the sender slept until an event's time, latency counts from when it woke, so the harness's own timer isn't charged to the plugin (it's reported apart, as `pacing_us`: "harness late"). When the sender was already behind because the plugin's window was full, latency counts from when the event was meant to go out, so a stalled plugin can't hide its delays. For sources: events per second against a credit window, and with a stimulus, latency from stimulus to event.
 - **Startup**: from launch until the plugin is ready.
 - **Resources**: CPU and memory of the plugin's process tree, sampled every 100 ms.
 

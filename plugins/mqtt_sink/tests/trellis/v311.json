@@ -1,0 +1,8 @@
+{
+  "broker_url": "mqtt://127.0.0.1:${broker}",
+  "client_id": "flwrs-test-sink-v311",
+  "default_topic": "flwrs/out",
+  "allowed_topics": ["flwrs/dev/+"],
+  "max_inflight": 4,
+  "protocol_version": "3.1.1"
+}

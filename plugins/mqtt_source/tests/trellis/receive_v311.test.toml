@@ -1,0 +1,16 @@
+# The same over MQTT 3.1.1: no properties.
+name = "receives messages as events over MQTT 3.1.1"
+launch_args = "v311.json"
+
+# Messages published before the subscription is in place aren't delivered
+# (as in MQTT): give the plugin time to connect and subscribe.
+[[steps]]
+wait_ms = 1000
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ path = "topic", eq = "sensors/1" }]
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ path = "payload", eq = "m2" }]

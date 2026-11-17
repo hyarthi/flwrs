@@ -1,3 +1,4 @@
+use crate::plugin::core::Unconfirmed;
 use crate::plugin::error::SourceError;
 use crate::plugin::msg_client::HubClient;
 use crate::schema::payload::PluginPayload;
@@ -42,6 +43,21 @@ impl LocalSink {
     /// message broker's acknowledgement). Fails if the hub rejected the event
     /// or the connection was lost before the hub answered; the event may then
     /// or may not have been routed.
+    /// Sends the event (waiting for credit, like [`emit`](Self::emit)) and
+    /// returns once it's written, with a [`Confirmation`] that resolves when
+    /// the hub has taken it. Unlike [`emit_confirmed`](Self::emit_confirmed),
+    /// a source can keep several events in flight, sent in order, and wait for
+    /// their confirmations in that order. Without the `ACKS` capability the
+    /// confirmation resolves at once.
+    pub async fn emit_tracked(&self, payload: PluginPayload) -> Result<Confirmation, SourceError> {
+        let (_, confirmation) = self
+            .client
+            .send_event(payload, None, true)
+            .await
+            .map_err(SourceError::new)?;
+        Ok(Confirmation(confirmation))
+    }
+
     pub async fn emit_confirmed(&self, payload: PluginPayload) -> Result<(), SourceError> {
         let (_, confirmation) = self
             .client
@@ -51,9 +67,25 @@ impl LocalSink {
         match confirmation {
             Some(rx) => match rx.await {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(reason)) => Err(SourceError::new(reason)),
-                Err(_) => Err(SourceError::new("the connection to the hub was lost")),
+                Ok(Err(unconfirmed)) => Err(SourceError::new(unconfirmed.to_string())),
+                Err(_) => Err(SourceError::new(Unconfirmed::Lost.to_string())),
             },
+            None => Ok(()),
+        }
+    }
+}
+
+/// The hub's answer to an event sent with [`LocalSink::emit_tracked`].
+#[must_use = "a confirmation does nothing unless awaited"]
+pub struct Confirmation(Option<tokio::sync::oneshot::Receiver<Result<(), Unconfirmed>>>);
+
+impl Confirmation {
+    /// Waits for the hub: `Ok` once it took the event; [`Unconfirmed`] if it
+    /// refused it (NACK) or the connection was lost first (then the event may
+    /// or may not have arrived: send it again to be sure).
+    pub async fn confirmed(self) -> Result<(), Unconfirmed> {
+        match self.0 {
+            Some(rx) => rx.await.unwrap_or(Err(Unconfirmed::Lost)),
             None => Ok(()),
         }
     }

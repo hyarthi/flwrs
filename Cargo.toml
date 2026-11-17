@@ -12,6 +12,9 @@ members = [
     "plugins/ticker",
     "plugins/script_transform",
     "plugins/accumulator",
+    "plugins/mqtt_sink",
+    "plugins/mqtt_source",
+    "plugins/ws_sink",
     "trellis",
 ]
 
@@ -110,6 +113,12 @@ bytes = "1.12.1"
 # TLS for remote plugins (ring: cross-compiles without cmake)
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+# MQTT plugins: the client with rustls but no crypto provider of its own (the plugins pass a ring config, so no aws-lc / cmake); the broker only for tests
+rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls-no-provider"] }
+rumqttd = { version = "0.20.0", default-features = false }
+webpki-roots = "1.0.12"
+# WebSocket sink: rustls through our own ring config (no aws-lc), no default connector
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "__rustls-tls"] }
 x509-parser = "0.18.1"
 
 # testing

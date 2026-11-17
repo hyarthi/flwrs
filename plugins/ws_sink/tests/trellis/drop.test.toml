@@ -1,0 +1,15 @@
+# /drop closes the connection after each message: the sink redials (with its
+# backoff) and the next event goes out on the new connection.
+name = "redials after the server closes"
+launch_args = "drop.json"
+
+[[steps]]
+send = "payloads/ok.json"
+expect_ack = "ack"
+
+[[steps]]
+wait_ms = 2500
+
+[[steps]]
+send = "payloads/ok.json"
+expect_ack = "ack"

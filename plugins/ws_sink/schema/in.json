@@ -1,0 +1,8 @@
+{
+  "fields": [
+    { "key": "url", "description": "ws:// or wss:// URL to send to (needs allowed_urls); empty: the configured url", "type": "STRING" },
+    { "key": "data", "description": "The message", "type": "BYTES" },
+    { "key": "message_type", "description": "text or binary; empty: the configured message_type", "type": "STRING" },
+    { "key": "correlation_id", "description": "ack reply: the request's id (generated if empty)", "type": "STRING" }
+  ]
+}

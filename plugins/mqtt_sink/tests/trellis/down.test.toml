@@ -1,0 +1,8 @@
+# With the broker down, events are NACKed at once, retryably: the hub's queue
+# is the buffer, not the plugin.
+name = "broker down"
+launch_args = "down.json"
+
+[[steps]]
+send = "payloads/default.json"
+expect_ack = { nack = { retryable = true } }

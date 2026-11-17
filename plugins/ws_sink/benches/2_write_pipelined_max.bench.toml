@@ -1,0 +1,11 @@
+# The same with max_concurrent 16.
+name = "ack write, 16 at a time, max load"
+launch_args = "write_pipelined.json"
+payloads = ["payloads/small.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"
+in_flight = 64

@@ -1,0 +1,31 @@
+[package]
+name = "flwrs-ws-sink"
+description = "flwrs sink plugin that sends each event as a WebSocket message over a long-lived connection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls"] } # bootstrap args; TLS for remote use
+flwrs-types.workspace = true # the payload as a value tree
+tokio.workspace = true
+clap.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+
+[dev-dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls", "package"] }
+flwrs-trellis.workspace = true # tests/trellis.rs: audit and behaviour tests
+jsonschema.workspace = true
+tempfile.workspace = true
+futures-util.workspace = true

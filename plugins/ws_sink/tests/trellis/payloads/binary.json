@@ -1,0 +1,1 @@
+{ "data": "raw bytes", "message_type": "binary", "url": "ws://127.0.0.1:${ws}/record/b" }

@@ -36,6 +36,27 @@ impl InboundEvent {
     }
 }
 
+/// Why an emitted event wasn't confirmed by the hub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unconfirmed {
+    /// The hub answered with a NACK; `retry`: it may take the event if it's
+    /// sent again later.
+    Refused { reason: String, retry: bool },
+    /// The connection to the hub was lost before an answer came.
+    Lost,
+}
+
+impl std::fmt::Display for Unconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unconfirmed::Refused { reason, .. } => f.write_str(reason),
+            Unconfirmed::Lost => f.write_str("the connection to the hub was lost"),
+        }
+    }
+}
+
+impl std::error::Error for Unconfirmed {}
+
 /// Which input an output belongs to (see [`InboundEvent::input_ref`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InputRef {

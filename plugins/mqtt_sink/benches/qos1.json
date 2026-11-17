@@ -1,0 +1,9 @@
+{
+  "broker_url": "mqtt://127.0.0.1:${broker}",
+  "client_id": "flwrs-bench-sink-qos1",
+  "default_topic": "bench/out",
+  "allowed_topics": [
+    "bench/#"
+  ],
+  "max_inflight": 64
+}

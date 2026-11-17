@@ -1,0 +1,18 @@
+{
+  "fields": [
+    { "key": "topic", "description": "Topic to publish to (needs allowed_topics); empty: default_topic", "type": "STRING" },
+    { "key": "payload", "description": "The message", "type": "BYTES" },
+    { "key": "qos", "description": "0, 1 or 2; empty: default_qos", "type": "U32" },
+    { "key": "retain", "description": "Retain the message at the broker", "type": "BOOL" },
+    { "key": "content_type", "description": "MQTT 5: the payload's content type", "type": "STRING" },
+    { "key": "response_topic", "description": "MQTT 5: where a request's reply goes", "type": "STRING" },
+    { "key": "correlation_data", "description": "MQTT 5: matches a reply to its request", "type": "BYTES" },
+    {
+      "key": "user_properties",
+      "description": "MQTT 5: user properties (a name may repeat)",
+      "type": "MAP",
+      "nested_type_definition": { "type": "ARRAY", "nested_type_definition": { "type": "STRING" } }
+    },
+    { "key": "message_expiry_s", "description": "MQTT 5: seconds the broker keeps the message for subscribers", "type": "U32" }
+  ]
+}

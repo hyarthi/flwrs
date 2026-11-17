@@ -1,0 +1,11 @@
+# 100-byte messages at QoS 1: each ACKed after the broker's PUBACK.
+name = "QoS 1, max load"
+launch_args = "qos1.json"
+payloads = ["payloads/small.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"
+in_flight = 64

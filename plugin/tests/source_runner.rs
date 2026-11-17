@@ -25,6 +25,8 @@ enum Mode {
     Burst(usize),
     /// Emit confirmed events and report each outcome.
     Confirmed(usize),
+    /// Emit `n` tracked events at once, then report their outcomes in order.
+    Tracked(usize),
     /// Emit `n` events, each only after `ready` (raced against a 100 ms
     /// timer: a timeout is reported as `Err("late")`, and that try is dropped).
     WhenReady(usize),
@@ -79,6 +81,17 @@ impl Source for TestSource {
                         .emit_confirmed(payload(vec![]))
                         .await
                         .map_err(|e| e.to_string());
+                    self.outcomes.send(outcome).unwrap();
+                }
+            }
+            Mode::Tracked(n) => {
+                // All sent first, then the answers awaited in order.
+                let mut confirmations = vec![];
+                for _ in 0..n {
+                    confirmations.push(sink.emit_tracked(payload(vec![])).await?);
+                }
+                for confirmation in confirmations {
+                    let outcome = confirmation.confirmed().await.map_err(|e| e.to_string());
                     self.outcomes.send(outcome).unwrap();
                 }
             }
@@ -325,5 +338,36 @@ async fn emit_confirmed_waits_for_the_hubs_answer() {
         next = outcome(&mut started).await;
     }
     assert_eq!(next, Ok(()));
+    stop(&mut hub, started).await;
+}
+
+#[tokio::test]
+async fn emit_tracked_keeps_several_events_in_flight() {
+    let _serial = SERIAL.lock().await;
+    let (listener, port) = listen().await;
+    let mut started = start(port, Mode::Tracked(3));
+
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[Capability::Acks], 0).await;
+    // All three go out before any answer.
+    let mut seq = 1;
+    for _ in 0..3 {
+        assert_eq!(kind(&mut hub, &mut seq).await, "event");
+    }
+    hub.send(&Nack {
+        seq: 2,
+        reason: "full".into(),
+        retry: false,
+    })
+    .await;
+    hub.send(&Ack {
+        up_to: 3,
+        seqs: vec![],
+    })
+    .await;
+    // Reported in send order, each with its own answer.
+    assert_eq!(outcome(&mut started).await, Ok(()));
+    assert_eq!(outcome(&mut started).await, Err("full".to_string()));
+    assert_eq!(outcome(&mut started).await, Ok(()));
     stop(&mut hub, started).await;
 }

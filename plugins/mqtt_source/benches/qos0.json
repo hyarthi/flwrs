@@ -1,0 +1,12 @@
+{
+  "broker_url": "mqtt://127.0.0.1:${broker}",
+  "client_id": "flwrs-bench-source-qos0",
+  "clean_start": true,
+  "subscriptions": [
+    {
+      "filter": "bench/#",
+      "qos": 0
+    }
+  ],
+  "max_inflight": 64
+}

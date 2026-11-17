@@ -18,9 +18,13 @@
 //! # start_rate = 100, step_rate = 100, step_ms = 2000, max_rate = 100000, max_p99_ms = 50   # step
 //! ```
 //!
-//! Sinks and transforms: latency from send (closed) or from the intended send
-//! time (open, step: no coordinated omission) to the plugin's ACK/NACK, so
-//! they need the ACKS capability. Sources: events per second against a credit
+//! Sinks and transforms: latency from send (closed) or from the scheduled
+//! send time (open, step) to the plugin's ACK/NACK, so they need the ACKS
+//! capability. In the open loop a thread paces the sends; when the sender
+//! slept until a send's time, latency starts when it woke (the timer's own
+//! lateness isn't the plugin's; it's reported as `pacing_us`), and when it
+//! was already behind (the plugin's window was full), it starts at the
+//! scheduled time, so backpressure counts (no coordinated omission). Sources: events per second against a credit
 //! window; with a stimulus (and a correlator, in code), stimulus → event
 //! latency. A `load_command` (e.g. `oha`) runs in the background meanwhile.
 //!
@@ -213,6 +217,10 @@ pub struct RunStats {
     pub throughput: f64,
     pub latency_us: Option<Percentiles>,
     pub resources: Option<Resources>,
+    /// Open loop: how late the harness woke for its sends (its timer, not
+    /// the plugin; not part of `latency_us`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pacing_us: Option<Percentiles>,
 }
 
 /// One rate of a step run.
@@ -505,6 +513,8 @@ struct Shared {
     pending: Mutex<BTreeMap<u64, (Instant, bool)>>,
     correlated: Mutex<HashMap<String, (Instant, bool)>>,
     hist: Mutex<Histogram<u64>>,
+    /// Open loop: the harness's wake-up lateness, per counted send.
+    pacing: Mutex<Histogram<u64>>,
     /// Counted completions (events answered, or emitted by a source).
     done: AtomicU64,
     errors: AtomicU64,
@@ -520,6 +530,7 @@ impl Shared {
             pending: Mutex::new(BTreeMap::new()),
             correlated: Mutex::new(HashMap::new()),
             hist: Mutex::new(new_histogram()),
+            pacing: Mutex::new(new_histogram()),
             done: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             measuring: AtomicBool::new(false),
@@ -545,6 +556,7 @@ impl Shared {
 
     fn reset(&self) {
         self.hist.lock().unwrap().reset();
+        self.pacing.lock().unwrap().reset();
         self.done.store(0, Ordering::Relaxed);
         self.errors.store(0, Ordering::Relaxed);
         *self.last_done.lock().unwrap() = None;
@@ -741,6 +753,7 @@ async fn run_once(
             throughput,
             latency_us: percentiles(&hist),
             resources,
+            pacing_us: percentiles(&shared.pacing.lock().unwrap()),
         },
         stages,
     ))
@@ -778,8 +791,7 @@ async fn drive(
     rate: Option<f64>,
     counter: &mut u64,
 ) -> Result<(), String> {
-    let start = Instant::now();
-    let mut i: u64 = 0;
+    let mut ticks = rate.map(|rate| pace(Instant::now(), until, rate));
     let consumes = ctx.consumes;
     let mut command = ctx.file.stimulus.as_ref().map(|argv| CommandStimulus {
         argv: argv.clone(),
@@ -787,18 +799,25 @@ async fn drive(
         vars: ctx.vars.clone(),
     });
     while Instant::now() < until {
-        let intended = match rate {
-            Some(rate) => {
-                let at = start + Duration::from_secs_f64(i as f64 / rate);
-                if at >= until {
+        let counted = shared.measuring.load(Ordering::Relaxed);
+        let intended = match ticks.as_mut() {
+            Some(ticks) => {
+                let Some(Tick { at, slept }) = ticks.recv().await else {
                     break;
+                };
+                let woke = Instant::now();
+                if slept {
+                    if counted {
+                        let late = woke.saturating_duration_since(at).as_micros().max(1) as u64;
+                        let _ = shared.pacing.lock().unwrap().record(late.min(3_600_000_000));
+                    }
+                    woke
+                } else {
+                    at
                 }
-                tokio::time::sleep_until(at.into()).await;
-                at
             }
             None => Instant::now(),
         };
-        let counted = shared.measuring.load(Ordering::Relaxed);
         if consumes {
             // The window: waits while the plugin has max_unacked events.
             let permit = tokio::select! {
@@ -844,9 +863,41 @@ async fn drive(
                 Err(_) => {}
             }
         }
-        i += 1;
     }
     Ok(())
+}
+
+/// A send's scheduled time, and whether the pacer slept until it (else the
+/// schedule was already behind).
+struct Tick {
+    at: Instant,
+    slept: bool,
+}
+
+/// Paces the open loop from a thread: an OS sleep wakes within a fraction of
+/// a millisecond, where tokio's timer rounds up to the next millisecond
+/// (~1.3 ms late at the median, which would count against the plugin). The
+/// small buffer keeps a stalled sender's ticks from piling up: the pacer then
+/// waits, and the late ticks after it come with `slept: false`.
+fn pace(start: Instant, until: Instant, rate: f64) -> tokio::sync::mpsc::Receiver<Tick> {
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    std::thread::spawn(move || {
+        for i in 0u64.. {
+            let at = start + Duration::from_secs_f64(i as f64 / rate);
+            if at >= until {
+                return;
+            }
+            let wait = at.saturating_duration_since(Instant::now());
+            let slept = !wait.is_zero();
+            if slept {
+                std::thread::sleep(wait);
+            }
+            if tx.blocking_send(Tick { at, slept }).is_err() {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 /// The fake hub's reader: answers, outputs, pings; credit and acks back.
@@ -1177,8 +1228,12 @@ pub fn report(results: &[BenchResult]) -> String {
                     )
                 })
                 .unwrap_or_default();
+            let pacing = s
+                .pacing_us
+                .map(|p| format!("  (harness late p50 {} µs, p99 {} µs)", p.p50, p.p99))
+                .unwrap_or_default();
             format!(
-                "  {label:<12} {:>10.0} ev/s  {lat}  errors {}  startup {:.0} ms{res}\n",
+                "  {label:<12} {:>10.0} ev/s  {lat}{pacing}  errors {}  startup {:.0} ms{res}\n",
                 s.throughput, s.errors, s.startup_ms
             )
         };

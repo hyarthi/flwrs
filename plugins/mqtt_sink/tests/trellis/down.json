@@ -1,0 +1,1 @@
+{ "broker_url": "mqtt://127.0.0.1:${down}", "default_topic": "flwrs/out" }

@@ -1,0 +1,6 @@
+{
+  "broker_url": "mqtt://127.0.0.1:${broker}",
+  "client_id": "flwrs-test-source-${client}",
+  "protocol_version": "3.1.1",
+  "subscriptions": [{ "filter": "sensors/#", "qos": 1 }]
+}

@@ -1,0 +1,1 @@
+{ "topic": "flwrs/dev/7", "payload": "named topic", "qos": 1, "content_type": "text/plain", "user_properties": { "k": ["v"] } }

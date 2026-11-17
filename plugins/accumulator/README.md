@@ -55,9 +55,9 @@ Measured with `cargo trellis bench plugins/accumulator` (`benches/`) on an Apple
 |---|---|---|---|---|
 | Running aggregate (output per event), max load | ~12 800 | 1.2 / 3.0 ms | ~61 % | ~12 MiB |
 | 1 s tumbling windows, max load | ~13 200 | 1.2 / 2.9 ms | ~55 % | ~11 MiB |
-| 1 s tumbling windows, steady 1 000/s | 1 000 | 0.9 / 1.6 ms | ~4 % | ~10 MiB |
+| 1 s tumbling windows, steady 1 000/s | 1 000 | 0.17 / 0.44 ms | ~5 % | ~10 MiB |
 
-Binary 7.2 MB, package 3.1 MB. Storage speed matters as for the script transform (a commit per event).
+The steady-rate row was remeasured with trellis 0.0.5's pacing (latency from when the harness woke for each send). Binary 7.2 MB, package 3.1 MB. Storage speed matters as for the script transform (a commit per event).
 
 ## Tests
 

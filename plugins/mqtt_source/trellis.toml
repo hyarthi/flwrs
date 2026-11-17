@@ -1,0 +1,7 @@
+# flwrs-trellis settings for the MQTT source.
+# The behaviour tests (tests/trellis/*.test.toml) need the broker and the
+# publisher that tests/trellis.rs provides, so they run with `cargo test`.
+
+[audit]
+# Without a broker the audit checks the protocol; data-events needs one (skipped).
+launch_args = "tests/trellis/audit.json"

@@ -1,0 +1,6 @@
+{
+  "url": "ws://127.0.0.1:${ws}/record",
+  "allowed_urls": ["ws://127.0.0.1:${ws}/record/"],
+  "subprotocols": ["v1"],
+  "origin": "https://flwrs.test"
+}

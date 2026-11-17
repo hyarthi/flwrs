@@ -1,0 +1,7 @@
+# flwrs-trellis settings for the MQTT sink.
+# The behaviour tests (tests/trellis/*.test.toml) need the broker that
+# tests/trellis.rs starts, so they run with `cargo test`, not `trellis test`.
+
+[audit]
+# No broker needed: the audit checks the protocol (events are NACKed, retryably).
+launch_args = "tests/trellis/audit.json"

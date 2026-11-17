@@ -42,7 +42,7 @@ impl LocalSink {
         match confirmation {
             Some(rx) => match rx.await {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(reason)) => Err(TransformError::new(reason)),
+                Ok(Err(unconfirmed)) => Err(TransformError::new(unconfirmed.to_string())),
                 Err(_) => Err(TransformError::new("the connection to the hub was lost")),
             },
             None => Ok(()),

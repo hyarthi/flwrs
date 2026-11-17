@@ -1,0 +1,10 @@
+{
+  "url": "ws://127.0.0.1:${ws}/echo",
+  "allowed_urls": ["ws://127.0.0.1:${ws}/silent"],
+  "ack": "reply",
+  "request_id_path": "id",
+  "reply_id_path": "id",
+  "reply_error_path": "error",
+  "reply_timeout_ms": 500,
+  "max_concurrent": 4
+}

@@ -1,0 +1,7 @@
+# flwrs-trellis settings for the WebSocket sink.
+# The behaviour tests (tests/trellis/*.test.toml) need the server that
+# tests/trellis.rs starts, so they run with `cargo test`.
+
+[audit]
+# No server needed: the audit checks the protocol (events are NACKed, retryably).
+launch_args = "tests/trellis/audit.json"

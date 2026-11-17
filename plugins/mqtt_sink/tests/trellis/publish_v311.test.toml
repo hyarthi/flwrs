@@ -1,0 +1,26 @@
+# Publishing through the broker tests/trellis.rs starts (`${broker}` is its
+# port); the test then checks what a subscriber received.
+name = "publishes to the broker over MQTT 3.1.1"
+launch_args = "v311.json"
+
+[[steps]]
+send = "payloads/default.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/named.json"
+expect_ack = "ack"
+
+# QoS 2: ACKed after PUBCOMP.
+[[steps]]
+send = "payloads/qos2.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/qos0.json"
+expect_ack = "ack"
+
+# A topic outside allowed_topics is never published, and not retried.
+[[steps]]
+send = "payloads/outside.json"
+expect_ack = { nack = { retryable = false } }

@@ -1,0 +1,23 @@
+{
+  "manifest_version": 2,
+  "id": "mqtt-source",
+  "name": "MQTT source",
+  "version": "0.0.1",
+  "type": "SOURCE",
+  "description": "Turns MQTT messages into events (MQTT 5 or 3.1.1), acknowledged to the broker once the hub has them.",
+  "executable": "bin/flwrs-mqtt-source",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": {
+    "out": "schema/out.json"
+  },
+  "ui": {
+    "icon": "ui/mqtt-source.svg",
+    "categories": [
+      "Inputs",
+      "MQTT",
+      "IoT"
+    ],
+    "docs": "README.md"
+  }
+}

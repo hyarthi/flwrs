@@ -1,0 +1,15 @@
+# The broker starts about 2 s into the test (tests/trellis.rs): the sink keeps
+# retrying with its backoff, connects, and publishes again.
+name = "recovers when the broker comes up"
+launch_args = "recover.json"
+
+[[steps]]
+send = "payloads/default.json"
+expect_ack = { nack = { retryable = true } }
+
+[[steps]]
+wait_ms = 6000
+
+[[steps]]
+send = "payloads/named.json"
+expect_ack = "ack"

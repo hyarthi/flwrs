@@ -59,7 +59,7 @@ pub(crate) enum Incoming {
 }
 
 /// The hub's answer to an emitted event.
-pub(crate) type Confirmation = Result<(), String>;
+pub(crate) type Confirmation = Result<(), crate::plugin::core::Unconfirmed>;
 
 struct Conn {
     id: u64,
@@ -380,7 +380,10 @@ impl HubClient {
         if let Some(nack) = nack
             && let Some(tx) = conn.confirms.remove(&nack.seq)
         {
-            let _ = tx.send(Err(nack.reason.clone()));
+            let _ = tx.send(Err(crate::plugin::core::Unconfirmed::Refused {
+                reason: nack.reason.clone(),
+                retry: nack.retry,
+            }));
         }
     }
 
@@ -423,7 +426,7 @@ impl HubClient {
 
 fn fail_confirms(confirms: HashMap<u64, oneshot::Sender<Confirmation>>) {
     for (_, tx) in confirms {
-        let _ = tx.send(Err("the connection to the hub was lost".into()));
+        let _ = tx.send(Err(crate::plugin::core::Unconfirmed::Lost));
     }
 }
 

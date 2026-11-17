@@ -1,0 +1,1 @@
+{ "broker_url": "mqtt://127.0.0.1:${broker}", "client_id": "flwrs-test-recover", "default_topic": "flwrs/out", "allowed_topics": ["flwrs/dev/+"] }

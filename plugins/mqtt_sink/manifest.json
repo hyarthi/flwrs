@@ -1,0 +1,23 @@
+{
+  "manifest_version": 2,
+  "id": "mqtt-sink",
+  "name": "MQTT sink",
+  "version": "0.0.1",
+  "type": "SINK",
+  "description": "Publishes each event to an MQTT broker (MQTT 5 or 3.1.1), acknowledged once the broker has it.",
+  "executable": "bin/flwrs-mqtt-sink",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": {
+    "in": "schema/in.json"
+  },
+  "ui": {
+    "icon": "ui/mqtt-sink.svg",
+    "categories": [
+      "Outputs",
+      "MQTT",
+      "IoT"
+    ],
+    "docs": "README.md"
+  }
+}

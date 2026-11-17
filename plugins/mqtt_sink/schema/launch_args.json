@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MQTT sink settings",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "broker_url"
+  ],
+  "properties": {
+    "broker_url": {
+      "title": "Broker",
+      "description": "mqtt://host[:1883] or mqtts://host[:8883] (TLS).",
+      "type": "string",
+      "pattern": "^(?i)(mqtt|mqtts|tcp|ssl)://",
+      "x-flwrs-order": 1
+    },
+    "protocol_version": {
+      "title": "MQTT version",
+      "enum": [
+        "5",
+        "3.1.1"
+      ],
+      "default": "5",
+      "x-flwrs-order": 2
+    },
+    "default_topic": {
+      "title": "Topic",
+      "description": "Where events go that don't name a topic.",
+      "type": "string",
+      "minLength": 1,
+      "x-flwrs-order": 3
+    },
+    "allowed_topics": {
+      "title": "Allowed topics",
+      "description": "Topic filters (+ and # wildcards) that events may name their own topic within. Without them, events can't choose a topic: a mapping mistake can't publish anywhere.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "x-flwrs-order": 4
+    },
+    "default_qos": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2
+      ],
+      "title": "QoS",
+      "description": "For events that don't set one. 0: written to the connection; 1 / 2: acknowledged by the broker before the event is.",
+      "default": 1,
+      "x-flwrs-order": 5
+    },
+    "username": {
+      "title": "User name",
+      "type": "string",
+      "x-flwrs-group": "Authentication",
+      "x-flwrs-order": 10
+    },
+    "password": {
+      "title": "Password",
+      "type": "string",
+      "writeOnly": true,
+      "x-flwrs-launch": {
+        "via": "env",
+        "alias": "MQTT_PASSWORD"
+      },
+      "x-flwrs-group": "Authentication",
+      "x-flwrs-order": 11
+    },
+    "tls_ca": {
+      "title": "CA certificate",
+      "description": "Uploaded PEM file with the CA(s) of the broker's certificate. Default: the bundled Mozilla roots.",
+      "type": "string",
+      "x-flwrs-launch": {
+        "via": "file",
+        "source": "upload"
+      },
+      "x-flwrs-group": "TLS",
+      "x-flwrs-order": 20
+    },
+    "tls_cert": {
+      "title": "Client certificate",
+      "description": "Uploaded PEM file: a client certificate (mTLS), with tls_key.",
+      "type": "string",
+      "x-flwrs-launch": {
+        "via": "file",
+        "source": "upload"
+      },
+      "x-flwrs-group": "TLS",
+      "x-flwrs-order": 21
+    },
+    "tls_key": {
+      "title": "Client key",
+      "description": "Uploaded PEM file: the client certificate's private key.",
+      "type": "string",
+      "x-flwrs-launch": {
+        "via": "file",
+        "source": "upload"
+      },
+      "x-flwrs-group": "TLS",
+      "x-flwrs-order": 22,
+      "writeOnly": true
+    },
+    "insecure_skip_verify": {
+      "title": "Skip certificate checks",
+      "description": "Development only: accept any broker certificate.",
+      "type": "boolean",
+      "default": false,
+      "x-flwrs-group": "TLS",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 23
+    },
+    "client_id": {
+      "title": "Client id",
+      "description": "Unique per broker. Default: flwrs-<node id>.",
+      "type": "string",
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 30
+    },
+    "keep_session": {
+      "title": "Keep the session",
+      "description": "Clean start off: the broker keeps the session across connections.",
+      "type": "boolean",
+      "default": false,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 31
+    },
+    "session_expiry_s": {
+      "title": "Session expiry (s)",
+      "description": "MQTT 5: how long the broker keeps the session after a disconnect.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 32
+    },
+    "keepalive_s": {
+      "title": "Keepalive (s)",
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 65535,
+      "default": 30,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 33
+    },
+    "max_inflight": {
+      "title": "Max in flight",
+      "description": "QoS 1 / 2 messages awaiting the broker at once. 1 keeps the event order strictly.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 16,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 34
+    },
+    "max_packet_bytes": {
+      "title": "Max packet size",
+      "description": "Bytes; a larger message is rejected (not retried).",
+      "type": "integer",
+      "minimum": 128,
+      "maximum": 268435455,
+      "default": 1048576,
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 35
+    },
+    "last_will": {
+      "title": "Last Will",
+      "description": "Published by the broker if the connection drops without a clean disconnect.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "topic"
+      ],
+      "properties": {
+        "topic": {
+          "type": "string",
+          "minLength": 1
+        },
+        "payload": {
+          "type": "string",
+          "default": ""
+        },
+        "qos": {
+          "type": "integer",
+          "enum": [
+            0,
+            1,
+            2
+          ],
+          "default": 0
+        },
+        "retain": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "x-flwrs-group": "Connection",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 36
+    }
+  }
+}

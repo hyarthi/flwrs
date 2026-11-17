@@ -1,0 +1,25 @@
+# At least once across a crash: with no credit the message can't be emitted,
+# so it isn't acknowledged to the broker. The plugin is killed; on restart the
+# broker sends it again from the persistent session.
+name = "an unconfirmed message survives a crash"
+launch_args = "v5.json"
+initial_credit = 0
+return_credit = false
+
+# Messages published before the subscription is in place aren't delivered
+# (as in MQTT): give the plugin time to connect and subscribe.
+[[steps]]
+wait_ms = 1000
+
+[[steps]]
+stimulus = true
+within_ms = 500
+expect_outputs = [{ count = 0 }]
+
+[[steps]]
+restart = true
+
+[[steps]]
+grant = 1
+within_ms = 5000
+expect_outputs = [{ path = "payload", eq = "m1" }]

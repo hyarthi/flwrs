@@ -1,0 +1,31 @@
+[package]
+name = "flwrs-mqtt-source"
+description = "flwrs source plugin that turns MQTT messages into events (MQTT 5 or 3.1.1), acknowledged to the broker once the hub has them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls"] } # bootstrap args; TLS for remote use
+flwrs-types.workspace = true # the payload as a value tree
+tokio.workspace = true
+clap.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rumqttc.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+pbjson-types.workspace = true # receive_time
+
+[dev-dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls", "package"] }
+flwrs-trellis.workspace = true # tests/trellis.rs: audit and behaviour tests
+rumqttd.workspace = true # an embedded broker for the tests
+jsonschema.workspace = true
+tempfile.workspace = true

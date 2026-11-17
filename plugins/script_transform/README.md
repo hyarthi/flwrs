@@ -56,9 +56,9 @@ Measured with `cargo trellis bench plugins/script_transform` (`benches/`) on an 
 | Stateless script, max load | ~15 500 | 1.0 / 3.0 ms | ~63 % | ~12 MiB |
 | `load` + `store` per event, max load | ~11 900 | 1.3 / 3.6 ms | ~58 % | ~12 MiB |
 | The same, `sync = full` | ~9 700 | 1.7 / 3.5 ms | ~47 % | ~12 MiB |
-| `load` + `store`, steady 1 000/s | 1 000 | 1.3 / 2.4 ms | ~5 % | ~10 MiB |
+| `load` + `store`, steady 1 000/s | 1 000 | 0.15 / 3.1 ms | ~5 % | ~10 MiB |
 
-Binary 6.9 MB, package 3.0 MB (Lua 5.4 and SQLite are compiled in). Every event commits to `state.db` (the outbox), so storage speed matters: macOS doesn't flush to the device on each `fsync` by default, so `sync = full` costs more on Linux with a slow SD card than shown here.
+The steady-rate row was remeasured with trellis 0.0.5's pacing (latency from when the harness woke for each send); its p99 varied between runs (0.3–6 ms), like the harness's own calibration on that machine. Binary 6.9 MB, package 3.0 MB (Lua 5.4 and SQLite are compiled in). Every event commits to `state.db` (the outbox), so storage speed matters: macOS doesn't flush to the device on each `fsync` by default, so `sync = full` costs more on Linux with a slow SD card than shown here.
 
 ## Tests
 

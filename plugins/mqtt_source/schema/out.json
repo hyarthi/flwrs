@@ -1,0 +1,20 @@
+{
+  "fields": [
+    { "key": "topic", "description": "The message's topic", "type": "STRING" },
+    { "key": "payload", "description": "The message", "type": "BYTES" },
+    { "key": "qos", "description": "The QoS it was delivered with (0, 1 or 2)", "type": "U32" },
+    { "key": "retain", "description": "A retained message", "type": "BOOL" },
+    { "key": "dup", "description": "The broker may have sent it before", "type": "BOOL" },
+    { "key": "content_type", "description": "MQTT 5: the payload's content type", "type": "STRING" },
+    { "key": "response_topic", "description": "MQTT 5: where a reply goes", "type": "STRING" },
+    { "key": "correlation_data", "description": "MQTT 5: matches a reply to its request", "type": "BYTES" },
+    {
+      "key": "user_properties",
+      "description": "MQTT 5: user properties (a name may repeat)",
+      "type": "MAP",
+      "nested_type_definition": { "type": "ARRAY", "nested_type_definition": { "type": "STRING" } }
+    },
+    { "key": "message_expiry_s", "description": "MQTT 5: seconds left before the message expires", "type": "U32" },
+    { "key": "receive_time", "description": "When the plugin received it", "type": "DATETIME" }
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "url": "ws://127.0.0.1:${ws}/sink",
+  "max_concurrent": 16
+}

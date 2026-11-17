@@ -1,0 +1,11 @@
+# The same as 1 over MQTT 3.1.1.
+name = "QoS 1 over MQTT 3.1.1, max load"
+launch_args = "v311.json"
+payloads = ["payloads/small.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"
+in_flight = 64

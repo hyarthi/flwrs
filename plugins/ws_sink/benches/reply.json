@@ -1,0 +1,7 @@
+{
+  "url": "ws://127.0.0.1:${ws}/echo",
+  "ack": "reply",
+  "request_id_path": "id",
+  "reply_id_path": "id",
+  "max_concurrent": 16
+}
