@@ -1,0 +1,13 @@
+{
+  "schemas": {
+    "in": { "fields": [{ "key": "device", "type": "STRING" }, { "key": "v", "type": "F64" }] },
+    "out": { "fields": [
+      { "key": "device", "type": "STRING" }, { "key": "n", "type": "I64" }, { "key": "sum", "type": "F64" }
+    ] }
+  },
+  "key": "device",
+  "init": "return { n = 0, sum = 0 }",
+  "step": "state.n = state.n + 1\nstate.sum = state.sum + payload.v\nreturn state, { device = key, n = state.n }",
+  "finish": "return { device = key, n = state.n, sum = state.sum }",
+  "window": { "type": "session", "gap": "300ms" }
+}

@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Accumulator settings",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemas",
+    "step"
+  ],
+  "properties": {
+    "schemas": {
+      "title": "Payload schemas",
+      "description": "The schema of the events the accumulator takes (in) and emits (out).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "in",
+        "out"
+      ],
+      "properties": {
+        "in": {
+          "type": "object"
+        },
+        "out": {
+          "type": "object"
+        }
+      },
+      "x-flwrs-order": 1
+    },
+    "key": {
+      "title": "Group by",
+      "description": "Dot path of the grouping key in the input (e.g. device, or tags[\"site\"]). Empty: everything is one group.",
+      "type": "string",
+      "x-flwrs-order": 2
+    },
+    "init": {
+      "title": "Init",
+      "description": "A group's initial state (runs when a group or window starts). Without it, the state starts as nil.",
+      "type": "string",
+      "minLength": 1,
+      "contentMediaType": "text/x-lua",
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "init.lua"
+      },
+      "x-flwrs-code": {
+        "language": "lua",
+        "params": [
+          "key"
+        ],
+        "definitions": "types/accumulator.d.lua",
+        "signature": "fun(key: string): any"
+      },
+      "x-flwrs-widget": "code",
+      "x-flwrs-order": 3
+    },
+    "step": {
+      "title": "Step",
+      "description": "For each event (in each window it belongs to): return the new state (nil forgets it) and, optionally, an output for this event.",
+      "type": "string",
+      "minLength": 1,
+      "contentMediaType": "text/x-lua",
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "step.lua"
+      },
+      "x-flwrs-code": {
+        "language": "lua",
+        "params": [
+          "state",
+          "payload",
+          "meta",
+          "key"
+        ],
+        "definitions": "types/accumulator.d.lua",
+        "signature": "fun(state: any, payload: In, meta: Meta, key: string): any, Out|Many|nil"
+      },
+      "x-flwrs-widget": "code",
+      "x-flwrs-order": 4
+    },
+    "finish": {
+      "title": "Finish",
+      "description": "When a window closes: return its output (or nil). Required with windows.",
+      "type": "string",
+      "minLength": 1,
+      "contentMediaType": "text/x-lua",
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "finish.lua"
+      },
+      "x-flwrs-code": {
+        "language": "lua",
+        "params": [
+          "state",
+          "key",
+          "window"
+        ],
+        "definitions": "types/accumulator.d.lua",
+        "signature": "fun(state: any, key: string, window: Window): Out|Many|nil"
+      },
+      "x-flwrs-widget": "code",
+      "x-flwrs-order": 5
+    },
+    "window": {
+      "title": "Windows",
+      "description": "On processing time. none: one running aggregate per key (idle_ttl forgets idle keys); tumbling: back-to-back windows of size; hopping: windows of size every hop; session: open while events come within gap.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "none",
+            "tumbling",
+            "hopping",
+            "session"
+          ],
+          "default": "none"
+        },
+        "size": {
+          "type": "string",
+          "pattern": "^([0-9]+(ms|s|m|h|d))+$",
+          "x-flwrs-widget": "duration"
+        },
+        "hop": {
+          "type": "string",
+          "pattern": "^([0-9]+(ms|s|m|h|d))+$",
+          "x-flwrs-widget": "duration"
+        },
+        "gap": {
+          "type": "string",
+          "pattern": "^([0-9]+(ms|s|m|h|d))+$",
+          "x-flwrs-widget": "duration"
+        },
+        "idle_ttl": {
+          "type": "string",
+          "pattern": "^([0-9]+(ms|s|m|h|d))+$",
+          "x-flwrs-widget": "duration"
+        }
+      },
+      "x-flwrs-order": 6
+    },
+    "late_close": {
+      "title": "Windows that ended while stopped",
+      "description": "run: finish runs for them when the plugin starts; drop: they're discarded.",
+      "enum": [
+        "run",
+        "drop"
+      ],
+      "default": "run",
+      "x-flwrs-order": 7
+    },
+    "on_error": {
+      "title": "When the script fails",
+      "description": "When step fails: nack (rejected, dead-lettered), nack_retry (rejected, delivered again later), drop (acknowledged, no outputs). The state is left as it was either way.",
+      "enum": [
+        "nack",
+        "nack_retry",
+        "drop"
+      ],
+      "default": "nack",
+      "x-flwrs-order": 8
+    },
+    "limits": {
+      "title": "Limits per event",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_instructions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000000,
+          "default": 1000000
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 100
+        },
+        "max_memory_bytes": {
+          "type": "integer",
+          "minimum": 262144,
+          "maximum": 1073741824,
+          "default": 16777216
+        }
+      },
+      "x-flwrs-group": "Limits",
+      "x-flwrs-advanced": true
+    },
+    "state": {
+      "title": "State",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_keys": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 100000
+        },
+        "max_value_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 65536
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 268435456
+        },
+        "sync": {
+          "description": "normal: fast, a power loss may lose the last commits; full: every commit on disk before the event is acknowledged.",
+          "enum": [
+            "normal",
+            "full"
+          ],
+          "default": "normal"
+        },
+        "applied_window": {
+          "description": "How many recent events' outputs are kept, to answer a redelivery without running the script again.",
+          "type": "integer",
+          "minimum": 1,
+          "default": 10000
+        },
+        "max_file_bytes": {
+          "description": "Largest size on disk of the state file (with its write-ahead log). From 90 % on, the oldest redelivery records are dropped; the node's own keys never are, so when they alone fill it, events that add data fail.",
+          "type": "integer",
+          "minimum": 1048576,
+          "default": 1073741824
+        }
+      },
+      "x-flwrs-group": "State",
+      "x-flwrs-advanced": true
+    }
+  }
+}

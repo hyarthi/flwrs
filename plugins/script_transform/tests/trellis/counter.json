@@ -1,0 +1,7 @@
+{
+  "schemas": {
+    "in": { "fields": [{ "key": "device", "type": "STRING" }] },
+    "out": { "fields": [{ "key": "device", "type": "STRING" }, { "key": "n", "type": "U64" }] }
+  },
+  "script": "if payload.device == 'bad' then error('bad device') end\nlocal n = (load(payload.device) or 0) + 1\nstore(payload.device, n)\nreturn { device = payload.device, n = n }"
+}

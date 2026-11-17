@@ -822,6 +822,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
 name = "fancy-regex"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -907,6 +919,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "flwrs-accumulator"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "flwrs-plugin",
+ "flwrs-script-transform",
+ "flwrs-trellis",
+ "flwrs-types",
+ "jsonschema",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "flwrs-app"
 version = "0.0.1"
 dependencies = [
@@ -917,6 +946,7 @@ dependencies = [
  "flate2",
  "flwrs-core",
  "flwrs-plugin",
+ "flwrs-types",
  "fs4",
  "futures-util",
  "getrandom 0.4.3",
@@ -924,7 +954,6 @@ dependencies = [
  "jsonschema",
  "junction",
  "log",
- "mlua",
  "nix",
  "pbjson",
  "pbjson-build",
@@ -1024,6 +1053,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "flwrs-script-transform"
+version = "0.0.1"
+dependencies = [
+ "clap",
+ "flwrs-plugin",
+ "flwrs-trellis",
+ "flwrs-types",
+ "jsonschema",
+ "log",
+ "prost",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "flwrs-ticker"
 version = "0.0.1"
 dependencies = [
@@ -1059,6 +1106,18 @@ dependencies = [
  "tokio",
  "toml",
  "zip",
+]
+
+[[package]]
+name = "flwrs-types"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "flwrs-plugin",
+ "mlua",
+ "pbjson-types",
+ "serde_json",
 ]
 
 [[package]]
@@ -2755,6 +2814,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsqlite-vfs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1",
+ "thiserror",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0d2b0146dd9661bf67bb107c0bb2a55064d556eeb3fc314151b957f313bcd4e"
+dependencies = [
+ "bitflags",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "hashlink",
+ "libsqlite3-sys",
+ "smallvec",
+ "sqlite-wasm-rs",
+]
+
+[[package]]
 name = "rust-embed"
 version = "8.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3168,6 +3252,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
+]
+
+[[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
 ]
 
 [[package]]

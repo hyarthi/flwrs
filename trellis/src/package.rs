@@ -148,6 +148,17 @@ pub fn package(opts: &PackageOptions) -> Result<Packaged, String> {
             files.insert(path.to_string(), (dir.join(path), 0o644));
         }
     }
+    // Files the launch-args schema names (a code field's `definitions`).
+    if let Some(schema_path) = &manifest.launch_args_schema {
+        let text = std::fs::read_to_string(dir.join(schema_path))
+            .map_err(|e| format!("{schema_path}: {e}"))?;
+        let schema: Value =
+            serde_json::from_str(&text).map_err(|e| format!("{schema_path}: {e}"))?;
+        let (spec, _) = package::LaunchSpec::new(&manifest, Some(&schema));
+        for (_, path) in spec.file_references() {
+            files.insert(path.to_string(), (dir.join(path), 0o644));
+        }
+    }
     let excluded: Vec<glob::Pattern> = config
         .package
         .exclude

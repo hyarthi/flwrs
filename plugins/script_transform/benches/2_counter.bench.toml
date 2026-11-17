@@ -1,0 +1,11 @@
+# load + store per event, committed with the outbox (sync = normal).
+name = "state per device, max load"
+launch_args = "counter.json"
+payloads = ["payloads/d1.json", "payloads/d2.json", "payloads/d3.json", "payloads/d4.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"
+in_flight = 64

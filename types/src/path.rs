@@ -1,7 +1,7 @@
 //! Dot paths: `a.b.c`, array indexes `a[0]`, quoted keys for unusual names
 //! `a["content.type"]`. Bare keys are letters, digits, `_` and `-`.
 
-use super::value::Value;
+use crate::value::Value;
 use flwrs_plugin::schema::payload::{
     FieldDefinition, SchemaDefinition, field_type::Enum as FieldType,
 };
@@ -10,13 +10,13 @@ use std::fmt;
 const MAX_DEPTH: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Segment {
+pub enum Segment {
     Key(String),
     Index(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Path(pub(crate) Vec<Segment>);
+pub struct Path(pub Vec<Segment>);
 
 impl fmt::Display for Path {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -45,7 +45,7 @@ fn is_bare(key: &str) -> bool {
 
 impl Path {
     /// Parses a path. It must start with a field name (a payload is an object).
-    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+    pub fn parse(text: &str) -> Result<Self, String> {
         let bytes = text.as_bytes();
         let mut segments = vec![];
         let mut i = 0;
@@ -150,7 +150,7 @@ impl Path {
         Ok(Path(segments))
     }
 
-    pub(crate) fn get<'a>(&self, value: &'a Value) -> Option<&'a Value> {
+    pub fn get<'a>(&self, value: &'a Value) -> Option<&'a Value> {
         let mut current = value;
         for segment in &self.0 {
             current = match (segment, current) {
@@ -167,7 +167,7 @@ impl Path {
 
     /// Sets the value at the path, creating objects along the way (an index
     /// may append: `a[len]`).
-    pub(crate) fn set(&self, root: &mut Value, new: Value) -> Result<(), String> {
+    pub fn set(&self, root: &mut Value, new: Value) -> Result<(), String> {
         let mut current = root;
         for (depth, segment) in self.0.iter().enumerate() {
             let last = depth + 1 == self.0.len();
@@ -219,7 +219,7 @@ impl Path {
     }
 
     /// Removes the value at the path. Returns whether there was one.
-    pub(crate) fn delete(&self, root: &mut Value) -> bool {
+    pub fn delete(&self, root: &mut Value) -> bool {
         let (last, parents) = self.0.split_last().expect("paths aren't empty");
         let mut current = root;
         for segment in parents {
@@ -258,10 +258,7 @@ impl Path {
 
     /// The field definition the path points at in `schema`: keys of OBJECTs
     /// must be declared, any key of a MAP works, indexes need an ARRAY.
-    pub(crate) fn resolve<'a>(
-        &self,
-        schema: &'a SchemaDefinition,
-    ) -> Result<&'a FieldDefinition, String> {
+    pub fn resolve<'a>(&self, schema: &'a SchemaDefinition) -> Result<&'a FieldDefinition, String> {
         let mut fields: &'a [FieldDefinition] = &schema.fields;
         let mut current: Option<&'a FieldDefinition> = None;
         for segment in &self.0 {

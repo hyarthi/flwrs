@@ -2,13 +2,17 @@
 //! (here), the typed value model ([`value`]), dot paths ([`path`]) and
 //! compiling and applying a mapping ([`compile`]): dot-notation rules always,
 //! and Lua (`lua` rules, `script`, `filter`) with the `mapping-lua` feature
-//! ([`lua`], on by default).
+//! ([`lua`], on by default). The value model, paths and sandbox are
+//! `flwrs-types`'s.
 
 pub(crate) mod compile;
+// The value tree, paths and the Lua sandbox live in `flwrs-types` (shared
+// with plugins that run user code).
 #[cfg(feature = "mapping-lua")]
-pub(crate) mod lua;
-pub(crate) mod path;
-pub(crate) mod value;
+pub(crate) use flwrs_types::lua;
+#[cfg(all(test, feature = "mapping-lua"))]
+mod lua_tests;
+pub(crate) use flwrs_types::{path, value};
 
 pub(crate) use compile::{Mapping, Schemas, compile};
 
@@ -34,6 +38,16 @@ pub(crate) struct LuaChunk {
     pub lua: String,
 }
 
+/// A text format a copy rule can decode from or encode to.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Codec {
+    Json,
+}
+
+/// The whole payload, as a rule's target (decode) or source (encode).
+pub(crate) const ROOT: &str = ".";
+
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Rule {
@@ -46,6 +60,15 @@ pub(crate) struct Rule {
     pub lua: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete: Option<bool>,
+    /// With `source`: the source (BYTES or STRING) is text in this format,
+    /// decoded into a value shaped by the target. Target `"."` replaces the
+    /// whole output (needs `mode: replace`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode: Option<Codec>,
+    /// With `source`: the source value is encoded as text in this format,
+    /// into a BYTES or STRING target. Source `"."` is the whole input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode: Option<Codec>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
@@ -162,16 +185,39 @@ impl MappingSpec {
             }
             for (i, rule) in rules.iter().enumerate() {
                 let label = format!("mapping.rules[{i}]");
+                let root_target = rule.target == ROOT;
+                let root_source = rule.source.as_deref() == Some(ROOT);
                 if rule.target.trim().is_empty() {
                     errors.push(format!("{label}.target is empty"));
+                } else if root_target {
+                    if rule.decode.is_none() {
+                        errors.push(format!(
+                            "{label}.target \".\" (the whole output) is only for a decode rule"
+                        ));
+                    } else if self.mode != Some(MappingMode::Replace) {
+                        errors.push(format!(
+                            "{label}.target \".\" replaces the whole output: it needs \"mode\": \"replace\""
+                        ));
+                    }
                 } else if let Err(e) = path::Path::parse(&rule.target) {
                     errors.push(format!("{label}.target: {e}"));
                 }
-                if let Some(source) = &rule.source
+                if root_source && rule.encode.is_none() {
+                    errors.push(format!(
+                        "{label}.source \".\" (the whole input) is only for an encode rule"
+                    ));
+                } else if let Some(source) = &rule.source
+                    && !root_source
                     && !source.trim().is_empty()
                     && let Err(e) = path::Path::parse(source)
                 {
                     errors.push(format!("{label}.source: {e}"));
+                }
+                if (rule.decode.is_some() || rule.encode.is_some()) && rule.source.is_none() {
+                    errors.push(format!("{label}: decode and encode go with a source"));
+                }
+                if rule.decode.is_some() && rule.encode.is_some() {
+                    errors.push(format!("{label}: use decode or encode, not both"));
                 }
                 let ops = [
                     rule.source.is_some(),

@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Script transform settings",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemas",
+    "script"
+  ],
+  "properties": {
+    "schemas": {
+      "title": "Payload schemas",
+      "description": "The schema of the events the script takes (in) and returns (out).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "in",
+        "out"
+      ],
+      "properties": {
+        "in": {
+          "type": "object"
+        },
+        "out": {
+          "type": "object"
+        }
+      },
+      "x-flwrs-order": 1
+    },
+    "script": {
+      "title": "Script",
+      "description": "Lua, run as function(payload, meta) for each event. Return a table (one output), nil (none) or emit_all({...}) (several). load(key), store(key, value [, {ttl = \"10m\"}]) and delete(key) keep state per node.",
+      "type": "string",
+      "minLength": 1,
+      "contentMediaType": "text/x-lua",
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "script.lua"
+      },
+      "x-flwrs-code": {
+        "language": "lua",
+        "params": [
+          "payload",
+          "meta"
+        ],
+        "definitions": "types/script.d.lua",
+        "signature": "fun(payload: In, meta: Meta): Out|Many|nil"
+      },
+      "x-flwrs-widget": "code",
+      "x-flwrs-order": 2
+    },
+    "on_error": {
+      "title": "When the script fails",
+      "description": "nack: reject the event (it's dead-lettered); nack_retry: reject it, the hub delivers it again later; drop: acknowledge it with no outputs. The state is left as it was either way.",
+      "enum": [
+        "nack",
+        "nack_retry",
+        "drop"
+      ],
+      "default": "nack",
+      "x-flwrs-order": 3
+    },
+    "limits": {
+      "title": "Limits per event",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_instructions": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000000,
+          "default": 1000000
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 100
+        },
+        "max_memory_bytes": {
+          "type": "integer",
+          "minimum": 262144,
+          "maximum": 1073741824,
+          "default": 16777216
+        }
+      },
+      "x-flwrs-group": "Limits",
+      "x-flwrs-advanced": true
+    },
+    "state": {
+      "title": "State",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_keys": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 100000
+        },
+        "max_value_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 65536
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 268435456
+        },
+        "sync": {
+          "description": "normal: fast, a power loss may lose the last commits; full: every commit on disk before the event is acknowledged.",
+          "enum": [
+            "normal",
+            "full"
+          ],
+          "default": "normal"
+        },
+        "applied_window": {
+          "description": "How many recent events' outputs are kept, to answer a redelivery without running the script again.",
+          "type": "integer",
+          "minimum": 1,
+          "default": 10000
+        },
+        "max_file_bytes": {
+          "description": "Largest size on disk of the state file (with its write-ahead log). From 90 % on, the oldest redelivery records are dropped; the node's own keys never are, so when they alone fill it, events that add data fail.",
+          "type": "integer",
+          "minimum": 1048576,
+          "default": 1073741824
+        }
+      },
+      "x-flwrs-group": "State",
+      "x-flwrs-advanced": true
+    }
+  }
+}

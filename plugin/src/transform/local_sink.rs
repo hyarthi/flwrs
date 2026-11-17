@@ -29,6 +29,26 @@ impl LocalSink {
             .map_err(TransformError::new)
     }
 
+    /// Like [`Self::emit`], and also waits for the hub's ACK (with `ACKS`):
+    /// `Ok` means the hub took the event (into a durable queue, if the target
+    /// has one). A NACK or a lost connection is an error; the caller may send
+    /// it again (so a receiver may see it twice).
+    pub async fn emit_confirmed(&self, payload: PluginPayload) -> Result<(), TransformError> {
+        let (_, confirmation) = self
+            .client
+            .send_event(payload, None, true)
+            .await
+            .map_err(TransformError::new)?;
+        match confirmation {
+            Some(rx) => match rx.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(reason)) => Err(TransformError::new(reason)),
+                Err(_) => Err(TransformError::new("the connection to the hub was lost")),
+            },
+            None => Ok(()),
+        }
+    }
+
     /// Sends an event tied to an earlier input (from
     /// [`InboundEvent::input_ref`](crate::plugin::core::InboundEvent::input_ref)),
     /// so it continues that input's trace, even if the input was acknowledged

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 flwrs-core.workspace = true
+flwrs-types.workspace = true # value tree, dot paths, Lua sandbox (feature lua via mapping-lua)
 flwrs-plugin = { workspace = true, features = ["package"] } # payload schema rules, wire framing and messages (shared with the hub); manifest + package checks
 chrono.workspace = true
 log.workspace = true
@@ -32,7 +33,6 @@ zip.workspace = true
 sha256.workspace = true
 getrandom.workspace = true # per-launch plugin tokens
 fs4.workspace = true # free disk space for the spill guard (cross-platform, safe API)
-mlua = { workspace = true, optional = true } # Lua mappings (feature mapping-lua)
 reqwest = { workspace = true, optional = true } # OTLP/HTTP export (feature otel)
 pbjson = { workspace = true, optional = true } # OTLP JSON telemetry files (feature otel)
 flate2.workspace = true # gzip: tar.gz scene imports, closed telemetry files (feature telemetry-file)
@@ -58,7 +58,7 @@ default = ["mapping-lua", "otel", "telemetry-file", "remote"]
 # Lua edge mappings (lua rules, script, filter). On by default; build with
 # --no-default-features for targets without a working C toolchain or with very
 # little flash. Without it, scenes with Lua mappings can be imported but not run.
-mapping-lua = ["dep:mlua"]
+mapping-lua = ["flwrs-types/lua"]
 # Export telemetry to an OpenTelemetry collector (OTLP/HTTP, protobuf). On by
 # default; uses the vendored OTLP protos in schema/otlp and reqwest (rustls).
 otel = ["dep:reqwest", "dep:pbjson"]

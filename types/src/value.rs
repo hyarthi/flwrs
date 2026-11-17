@@ -11,7 +11,7 @@ use pbjson_types::Timestamp;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Value {
+pub enum Value {
     Null,
     String(String),
     Bool(bool),
@@ -34,7 +34,7 @@ pub(crate) enum Value {
 
 /// The packed numeric arrays (`PACKED_F32` …).
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Packed {
+pub enum Packed {
     F32(Vec<f32>),
     F64(Vec<f64>),
     I32(Vec<i32>),
@@ -44,7 +44,7 @@ pub(crate) enum Packed {
 }
 
 impl Packed {
-    pub(crate) fn field_type(&self) -> FieldType {
+    pub fn field_type(&self) -> FieldType {
         match self {
             Packed::F32(_) => FieldType::PackedF32,
             Packed::F64(_) => FieldType::PackedF64,
@@ -55,7 +55,7 @@ impl Packed {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         match self {
             Packed::F32(v) => v.len(),
             Packed::F64(v) => v.len(),
@@ -66,8 +66,12 @@ impl Packed {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Element `i` as a scalar value.
-    pub(crate) fn get(&self, i: usize) -> Option<Value> {
+    pub fn get(&self, i: usize) -> Option<Value> {
         Some(match self {
             Packed::F32(v) => Value::F32(*v.get(i)?),
             Packed::F64(v) => Value::F64(*v.get(i)?),
@@ -79,13 +83,13 @@ impl Packed {
     }
 
     /// The elements as scalar values.
-    pub(crate) fn to_values(&self) -> Vec<Value> {
+    pub fn to_values(&self) -> Vec<Value> {
         (0..self.len()).filter_map(|i| self.get(i)).collect()
     }
 
     /// Builds a packed array of `packed` type from scalar values, converting
     /// each losslessly to the element type.
-    pub(crate) fn from_values(packed: FieldType, values: Vec<Value>) -> Result<Packed, String> {
+    pub fn from_values(packed: FieldType, values: Vec<Value>) -> Result<Packed, String> {
         let element = element_type(packed).ok_or("not a packed type")?;
         let def = FieldDefinition {
             r#type: element as i32,
@@ -120,7 +124,7 @@ impl Packed {
 }
 
 /// The element type of a packed type (`PACKED_F32` → `F32`).
-pub(crate) fn element_type(packed: FieldType) -> Option<FieldType> {
+pub fn element_type(packed: FieldType) -> Option<FieldType> {
     Some(match packed {
         FieldType::PackedF32 => FieldType::F32,
         FieldType::PackedF64 => FieldType::F64,
@@ -133,7 +137,7 @@ pub(crate) fn element_type(packed: FieldType) -> Option<FieldType> {
 }
 
 impl Value {
-    pub(crate) fn type_name(&self) -> &'static str {
+    pub fn type_name(&self) -> &'static str {
         match self {
             Value::Null => "null",
             Value::String(_) => "STRING",
@@ -154,7 +158,7 @@ impl Value {
     }
 
     /// The payload as an object of its fields.
-    pub(crate) fn from_payload(payload: &PluginPayload) -> Self {
+    pub fn from_payload(payload: &PluginPayload) -> Self {
         Value::Object(
             payload
                 .fields
@@ -165,7 +169,7 @@ impl Value {
     }
 
     /// Back to a payload; the value must be an object.
-    pub(crate) fn into_payload(self) -> Result<PluginPayload, String> {
+    pub fn into_payload(self) -> Result<PluginPayload, String> {
         match self {
             Value::Object(fields) => Ok(PluginPayload {
                 fields: fields
@@ -184,7 +188,8 @@ impl Value {
     }
 }
 
-fn from_field_value(value: Option<&FieldValue>) -> Value {
+/// One protobuf `FieldValue` as a value (`None` = null).
+pub fn from_field_value(value: Option<&FieldValue>) -> Value {
     let Some(value) = value.and_then(|v| v.value.as_ref()) else {
         return Value::Null;
     };
@@ -225,7 +230,9 @@ fn from_field_value(value: Option<&FieldValue>) -> Value {
     }
 }
 
-fn into_field_value(value: Value) -> FieldValue {
+/// A value as one protobuf `FieldValue` (keeps every type: u64 vs i64,
+/// bytes vs text, datetimes, packed arrays).
+pub fn into_field_value(value: Value) -> FieldValue {
     let value = match value {
         Value::Null => None,
         Value::String(s) => Some(Pb::String(s)),
@@ -272,9 +279,24 @@ fn into_field_value(value: Value) -> FieldValue {
 /// JSON has no bytes or datetime: for a BYTES target a string becomes its
 /// UTF-8 bytes (or an array of 0–255 numbers is taken as is), and for a
 /// DATETIME target a string is parsed as RFC 3339.
-pub(crate) fn from_json(
+pub fn from_json(json: &serde_json::Value, def: Option<&FieldDefinition>) -> Result<Value, String> {
+    convert_json(json, def, false)
+}
+
+/// Like [`from_json`], for decoded data (the JSON codec, `crate::json`): a
+/// string for a BYTES field is base64, and object keys the definition
+/// doesn't declare are dropped (constants refuse them).
+pub fn from_json_base64(
     json: &serde_json::Value,
     def: Option<&FieldDefinition>,
+) -> Result<Value, String> {
+    convert_json(json, def, true)
+}
+
+fn convert_json(
+    json: &serde_json::Value,
+    def: Option<&FieldDefinition>,
+    codec: bool,
 ) -> Result<Value, String> {
     use serde_json::Value as J;
     let Some(def) = def else {
@@ -291,12 +313,12 @@ pub(crate) fn from_json(
             J::Array(items) => Value::Array(
                 items
                     .iter()
-                    .map(|v| from_json(v, None))
+                    .map(|v| convert_json(v, None, codec))
                     .collect::<Result<_, _>>()?,
             ),
             J::Object(map) => Value::Object(
                 map.iter()
-                    .map(|(k, v)| Ok((k.clone(), from_json(v, None)?)))
+                    .map(|(k, v)| Ok((k.clone(), convert_json(v, None, codec)?)))
                     .collect::<Result<_, String>>()?,
             ),
         });
@@ -322,6 +344,13 @@ pub(crate) fn from_json(
             }))
         }
         FieldType::Bytes => match json {
+            serde_json::Value::String(s) if codec => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD
+                    .decode(s)
+                    .map(Value::Bytes)
+                    .map_err(|e| format!("{s:?} isn't base64: {e}"))
+            }
             serde_json::Value::String(s) => Ok(Value::Bytes(s.as_bytes().to_vec())),
             serde_json::Value::Array(items) => items
                 .iter()
@@ -340,7 +369,7 @@ pub(crate) fn from_json(
             Ok(Value::Array(
                 items
                     .iter()
-                    .map(|v| from_json(v, nested))
+                    .map(|v| convert_json(v, nested, codec))
                     .collect::<Result<_, _>>()?,
             ))
         }
@@ -349,20 +378,29 @@ pub(crate) fn from_json(
             let nested = def.nested_type_definition.as_deref();
             Ok(Value::Map(
                 map.iter()
-                    .map(|(k, v)| Ok((k.clone(), from_json(v, nested)?)))
+                    .map(|(k, v)| Ok((k.clone(), convert_json(v, nested, codec)?)))
                     .collect::<Result<_, String>>()?,
             ))
         }
         FieldType::Object => {
             let map = json.as_object().ok_or_else(mismatch)?;
             let mut fields = vec![];
+            if codec {
+                // Decoded data: in the definition's order; undeclared keys dropped.
+                for field in &def.object_fields {
+                    if let Some(v) = map.get(&field.key) {
+                        fields.push((field.key.clone(), convert_json(v, Some(field), codec)?));
+                    }
+                }
+                return Ok(Value::Object(fields));
+            }
             for (key, v) in map {
                 let field = def
                     .object_fields
                     .iter()
                     .find(|f| f.key == *key)
                     .ok_or_else(|| format!("{key:?} isn't a field of this object"))?;
-                fields.push((key.clone(), from_json(v, Some(field))?));
+                fields.push((key.clone(), convert_json(v, Some(field), codec)?));
             }
             Ok(Value::Object(fields))
         }
@@ -389,7 +427,7 @@ pub(crate) fn from_json(
             let items = json.as_array().ok_or_else(mismatch)?;
             let values = items
                 .iter()
-                .map(|v| from_json(v, None))
+                .map(|v| convert_json(v, None, codec))
                 .collect::<Result<Vec<_>, _>>()?;
             Packed::from_values(field_type, values).map(Value::Packed)
         }
@@ -401,7 +439,7 @@ pub(crate) fn from_json(
 /// a whole F64 → I32 that fits, OBJECT ↔ MAP); fails otherwise. Nested values
 /// follow their definitions; an object's fields that `def` doesn't declare
 /// are dropped.
-pub(crate) fn coerce(value: Value, def: &FieldDefinition) -> Result<Value, String> {
+pub fn coerce(value: Value, def: &FieldDefinition) -> Result<Value, String> {
     if value == Value::Null {
         return Ok(value);
     }
@@ -523,7 +561,7 @@ pub(crate) fn coerce(value: Value, def: &FieldDefinition) -> Result<Value, Strin
 }
 
 /// Shapes a payload to the target's input schema (see [`coerce`]).
-pub(crate) fn coerce_payload(value: Value, schema: &SchemaDefinition) -> Result<Value, String> {
+pub fn coerce_payload(value: Value, schema: &SchemaDefinition) -> Result<Value, String> {
     match value {
         Value::Object(fields) => coerce_fields(fields, &schema.fields).map(Value::Object),
         other => Err(format!(
@@ -567,7 +605,7 @@ fn whole_float(f: f64) -> Option<i128> {
 
 /// Whether a value of type `from` can (in principle) become a `to`, for
 /// config-time checks: some conversions still depend on the value (range).
-pub(crate) fn convertible(from: FieldType, to: FieldType) -> bool {
+pub fn convertible(from: FieldType, to: FieldType) -> bool {
     use FieldType::*;
     let numeric = |t| matches!(t, I32 | I64 | U32 | U64 | F32 | F64);
     let sequence = |t: FieldType| t == Array || element_type(t).is_some();

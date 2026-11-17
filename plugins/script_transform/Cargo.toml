@@ -1,0 +1,38 @@
+[package]
+name = "flwrs-script-transform"
+description = "flwrs transform plugin that runs a Lua script on each event, with keyed state kept exactly once."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# The state store and the Lua host are a library too: the accumulator
+# (plugins/accumulator) builds on them.
+[lib]
+name = "flwrs_script_transform"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flwrs-script-transform"
+path = "src/main.rs"
+
+[dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls"] } # TLS for remote use
+flwrs-types = { workspace = true, features = ["lua"] }
+tokio.workspace = true
+clap.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+prost.workspace = true # stored values and outputs (protobuf)
+rusqlite.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true # the launch-args schema against the CLI
+flwrs-plugin = { workspace = true, features = ["package"] }
+flwrs-trellis.workspace = true # tests/trellis.rs: audit and behaviour tests
+tempfile.workspace = true

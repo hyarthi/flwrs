@@ -1,0 +1,28 @@
+{
+  "manifest_version": 2,
+  "id": "accumulator",
+  "name": "Accumulator",
+  "version": "0.0.1",
+  "type": "TRANSFORM",
+  "description": "Aggregates events per key, over tumbling, hopping or session windows, with a Lua step and finish.",
+  "executable": "bin/flwrs-accumulator",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": {
+    "in": {
+      "from_launch_args": "/schemas/in"
+    },
+    "out": {
+      "from_launch_args": "/schemas/out"
+    }
+  },
+  "ui": {
+    "icon": "ui/accumulator.svg",
+    "categories": [
+      "Transform",
+      "Aggregation",
+      "Scripting"
+    ],
+    "docs": "README.md"
+  }
+}

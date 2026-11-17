@@ -1,0 +1,35 @@
+[package]
+name = "flwrs-accumulator"
+description = "flwrs transform plugin that aggregates events per key, over windows, with a Lua step and finish."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "flwrs_accumulator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flwrs-accumulator"
+path = "src/main.rs"
+
+[dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls"] } # TLS for remote use
+flwrs-types = { workspace = true, features = ["lua"] }
+flwrs-script-transform.workspace = true # the state store, the Lua host, settings files
+tokio.workspace = true
+clap.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true # the launch-args schema against the CLI
+flwrs-plugin = { workspace = true, features = ["package"] }
+flwrs-trellis.workspace = true # tests/trellis.rs: audit and behaviour tests
+tempfile.workspace = true

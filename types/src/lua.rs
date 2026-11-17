@@ -1,9 +1,11 @@
-//! The Lua 5.4 tier of edge mappings, behind the `mapping-lua` feature.
+//! The Lua 5.4 sandbox (feature `lua`): edge mappings in the server, and
+//! plugins that run user code (script transforms).
 //!
 //! **Sandbox.** One Lua state per edge (created when the edge's mapping is
 //! compiled, so scenes without Lua never create one). Only `string`, `table`,
 //! `math` and `utf8` are loaded; `load`, `loadfile`, `dofile`,
-//! `collectgarbage`, `require` and `print` are removed, and `io`, `os`,
+//! `collectgarbage`, `require` and `print` are removed, `json` (encode and
+//! decode, see [`crate::json`]) is added, and `io`, `os`,
 //! `debug`, `package` and `coroutine` are never loaded. Chunks run in an
 //! environment where globals can be read but not assigned (so nothing carries
 //! over between events), and the library tables are read-only. `payload` and
@@ -19,27 +21,31 @@
 //! null is `nil`. Results are converted back guided by the target schema, so
 //! an empty `{}` becomes an array or a map as the target field says.
 
-use super::value::{self, Value};
+use crate::json;
+use crate::value::{self, Value};
 use flwrs_plugin::schema::payload::{
     FieldDefinition, SchemaDefinition, field_type::Enum as FieldType,
 };
 use flwrs_plugin::schema::protocol::EventMetadata;
-use mlua::{Function, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
+/// The Lua binding, for hosts that install their own functions
+/// ([`Runtime::with_host`]).
+pub use mlua;
+use mlua::{Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, VmState};
 use pbjson_types::Timestamp;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-pub(crate) const DEFAULT_MAX_INSTRUCTIONS: u64 = 1_000_000;
-pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 50;
-pub(crate) const DEFAULT_MAX_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_INSTRUCTIONS: u64 = 1_000_000;
+pub const DEFAULT_TIMEOUT_MS: u64 = 50;
+pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 16 * 1024 * 1024;
 const HOOK_EVERY: u32 = 1_000;
 /// Marks our read-only proxies, so results that hand one back can be read.
 const PROXY_MARK: &str = "__flwrs_readonly";
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Limits {
+pub struct Limits {
     pub max_instructions: u64,
     pub timeout: Duration,
     pub max_memory_bytes: u64,
@@ -62,7 +68,7 @@ struct Budget {
 }
 
 /// One edge's Lua state and its compiled chunks.
-pub(crate) struct Runtime {
+pub struct Runtime {
     lua: Lua,
     limits: Limits,
     budget: Arc<Budget>,
@@ -79,12 +85,37 @@ impl std::fmt::Debug for Runtime {
     }
 }
 
-/// A compiled chunk: `function(payload, meta) <code> end`.
+/// An argument of [`Runtime::call_with`].
+pub enum Arg<'a> {
+    /// A value the code can read but not change (like `payload`).
+    ReadOnly(&'a Value),
+    /// A value as an ordinary, writable Lua value (like an accumulator's state).
+    Plain(&'a Value),
+    /// Event metadata (`event_id`, `trace_id`, …), read-only.
+    Meta(Option<&'a EventMetadata>),
+    /// Any Lua value.
+    Lua(mlua::Value),
+}
+
+/// Installs a host's functions and tables into the globals, before they're
+/// made read-only.
+pub type Install<'a> = &'a dyn Fn(&Lua, &Table) -> mlua::Result<()>;
+
+/// A compiled chunk: `function(<params>) <code> end`.
 #[derive(Debug, Clone)]
-pub(crate) struct Chunk(Function);
+pub struct Chunk(Function);
 
 impl Runtime {
-    pub(crate) fn new(limits: Limits) -> Result<Self, String> {
+    /// A sandbox with the standard libraries (`string`, `table`, `math`,
+    /// `utf8`, `json`).
+    pub fn new(limits: Limits) -> Result<Self, String> {
+        Self::with_host(limits, &|_, _| Ok(()))
+    }
+
+    /// A sandbox with the host's own globals too (e.g. a plugin's `load` /
+    /// `store`, [`time_library`], [`log_library`]). Tables installed this way
+    /// are read-only like the standard libraries.
+    pub fn with_host(limits: Limits, install: Install) -> Result<Self, String> {
         let lua = Lua::new_with(
             StdLib::STRING | StdLib::TABLE | StdLib::MATH | StdLib::UTF8,
             LuaOptions::default(),
@@ -111,6 +142,8 @@ impl Runtime {
                     "assigning globals isn't allowed (use local variables)",
                 ))
             })?;
+            globals.raw_set("json", json_library(&lua)?)?;
+            install(&lua, &globals)?;
             // Library tables become read-only views.
             let safe = lua.create_table()?;
             for pair in globals.pairs::<mlua::Value, mlua::Value>() {
@@ -179,8 +212,18 @@ impl Runtime {
         })
     }
 
+    /// The Lua state (e.g. to make values for [`Arg::Lua`]).
+    pub fn lua(&self) -> &Lua {
+        &self.lua
+    }
+
     /// Compiles `code` as the body of `function(payload, meta)`.
-    pub(crate) fn chunk(&self, label: &str, code: &str) -> Result<Chunk, String> {
+    pub fn chunk(&self, label: &str, code: &str) -> Result<Chunk, String> {
+        self.chunk_with(label, code, &["payload", "meta"])
+    }
+
+    /// Compiles `code` as the body of `function(<params>)`.
+    pub fn chunk_with(&self, label: &str, code: &str, params: &[&str]) -> Result<Chunk, String> {
         // Syntax first, on the code alone, so errors point at what the user
         // wrote (not at the wrapper's `end`).
         self.lua
@@ -188,7 +231,7 @@ impl Runtime {
             .set_name(format!("={label}"))
             .into_function()
             .map_err(|e| describe(&e))?;
-        let source = format!("return function(payload, meta) {code}\nend");
+        let source = format!("return function({}) {code}\nend", params.join(", "));
         self.lua
             .load(source)
             .set_name(format!("={label}"))
@@ -199,14 +242,28 @@ impl Runtime {
     }
 
     /// Runs a chunk on one event, within the limits.
-    pub(crate) fn call(
+    pub fn call(
         &self,
         chunk: &Chunk,
         payload: &Value,
         meta: Option<&EventMetadata>,
     ) -> Result<mlua::Value, String> {
-        let payload = self.to_lua(payload).map_err(|e| describe(&e))?;
-        let meta = self.meta_table(meta).map_err(|e| describe(&e))?;
+        let results = self.call_with(chunk, vec![Arg::ReadOnly(payload), Arg::Meta(meta)])?;
+        Ok(results.into_iter().next().unwrap_or(mlua::Value::Nil))
+    }
+
+    /// Runs a chunk with any arguments, within the limits; every result.
+    pub fn call_with(&self, chunk: &Chunk, args: Vec<Arg>) -> Result<MultiValue, String> {
+        let mut values = MultiValue::new();
+        for arg in args {
+            let value = match arg {
+                Arg::ReadOnly(v) => self.to_lua(v),
+                Arg::Plain(v) => plain_lua(&self.lua, v),
+                Arg::Meta(m) => self.meta_table(m).map(mlua::Value::Table),
+                Arg::Lua(v) => Ok(v),
+            };
+            values.push_back(value.map_err(|e| describe(&e))?);
+        }
         self.budget.remaining.store(
             i64::try_from(self.limits.max_instructions).unwrap_or(i64::MAX),
             Ordering::Relaxed,
@@ -216,7 +273,7 @@ impl Runtime {
             .deadline
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Instant::now() + self.limits.timeout;
-        chunk.0.call((payload, meta)).map_err(|e| match e {
+        chunk.0.call(values).map_err(|e| match e {
             mlua::Error::MemoryError(_) => format!(
                 "used more than {} bytes of memory (lua.max_memory_bytes)",
                 self.limits.max_memory_bytes
@@ -289,6 +346,192 @@ impl Runtime {
     }
 }
 
+/// `json.encode(value) -> string` and `json.decode(string) -> value`: the
+/// JSON codec (`crate::json`), on plain Lua values (tables are arrays when
+/// they're sequences, else objects; decoded tables are ordinary, writable
+/// ones). At most `json::MAX_DEPTH` levels; errors are Lua errors.
+fn json_library(lua: &Lua) -> mlua::Result<Table> {
+    let library = lua.create_table()?;
+    library.raw_set(
+        "encode",
+        lua.create_function(|_, value: mlua::Value| {
+            if too_deep(&value, 0) {
+                return Err(mlua::Error::runtime(format!(
+                    "json.encode: nested deeper than {} levels (or a table contains itself)",
+                    json::MAX_DEPTH
+                )));
+            }
+            let value = from_lua(value, None)
+                .map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))?;
+            json::encode(&value).map_err(|e| mlua::Error::runtime(format!("json.encode: {e}")))
+        })?,
+    )?;
+    library.raw_set(
+        "decode",
+        lua.create_function(|lua, text: mlua::LuaString| {
+            let value = json::decode(&text.as_bytes(), None)
+                .map_err(|e| mlua::Error::runtime(format!("json.decode: {e}")))?;
+            plain_lua(lua, &value)
+        })?,
+    )?;
+    Ok(library)
+}
+
+/// Whether a Lua value nests deeper than the JSON limit (which also stops
+/// tables that contain themselves).
+fn too_deep(value: &mlua::Value, depth: usize) -> bool {
+    let mlua::Value::Table(t) = value else {
+        return false;
+    };
+    if depth >= json::MAX_DEPTH {
+        return true;
+    }
+    unproxy(t.clone())
+        .pairs::<mlua::Value, mlua::Value>()
+        .flatten()
+        .any(|(_, v)| too_deep(&v, depth + 1))
+}
+
+/// `time.now()`: the current time in epoch milliseconds (UTC).
+pub fn time_library(lua: &Lua) -> mlua::Result<Table> {
+    let library = lua.create_table()?;
+    library.raw_set(
+        "now",
+        lua.create_function(|_, ()| {
+            Ok(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                .unwrap_or(0))
+        })?,
+    )?;
+    Ok(library)
+}
+
+/// A log level of [`log_library`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    Warn,
+}
+
+/// `log.info(...)` and `log.warn(...)`: the arguments, as text joined by
+/// spaces, go to `sink` (the host decides where, and how often).
+pub fn log_library(
+    lua: &Lua,
+    sink: Arc<dyn Fn(LogLevel, String) + Send + Sync>,
+) -> mlua::Result<Table> {
+    let library = lua.create_table()?;
+    for (name, level) in [("info", LogLevel::Info), ("warn", LogLevel::Warn)] {
+        let sink = sink.clone();
+        library.raw_set(
+            name,
+            lua.create_function(move |_, args: MultiValue| {
+                let text: Vec<String> = args
+                    .iter()
+                    .map(|v| match v {
+                        mlua::Value::String(s) => s.to_string_lossy(),
+                        mlua::Value::Table(_) => "table".into(),
+                        other => other
+                            .to_string()
+                            .unwrap_or_else(|_| other.type_name().into()),
+                    })
+                    .collect();
+                sink(level, text.join(" "));
+                Ok(())
+            })?,
+        )?;
+    }
+    Ok(library)
+}
+
+/// A Lua value as a typed value without a schema, keeping what a store needs:
+/// integers vs floats, and text vs bytes (a string that isn't UTF-8 is BYTES).
+/// Tables are arrays when they're sequences, else objects with string keys.
+pub fn from_lua_lossless(value: mlua::Value) -> Result<Value, String> {
+    if too_deep(&value, 0) {
+        return Err(format!(
+            "nested deeper than {} levels (or a table contains itself)",
+            json::MAX_DEPTH
+        ));
+    }
+    lossless(value)
+}
+
+fn lossless(value: mlua::Value) -> Result<Value, String> {
+    Ok(match value {
+        mlua::Value::Nil => Value::Null,
+        mlua::Value::Boolean(b) => Value::Bool(b),
+        mlua::Value::Integer(n) => Value::I64(n),
+        mlua::Value::Number(n) => Value::F64(n),
+        mlua::Value::String(s) => match s.to_str() {
+            Ok(text) => Value::String(text.to_string()),
+            Err(_) => Value::Bytes(s.as_bytes().to_vec()),
+        },
+        mlua::Value::Table(t) => {
+            let t = unproxy(t);
+            let len = t.raw_len();
+            let count = t.pairs::<mlua::Value, mlua::Value>().count();
+            if len > 0 && len == count {
+                let mut items = vec![];
+                for i in 1..=len {
+                    items.push(lossless(t.raw_get(i).map_err(|e| describe(&e))?)?);
+                }
+                Value::Array(items)
+            } else {
+                let mut fields = vec![];
+                for pair in t.pairs::<mlua::Value, mlua::Value>() {
+                    let (k, v) = pair.map_err(|e| describe(&e))?;
+                    fields.push((string_key(k)?, lossless(v)?));
+                }
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                Value::Object(fields)
+            }
+        }
+        other => return Err(format!("a {} can't be stored", other.type_name())),
+    })
+}
+
+/// A value as ordinary Lua values (writable tables).
+pub fn plain_lua(lua: &Lua, value: &Value) -> mlua::Result<mlua::Value> {
+    Ok(match value {
+        Value::Null => mlua::Value::Nil,
+        Value::String(s) => mlua::Value::String(lua.create_string(s)?),
+        Value::Bytes(b) => mlua::Value::String(lua.create_string(b)?),
+        Value::Bool(b) => mlua::Value::Boolean(*b),
+        Value::I32(n) => mlua::Value::Integer(i64::from(*n)),
+        Value::I64(n) => mlua::Value::Integer(*n),
+        Value::U32(n) => mlua::Value::Integer(i64::from(*n)),
+        Value::U64(n) => mlua::Value::Integer(i64::try_from(*n).map_err(|_| {
+            mlua::Error::runtime(format!("{n} is above Lua's integer range (u64 > i64::MAX)"))
+        })?),
+        Value::F32(n) => mlua::Value::Number(f64::from(*n)),
+        Value::F64(n) => mlua::Value::Number(*n),
+        Value::DateTime(t) => mlua::Value::Integer(epoch_ms(t)),
+        Value::Array(items) => {
+            let t = lua.create_table()?;
+            for (i, item) in items.iter().enumerate() {
+                t.raw_set(i + 1, plain_lua(lua, item)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+        Value::Packed(p) => plain_lua(lua, &Value::Array(p.to_values()))?,
+        Value::Map(map) => {
+            let t = lua.create_table()?;
+            for (k, v) in map {
+                t.raw_set(k.as_str(), plain_lua(lua, v)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+        Value::Object(fields) => {
+            let t = lua.create_table()?;
+            for (k, v) in fields {
+                t.raw_set(k.as_str(), plain_lua(lua, v)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+    })
+}
+
 /// A proxy that reads through to `real` and refuses writes.
 fn readonly(lua: &Lua, real: Table, error: &Function, next: &Function) -> mlua::Result<Table> {
     let proxy = lua.create_table()?;
@@ -334,7 +577,7 @@ fn epoch_ms(t: &Timestamp) -> i64 {
 /// Checks `code`'s syntax as the body of `function(<params>)`, in a bare
 /// Lua state (nothing runs). The error names `label` and the line, as the
 /// user wrote it.
-pub(crate) fn check_syntax(label: &str, code: &str, params: &[String]) -> Result<(), String> {
+pub fn check_syntax(label: &str, code: &str, params: &[String]) -> Result<(), String> {
     let lua = Lua::new_with(StdLib::NONE, LuaOptions::default())
         .map_err(|e| format!("couldn't start Lua: {e}"))?;
     lua.load(code)
@@ -366,12 +609,12 @@ fn describe(err: &mlua::Error) -> String {
 }
 
 /// Whether a Lua result counts as true (everything but `nil` and `false`).
-pub(crate) fn truthy(value: &mlua::Value) -> bool {
+pub fn truthy(value: &mlua::Value) -> bool {
     !matches!(value, mlua::Value::Nil | mlua::Value::Boolean(false))
 }
 
 /// A Lua result as a typed value, guided by `def` where known.
-pub(crate) fn from_lua(value: mlua::Value, def: Option<&FieldDefinition>) -> Result<Value, String> {
+pub fn from_lua(value: mlua::Value, def: Option<&FieldDefinition>) -> Result<Value, String> {
     let field_type = def.map(|d| d.r#type());
     let converted = match value {
         mlua::Value::Nil => return Ok(Value::Null),
@@ -492,7 +735,7 @@ fn string_key(key: mlua::Value) -> Result<String, String> {
 }
 
 /// A whole-payload script result, shaped to the target's schema.
-pub(crate) fn payload_from_lua(
+pub fn payload_from_lua(
     value: mlua::Value,
     schema: Option<&SchemaDefinition>,
 ) -> Result<Value, String> {
@@ -518,309 +761,137 @@ pub(crate) fn payload_from_lua(
 
 #[cfg(test)]
 mod tests {
-    use super::super::compile::{Schemas, compile};
-    use super::super::{MappingSpec, path::Path};
     use super::*;
-    use flwrs_plugin::schema::payload::PluginPayload;
-    use flwrs_plugin::schema::rules::parse_json;
-    use serde_json::json;
 
-    fn spec(json: serde_json::Value) -> MappingSpec {
-        MappingSpec::parse(&json).unwrap().unwrap()
-    }
-
-    fn target() -> SchemaDefinition {
-        parse_json(
-            r#"{"fields": [
-                {"key": "text", "type": "STRING"},
-                {"key": "n", "type": "I64"},
-                {"key": "big", "type": "U64"},
-                {"key": "when", "type": "DATETIME"},
-                {"key": "raw", "type": "BYTES"},
-                {"key": "list", "type": "ARRAY", "nested_type_definition": {"type": "I32"}},
-                {"key": "tags", "type": "MAP", "nested_type_definition": {"type": "STRING"}}
-            ]}"#,
-        )
-        .unwrap()
-    }
-
-    fn payload(fields: Vec<(&str, Value)>) -> PluginPayload {
-        Value::Object(
-            fields
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-        )
-        .into_payload()
-        .unwrap()
-    }
-
-    fn input() -> PluginPayload {
-        payload(vec![
-            ("text", Value::String("hello".into())),
-            ("n", Value::I64(41)),
-            (
-                "when",
-                Value::DateTime(Timestamp {
-                    seconds: 1_700_000_000,
-                    nanos: 123_000_000,
-                }),
-            ),
-            ("list", Value::Array(vec![Value::I32(1), Value::I32(2)])),
-        ])
-    }
-
-    /// Runs one Lua rule targeting `target` and returns the result there.
-    fn rule(code: &str, target_field: &str) -> Result<Option<Value>, String> {
-        let t = target();
-        let mapping = compile(
-            &spec(json!({"rules": [{"target": target_field, "lua": code}]})),
-            Schemas {
-                source: None,
-                target: Some(&t),
-            },
-        )
-        .map_err(|e| e.join("; "))?;
-        let out = mapping.apply(&input(), None)?.expect("not filtered");
-        Ok(Path::parse(target_field)
-            .unwrap()
-            .get(&Value::from_payload(&out))
-            .cloned())
+    fn run(code: &str, payload: Value) -> Result<Value, String> {
+        let runtime = Runtime::new(Limits::default())?;
+        let chunk = runtime.chunk("test", code)?;
+        let result = runtime.call(&chunk, &payload, None)?;
+        from_lua(result, None)
     }
 
     #[test]
-    fn rules_see_the_payload_and_set_typed_values() {
-        assert_eq!(
-            rule("return payload.text:upper()", "text"),
-            Ok(Some(Value::String("HELLO".into())))
-        );
-        assert_eq!(rule("return payload.n + 1", "n"), Ok(Some(Value::I64(42))));
-        assert_eq!(rule("return #payload.list", "n"), Ok(Some(Value::I64(2))));
-        assert_eq!(
-            rule(
-                "local s = 0 for _, v in ipairs(payload.list) do s = s + v end return s",
-                "n"
-            ),
-            Ok(Some(Value::I64(3)))
-        );
-        // nil removes the field, like `delete`.
-        assert_eq!(rule("return nil", "text"), Ok(None));
-    }
-
-    #[test]
-    fn values_follow_the_target_schema() {
-        // Datetimes are epoch milliseconds, both ways.
-        assert_eq!(
-            rule("return payload.when", "when"),
-            Ok(Some(Value::DateTime(Timestamp {
-                seconds: 1_700_000_000,
-                nanos: 123_000_000
-            })))
-        );
-        assert_eq!(
-            rule("return payload.when // 1000", "n"),
-            Ok(Some(Value::I64(1_700_000_000)))
-        );
-        // An empty table is whatever the target field is.
-        assert_eq!(rule("return {}", "list"), Ok(Some(Value::Array(vec![]))));
-        assert_eq!(
-            rule("return {}", "tags"),
-            Ok(Some(Value::Map(BTreeMap::new())))
-        );
-        assert_eq!(
-            rule("return {a = 'x'}", "tags"),
-            Ok(Some(Value::Map(BTreeMap::from([(
-                "a".into(),
-                Value::String("x".into())
-            )]))))
-        );
-        // Lua strings are bytes for a BYTES field; not-UTF-8 isn't a STRING.
-        assert_eq!(
-            rule("return '\\xff\\x00'", "raw"),
-            Ok(Some(Value::Bytes(vec![0xff, 0])))
-        );
-        assert!(
-            rule("return '\\xff'", "text")
-                .unwrap_err()
-                .contains("isn't UTF-8")
-        );
-        assert!(
-            rule("return {1, 2}", "text")
-                .unwrap_err()
-                .contains("can't be a STRING")
-        );
-        assert!(rule("return 1.5", "n").is_err(), "not a whole number");
-    }
-
-    #[test]
-    fn u64_above_lua_integers_is_an_error() {
-        let mapping = compile(
-            &spec(json!({"rules": [{"target": "big", "lua": "return payload.big"}]})),
-            Schemas::default(),
-        )
-        .unwrap();
-        let input = payload(vec![("big", Value::U64(u64::MAX))]);
-        assert!(
-            mapping
-                .apply(&input, None)
-                .unwrap_err()
-                .contains("above Lua's integer range")
-        );
-        let fits = payload(vec![("big", Value::U64(i64::MAX as u64))]);
-        assert!(mapping.apply(&fits, None).is_ok());
-    }
-
-    #[test]
-    fn script_and_filter() {
-        let t = target();
-        let mapping = compile(
-            &spec(json!({
-                "filter": {"lua": "return payload.n > 40"},
-                "script": {"lua": "if payload.text == 'skip' then return nil end\nreturn { text = payload.text .. '!', n = payload.n * 2, extra = 1 }"}
-            })),
-            Schemas { source: None, target: Some(&t) },
-        )
-        .unwrap();
-        let out = mapping.apply(&input(), None).unwrap().unwrap();
-        let out = Value::from_payload(&out);
-        assert_eq!(
-            out,
-            Value::Object(vec![
-                ("text".into(), Value::String("hello!".into())),
-                ("n".into(), Value::I64(82)),
-            ]),
-            "shaped to the schema (order, types; `extra` dropped)"
-        );
-        // The filter drops it.
-        let low = payload(vec![
-            ("n", Value::I64(1)),
-            ("text", Value::String("x".into())),
+    fn json_encode_and_decode() {
+        let payload = Value::Object(vec![
+            ("n".into(), Value::I64(3)),
+            ("tags".into(), Value::Array(vec![Value::String("a".into())])),
         ]);
-        assert_eq!(mapping.apply(&low, None), Ok(None));
-        // `return nil` drops it too.
-        let skip = payload(vec![
-            ("n", Value::I64(50)),
-            ("text", Value::String("skip".into())),
-        ]);
-        assert_eq!(mapping.apply(&skip, None), Ok(None));
+        // the read-only payload encodes like any table
+        assert_eq!(
+            run("return json.encode(payload)", payload.clone()),
+            Ok(Value::String(r#"{"n":3,"tags":["a"]}"#.into()))
+        );
+        // decoded tables are ordinary, writable ones
+        assert_eq!(
+            run(
+                r#"local t = json.decode('{"a": [1, 2], "b": "x"}'); t.c = #t.a; return t"#,
+                Value::Null
+            ),
+            Ok(Value::Object(vec![
+                ("a".into(), Value::Array(vec![Value::I64(1), Value::I64(2)])),
+                ("b".into(), Value::String("x".into())),
+                ("c".into(), Value::I64(2)),
+            ]))
+        );
+        assert_eq!(
+            run("return json.encode({})", Value::Null),
+            Ok(Value::String("{}".into()))
+        );
+        // errors are Lua errors (a mapping error for the caller)
+        assert!(
+            run("return json.decode('{oops')", Value::Null)
+                .unwrap_err()
+                .contains("json.decode: not JSON")
+        );
+        let e = run("local t = {}; t.t = t; return json.encode(t)", Value::Null).unwrap_err();
+        assert!(e.contains("deeper than"), "{e}");
+        // the library is read-only like the others
+        assert!(run("json.encode = nil; return 1", Value::Null).is_err());
     }
 
     #[test]
-    fn meta_is_visible() {
-        let mapping = compile(
-            &spec(json!({"rules": [{"target": "text", "lua": "return meta.trace_id .. ':' .. meta.hops"}]})),
-            Schemas::default(),
-        )
+    fn syntax_is_checked_as_a_function_body() {
+        assert!(check_syntax("x", "return payload", &["payload".into()]).is_ok());
+        let e = check_syntax("x", "return (", &[]).unwrap_err();
+        assert!(e.starts_with("x:1:"), "{e}");
+        assert!(check_syntax("x", "return ...", &[]).is_err());
+    }
+
+    #[test]
+    fn hosts_add_functions_and_call_with_any_arguments() {
+        let logged = Arc::new(Mutex::new(vec![]));
+        let sink_log = logged.clone();
+        let runtime = Runtime::with_host(Limits::default(), &move |lua, globals| {
+            globals.raw_set("time", time_library(lua)?)?;
+            let sink_log = sink_log.clone();
+            globals.raw_set(
+                "log",
+                log_library(
+                    lua,
+                    Arc::new(move |level, text| sink_log.lock().unwrap().push((level, text))),
+                )?,
+            )?;
+            globals.raw_set("double", lua.create_function(|_, n: i64| Ok(n * 2))?)?;
+            Ok(())
+        })
         .unwrap();
-        let meta = EventMetadata {
-            trace_id: "t1".into(),
-            hops: 3,
-            ..Default::default()
-        };
-        let out = mapping.apply(&input(), Some(&meta)).unwrap().unwrap();
-        assert_eq!(
-            Path::parse("text").unwrap().get(&Value::from_payload(&out)),
-            Some(&Value::String("t1:3".into()))
-        );
-    }
-
-    #[test]
-    fn the_sandbox_keeps_scripts_in() {
-        for (code, expected) in [
-            (
-                "return io.open('/etc/passwd')",
-                "attempt to index a nil value",
-            ),
-            ("return os.execute('true')", "attempt to index a nil value"),
-            ("return require('os')", "attempt to call a nil value"),
-            ("return load('return 1')()", "attempt to call a nil value"),
-            (
-                "return dofile('/etc/passwd')",
-                "attempt to call a nil value",
-            ),
-            (
-                "return loadfile('/etc/passwd')",
-                "attempt to call a nil value",
-            ),
-            (
-                "return collectgarbage('count')",
-                "attempt to call a nil value",
-            ),
-            ("return debug.getinfo(1)", "attempt to index a nil value"),
-            ("x = 1 return 'x'", "assigning globals isn't allowed"),
-            ("payload.text = 'changed' return 'x'", "read-only"),
-            ("payload.list[1] = 5 return 'x'", "read-only"),
-            ("string.upper = nil return 'x'", "read-only"),
-            (
-                "setmetatable(payload, {}) return 'x'",
-                "protected metatable",
-            ),
-        ] {
-            let err = rule(code, "text").unwrap_err();
-            assert!(err.contains(expected), "{code:?}: {err:?}");
-        }
-        // What's meant to be there works.
-        assert_eq!(
-            rule(
-                "return string.format('%d', math.max(1, 2)) .. utf8.char(65)",
-                "text"
-            ),
-            Ok(Some(Value::String("2A".into())))
-        );
-        assert_eq!(
-            rule("return tostring(getmetatable(payload))", "text"),
-            Ok(Some(Value::String("false".into())))
-        );
-    }
-
-    #[test]
-    fn limits_stop_runaway_scripts() {
-        let run = |limits: serde_json::Value, code: &str| {
-            let mapping = compile(
-                &spec(json!({"lua": limits, "rules": [{"target": "text", "lua": code}]})),
-                Schemas::default(),
+        let chunk = runtime
+            .chunk_with(
+                "step",
+                "state.n = state.n + double(payload.x); log.info('n is', state.n, true); return state, time.now() > 0",
+                &["state", "payload"],
             )
             .unwrap();
-            mapping.apply(&input(), None).unwrap_err()
-        };
-        let err = run(json!({}), "while true do end");
-        assert!(err.contains("stopped after 1000000 instructions"), "{err}");
-        let err = run(
-            json!({"max_instructions": 1_000_000_000, "timeout_ms": 20}),
-            "while true do end",
+        let state = Value::Object(vec![("n".into(), Value::I64(1))]);
+        let payload = Value::Object(vec![("x".into(), Value::I64(5))]);
+        let results = runtime
+            .call_with(&chunk, vec![Arg::Plain(&state), Arg::ReadOnly(&payload)])
+            .unwrap();
+        let mut results = results.into_iter();
+        // the state was writable; the payload wasn't touched
+        assert_eq!(
+            from_lua_lossless(results.next().unwrap()).unwrap(),
+            Value::Object(vec![("n".into(), Value::I64(11))])
         );
-        assert!(err.contains("stopped after 20 ms"), "{err}");
-        let err = run(
-            json!({"max_memory_bytes": 262_144}),
-            "local t = {} for i = 1, 1e7 do t[i] = i end return 'x'",
+        assert_eq!(results.next(), Some(mlua::Value::Boolean(true)));
+        assert_eq!(
+            *logged.lock().unwrap(),
+            [(LogLevel::Info, "n is 11 true".to_string())]
         );
-        assert!(err.contains("more than 262144 bytes of memory"), "{err}");
-        // The state stays usable after a limit was hit.
-        let mapping = compile(
-            &spec(json!({"rules": [{"target": "text", "lua": "if payload.n > 100 then while true do end end return 'ok'"}]})),
-            Schemas::default(),
-        )
-        .unwrap();
-        let big = payload(vec![("n", Value::I64(101))]);
-        assert!(mapping.apply(&big, None).is_err());
-        assert!(mapping.apply(&input(), None).unwrap().is_some());
+        // host tables are read-only too
+        let chunk = runtime.chunk_with("t", "time.now = nil", &[]).unwrap();
+        assert!(runtime.call_with(&chunk, vec![]).is_err());
+        let chunk = runtime
+            .chunk_with("t", "payload.x = 1", &["payload"])
+            .unwrap();
+        assert!(
+            runtime
+                .call_with(&chunk, vec![Arg::ReadOnly(&payload)])
+                .is_err()
+        );
     }
 
     #[test]
-    fn syntax_errors_and_limits_are_reported_at_compile_time() {
-        let errors = compile(
-            &spec(json!({"filter": {"lua": "return ("}, "rules": [{"target": "a", "lua": "return 1 +"}]})),
-            Schemas::default(),
-        )
-        .unwrap_err();
-        assert_eq!(errors.len(), 2, "{errors:?}");
-        assert!(
-            errors[0].starts_with("mapping.filter.lua: mapping.filter:1:"),
-            "{errors:?}"
+    fn lossless_keeps_bytes_and_numbers_apart() {
+        let lua = Lua::new();
+        let value: mlua::Value = lua
+            .load(r#"return { i = 1, f = 1.0, text = "hé", raw = "\xff\x00", list = {1, 2} }"#)
+            .eval()
+            .unwrap();
+        assert_eq!(
+            from_lua_lossless(value).unwrap(),
+            Value::Object(vec![
+                ("f".into(), Value::F64(1.0)),
+                ("i".into(), Value::I64(1)),
+                (
+                    "list".into(),
+                    Value::Array(vec![Value::I64(1), Value::I64(2)])
+                ),
+                ("raw".into(), Value::Bytes(vec![0xff, 0])),
+                ("text".into(), Value::String("hé".into())),
+            ])
         );
-        assert!(errors[1].starts_with("mapping.rules[0].lua:"), "{errors:?}");
-        let bad_limits =
-            MappingSpec::parse(&json!({"lua": {"timeout_ms": 0}, "rules": []})).unwrap_err();
-        assert!(bad_limits[0].contains("mapping.lua.timeout_ms must be between 1 and 10000"));
+        let cyclic: mlua::Value = lua.load("local t = {}; t.t = t; return t").eval().unwrap();
+        assert!(from_lua_lossless(cyclic).is_err());
     }
 }

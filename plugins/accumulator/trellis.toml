@@ -1,0 +1,10 @@
+# flwrs-trellis settings for the accumulator.
+
+[audit]
+launch_args = "tests/trellis/sum.json"
+
+[test]
+files = ["tests/trellis/*.test.toml"]
+
+[bench]
+files = ["benches/*.bench.toml"]

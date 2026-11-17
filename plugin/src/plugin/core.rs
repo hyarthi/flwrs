@@ -234,6 +234,36 @@ impl From<FieldDefinition> for PbFieldDefinition {
     }
 }
 
+impl From<PbFieldDefinition> for FieldDefinition {
+    /// A protobuf definition (e.g. parsed from JSON with
+    /// `schema::rules::parse_json`) as a builder.
+    fn from(field: PbFieldDefinition) -> Self {
+        let type_ = field.r#type();
+        Self {
+            key: field.key,
+            description: Some(field.description).filter(|d| !d.is_empty()),
+            type_,
+            nested_type_definition: field
+                .nested_type_definition
+                .map(|t| Box::new(FieldDefinition::from(*t))),
+            object_fields: Some(field.object_fields)
+                .filter(|f| !f.is_empty())
+                .map(|f| f.into_iter().map(Into::into).collect()),
+            content_type: Some(field.content_type).filter(|c| !c.is_empty()),
+        }
+    }
+}
+
+impl From<PbSchemaDefinition> for SchemaDefinition {
+    /// A protobuf schema (e.g. one a node's settings carry, parsed with
+    /// `schema::rules::parse_json`) as a builder, to declare in `Initialize`.
+    fn from(schema: PbSchemaDefinition) -> Self {
+        Self {
+            fields: schema.fields.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 impl Default for FieldDefinition {
     fn default() -> Self {
         Self::new()
@@ -346,5 +376,25 @@ impl Default for ReconnectPolicy {
             initial_delay: Duration::from_secs(1),
             max_delay: MAX_RECONNECT_DELAY,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protobuf_schemas_round_trip_through_the_builder() {
+        let pb = crate::schema::rules::parse_json(
+            r#"{"fields": [
+                {"key": "text", "type": "STRING", "description": "a text"},
+                {"key": "raw", "type": "BYTES", "content_type": "image/png"},
+                {"key": "doc", "type": "OBJECT", "object_fields": [{"key": "n", "type": "U64"}]},
+                {"key": "tags", "type": "MAP", "nested_type_definition": {"type": "STRING"}}
+            ]}"#,
+        )
+        .unwrap();
+        let back: PbSchemaDefinition = SchemaDefinition::from(pb.clone()).into();
+        assert_eq!(back, pb);
     }
 }

@@ -1,0 +1,22 @@
+name = "a session's events step, and its window closes with their sum"
+launch_args = "sum.json"
+
+[[steps]]
+send = "payloads/a1.json"
+expect_ack = "ack"
+expect_outputs = [{ path = "n", eq = 1 }]
+
+[[steps]]
+send = "payloads/a2.json"
+expect_ack = "ack"
+expect_outputs = [{ path = "n", eq = 2 }]
+
+# The session ends 300 ms after the last event: the timer closes it.
+[[steps]]
+wait_ms = 1000
+expect_outputs = [{ path = "sum", eq = 3.0 }]
+
+# A new session starts over.
+[[steps]]
+send = "payloads/a1.json"
+expect_outputs = [{ path = "n", eq = 1 }]

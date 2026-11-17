@@ -1,0 +1,11 @@
+# A script without state: the Lua call plus the outbox commit.
+name = "stateless script, max load"
+launch_args = "passthrough.json"
+payloads = ["payloads/d1.json", "payloads/d2.json", "payloads/d3.json", "payloads/d4.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"
+in_flight = 64

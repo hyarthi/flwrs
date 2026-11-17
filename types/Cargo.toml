@@ -1,0 +1,27 @@
+[package]
+name = "flwrs-types"
+description = "flwrs: types and type definitions shared by the server and plugins: the typed value tree, dot paths, the Lua sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Used by path inside this workspace (the server, in-repo plugins). Publish it
+# only if a published crate ever needs it.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+flwrs-plugin.workspace = true # payload and schema types
+pbjson-types.workspace = true # Timestamp
+serde_json.workspace = true
+chrono.workspace = true # RFC 3339 datetimes
+base64.workspace = true # bytes in JSON
+mlua = { workspace = true, optional = true }
+
+[features]
+default = []
+# The Lua 5.4 sandbox (vendored Lua: needs a C compiler for the target).
+lua = ["dep:mlua"]

@@ -33,7 +33,8 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 | `core/` | `flwrs-core` | Shared library: config, logging, SQLite + migrations, HTTP server, service registry. |
 | `app/` | `flwrs-app` | The flwrs server. |
 | `plugin/` | `flwrs-plugin` | Plugin protocol definition (`schema/*.proto`) and the reference Rust SDK: wire framing, `Source`/`Transform`/`Sink` traits and runners. |
-| `plugins/` | — | Base plugin library. Currently `http_sink` and `ticker` (Rust). Plugins in other languages can live here too. |
+| `types/` | `flwrs-types` | Types shared by the server and plugins: the typed value tree, dot paths and the Lua sandbox (unpublished). |
+| `plugins/` | — | Base plugin library. Currently `http_sink`, `ticker`, `script_transform` and `accumulator` (Rust). Plugins in other languages can live here too. |
 | `examples/plugins/` | — | Minimal, unsupported demo plugins (HTTP sinks in Python, Go, TypeScript and Java). |
 | `trellis/` | `flwrs-trellis` | Developer toolkit for plugins (any language): `package`, `audit` (protocol conformance), `test`, `bench`. `cargo trellis <command>` in this repo. |
 | `docs/` | — | Specifications for plugin authors: the [plugin protocol](docs/protocol.md) and the [plugin specification](docs/plugin-spec.md) (packages, manifests, launching). |
@@ -118,7 +119,7 @@ cargo run -p flwrs-app -- --config config.toml
 cargo run -p flwrs-app -- --config config.dev.toml   # serves on 127.0.0.1:8080
 ```
 
-It keeps everything the server writes at run time (database, installed plugins, node folders, uploaded files, spool files, telemetry files) under `./.data/`, which is gitignored, so runtime data never mixes with the source tree.
+It keeps everything the server writes at run time (database, installed plugins, node folders, uploaded files, spool files, telemetry files) under `./.data/`, which is gitignored, so runtime data never mixes with the source tree. To start over, stop the server and run `chmod -R u+w .data && rm -rf .data` (node folders' `config/` are read-only, so a plain `rm -rf` stops there).
 
 - REST API: `http://localhost:8080/api/scenes`
 - Swagger UI: `http://localhost:8080/swagger-ui`
@@ -207,6 +208,17 @@ Rules run in order. Each sets its `target` path from exactly one of:
 - `delete: true`: remove the target;
 - `lua`: Lua code that `return`s the value (see *Lua*, below). Returning `nil` removes the target, like `delete`.
 
+**JSON in bytes.** Bodies usually travel as BYTES (or STRING) holding JSON. A copy rule can decode or encode it:
+
+```json
+{ "mode": "replace", "rules": [ { "target": ".", "source": "body", "decode": "json" } ] }
+{ "mode": "replace", "rules": [ { "target": "body", "source": ".", "encode": "json" }, { "target": "topic", "value": "readings" } ] }
+```
+
+- `"decode": "json"`: the source (BYTES or STRING) is parsed as JSON and shaped by the target field, like a constant (a string becomes BYTES as base64, a DATETIME is RFC 3339), except that object keys the target doesn't declare are dropped. Target `"."` makes the decoded object the whole output (with `mode: replace`).
+- `"encode": "json"`: the source value becomes JSON text in a BYTES or STRING target. Source `"."` is the whole input event. Integers stay exact numbers (a JavaScript reader loses precision above 2^53), datetimes are RFC 3339 in UTC, bytes are base64, packed arrays are arrays.
+- Text that isn't JSON, or JSON that doesn't fit the target, is a mapping error. At most 32 levels of nesting.
+
 `mode` is `merge` (the default: start from the input event) or `replace` (start empty, so only the rules' targets are sent). **Paths** are dot notation: `a.b.c`, indexes `readings[0].value`, and quoted keys for unusual names `headers["content-type"]`. Missing levels are created when a target is set.
 
 The output is then shaped to the target node's input schema. Conversions that lose nothing happen on their own (I32 → I64, a whole F64 → I32 that fits, OBJECT ↔ MAP). Fields the target doesn't declare are dropped. A value that can't be converted is a **mapping error**: the event isn't sent along that edge, and it's logged (rate-limited) and counted per node.
@@ -225,8 +237,8 @@ The output is then shaped to the target node's input schema. Conversions that lo
 
 - `filter`: if it returns `false` or `nil`, the event isn't sent along this edge (Node-RED-style switch routing).
 - `script` (instead of `rules`): returns the whole output; `return nil` drops the event on this edge.
-- Code sees `payload` (the input event) and `meta` (`event_id`, `trace_id`, `hops`, `origin_node_id`, `create_time`), both read-only. Results are built as new tables.
-- **Sandbox:** only `string`, `table`, `math` and `utf8` are available. No files, processes, environment, network or loading other code (`io`, `os`, `require`, `load`, `dofile` and `debug` aren't there). Globals can't be assigned, so nothing carries over between events. Each edge has its own Lua state.
+- Code sees `payload` (the input event) and `meta` (`event_id`, `trace_id`, `hops`, `origin_node_id`, `create_time`), both read-only. Results are built as new tables. `json.encode(value)` and `json.decode(text)` convert to and from JSON text (the same rules as the codec above; decoded tables are ordinary, writable ones).
+- **Sandbox:** only `string`, `table`, `math`, `utf8` and `json` are available. No files, processes, environment, network or loading other code (`io`, `os`, `require`, `load`, `dofile` and `debug` aren't there). Globals can't be assigned, so nothing carries over between events. Each edge has its own Lua state.
 - **Limits per call** (`lua`, optional; defaults shown above): instructions, wall-clock time, memory. A script that breaks one, or fails, is a mapping error: the event is skipped on that edge, logged and counted.
 - **Values:** strings and bytes are Lua strings; integers are exact (a U64 above `i64::MAX` is an error); floats are numbers; a DATETIME is epoch milliseconds (UTC); arrays are 1-based tables; maps and objects are tables; null is `nil`. Results are converted back by the target's schema, so `{}` becomes an empty array or map as the target field says, and a string becomes BYTES for a BYTES field.
 - **A server built without Lua** refuses Lua mappings when they're saved. Scenes with Lua can still be **imported** there, but they can't be enabled: their Lua mappings are listed as problems.
@@ -373,7 +385,7 @@ Plugins are packaged and run as described in the [plugin specification](docs/plu
 
 flwrs is in early development. The main things still missing, roughly in order:
 
-1. **A set of base plugins.** Common sources, transforms and sinks (timers, MQTT, HTTP in and out, files, databases, scripting, ML inference, …), so typical workflows need no custom plugin. Today there's the HTTP sink and the ticker ([plugins/ticker](plugins/ticker): interval or cron).
+1. **A set of base plugins.** Common sources, transforms and sinks (timers, MQTT, HTTP in and out, files, databases, scripting, ML inference, …), so typical workflows need no custom plugin. Today there's the HTTP sink, the ticker ([plugins/ticker](plugins/ticker): interval or cron) the script transform ([plugins/script_transform](plugins/script_transform): Lua per event, keyed state kept exactly once) and the accumulator ([plugins/accumulator](plugins/accumulator): per-key aggregates over tumbling, hopping or session windows).
 2. **Alternative storage back-ends**, such as PostgreSQL. Today scenes, nodes, edges and the plugin registry live in SQLite only (the `Database` enum in `flwrs-core` has a single variant); a shared database is also a step towards running several servers.
 3. **A web UI** for building and running scenes visually (nodes, edges, mappings, status), instead of through the REST API.
 4. **Running as a cluster.** The server currently runs in **single-node mode only**: one server runs every scene it has, and there's no swarming, no handover of scenes between servers, and no load balancing. Remote plugins can run on other machines, but they all connect to one hub. Running properly in a data-centre environment (in-cluster) needs scenes spread across servers, failover, and load balancing.

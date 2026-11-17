@@ -831,6 +831,7 @@ struct Session {
     step: usize,
     /// step → (payload, event id, attempt) of the event it sent.
     sent: BTreeMap<usize, (PluginPayload, String, u32)>,
+    /// This connection's answers and outputs, by input seq.
     answers: BTreeMap<u64, Answer>,
     outputs: Vec<Output>,
     step_outputs: BTreeMap<usize, Vec<PluginPayload>>,
@@ -900,6 +901,10 @@ impl Session {
         })?;
         self.conn = conn;
         self.negotiated = negotiated;
+        // Seqs start over on a new connection: answers and outputs keyed by
+        // the old connection's seqs would be taken for the new events'.
+        self.answers.clear();
+        self.outputs.clear();
         self.grant_initial().await
     }
 

@@ -1,0 +1,20 @@
+{
+  "manifest_version": 2,
+  "id": "script-transform",
+  "name": "Script",
+  "version": "0.0.1",
+  "type": "TRANSFORM",
+  "description": "Runs a Lua script on each event, with keyed state kept exactly once.",
+  "executable": "bin/flwrs-script-transform",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": {
+    "in": { "from_launch_args": "/schemas/in" },
+    "out": { "from_launch_args": "/schemas/out" }
+  },
+  "ui": {
+    "icon": "ui/script.svg",
+    "categories": ["Transform", "Scripting"],
+    "docs": "README.md"
+  }
+}

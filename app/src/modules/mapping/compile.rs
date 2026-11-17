@@ -3,9 +3,12 @@
 
 use super::path::Path;
 use super::value::{self, Value, convertible};
-use super::{MappingMode, MappingSpec};
-use flwrs_plugin::schema::payload::{PluginPayload, SchemaDefinition};
+use super::{Codec, MappingMode, MappingSpec, ROOT};
+use flwrs_plugin::schema::payload::{
+    FieldDefinition, PluginPayload, SchemaDefinition, field_type::Enum as FieldType,
+};
 use flwrs_plugin::schema::protocol::EventMetadata;
+use flwrs_types::json;
 use std::sync::Arc;
 
 /// A compiled mapping: dot-notation rules, plus Lua rules,
@@ -41,6 +44,20 @@ pub(crate) fn compile(
     let mut rules = vec![];
     for (i, rule) in spec.rules.iter().flatten().enumerate() {
         let label = format!("mapping.rules[{i}]");
+        if let (Some(codec), Some(source)) = (rule.decode, &rule.source) {
+            match compile_decode(codec, source, &rule.target, schemas) {
+                Ok(rule) => rules.push(rule),
+                Err(e) => errors.push(format!("{label}: {e}")),
+            }
+            continue;
+        }
+        if let (Some(codec), Some(source)) = (rule.encode, &rule.source) {
+            match compile_encode(codec, source, &rule.target, schemas) {
+                Ok(rule) => rules.push(rule),
+                Err(e) => errors.push(format!("{label}: {e}")),
+            }
+            continue;
+        }
         let target = match Path::parse(&rule.target) {
             Ok(path) => path,
             Err(e) => {
@@ -108,11 +125,125 @@ pub(crate) fn compile(
     }))
 }
 
+/// Where a decoded value goes.
+#[derive(Debug)]
+enum Output {
+    /// The whole output (target `"."`).
+    Root,
+    Path(Path),
+}
+
+/// What an encode rule encodes.
+#[derive(Debug)]
+enum Input {
+    /// The whole input (source `"."`).
+    Root,
+    Path(Path),
+}
+
+/// A decode rule: text at `source` becomes a value shaped by `def`.
+fn compile_decode(
+    codec: Codec,
+    source: &str,
+    target: &str,
+    schemas: Schemas,
+) -> Result<Rule, String> {
+    let Codec::Json = codec;
+    let source = Path::parse(source).map_err(|e| format!("source: {e}"))?;
+    if let Some(def) = schemas
+        .source
+        .map(|s| source.resolve(s))
+        .transpose()
+        .map_err(|e| format!("source: {e} (source's output schema)"))?
+        && !matches!(def.r#type(), FieldType::String | FieldType::Bytes)
+    {
+        return Err(format!(
+            "{source} is a {}; only BYTES or STRING can be decoded",
+            def.r#type().as_str_name()
+        ));
+    }
+    let (target, def) = if target == ROOT {
+        let def = schemas.target.map(|s| FieldDefinition {
+            r#type: FieldType::Object as i32,
+            object_fields: s.fields.clone(),
+            ..Default::default()
+        });
+        (Output::Root, def)
+    } else {
+        let path = Path::parse(target).map_err(|e| format!("target: {e}"))?;
+        let def = schemas
+            .target
+            .map(|s| path.resolve(s))
+            .transpose()
+            .map_err(|e| format!("target: {e} (target's input schema)"))?
+            .cloned();
+        (Output::Path(path), def)
+    };
+    Ok(Rule::Decode {
+        source,
+        target,
+        def,
+    })
+}
+
+/// An encode rule: the value at `source` becomes text at `target`.
+fn compile_encode(
+    codec: Codec,
+    source: &str,
+    target: &str,
+    schemas: Schemas,
+) -> Result<Rule, String> {
+    let Codec::Json = codec;
+    let source = if source == ROOT {
+        Input::Root
+    } else {
+        let path = Path::parse(source).map_err(|e| format!("source: {e}"))?;
+        if let Some(schema) = schemas.source {
+            path.resolve(schema)
+                .map_err(|e| format!("source: {e} (source's output schema)"))?;
+        }
+        Input::Path(path)
+    };
+    let path = Path::parse(target).map_err(|e| format!("target: {e}"))?;
+    let def = schemas
+        .target
+        .map(|s| path.resolve(s))
+        .transpose()
+        .map_err(|e| format!("target: {e} (target's input schema)"))?;
+    let as_string = match def.map(|d| d.r#type()) {
+        None | Some(FieldType::Bytes) => false,
+        Some(FieldType::String) => true,
+        Some(other) => {
+            return Err(format!(
+                "{path} is a {}; encoded text goes into BYTES or STRING",
+                other.as_str_name()
+            ));
+        }
+    };
+    Ok(Rule::Encode {
+        source,
+        target: path,
+        as_string,
+    })
+}
+
 #[derive(Debug)]
 enum Rule {
     Copy {
         source: Path,
         target: Path,
+    },
+    /// JSON text at `source` → a value (shaped by `def`) at `target`.
+    Decode {
+        source: Path,
+        target: Output,
+        def: Option<FieldDefinition>,
+    },
+    /// The value at `source` → JSON text at `target` (STRING, else BYTES).
+    Encode {
+        source: Input,
+        target: Path,
+        as_string: bool,
     },
     Set {
         target: Path,
@@ -171,6 +302,57 @@ impl Mapping for DotMapping {
                     if let Some(found) = source.get(&input) {
                         target.set(&mut out, found.clone())?;
                     }
+                }
+                Rule::Decode {
+                    source,
+                    target,
+                    def,
+                } => {
+                    let text = match source.get(&input) {
+                        None | Some(Value::Null) => continue,
+                        Some(Value::String(s)) => s.as_bytes(),
+                        Some(Value::Bytes(b)) => b.as_slice(),
+                        Some(other) => {
+                            return Err(format!(
+                                "{source}: a {} isn't JSON text",
+                                other.type_name()
+                            ));
+                        }
+                    };
+                    let decoded =
+                        json::decode(text, def.as_ref()).map_err(|e| format!("{source}: {e}"))?;
+                    match target {
+                        Output::Root => match decoded {
+                            Value::Object(_) => out = decoded,
+                            other => {
+                                return Err(format!(
+                                    "{source}: the JSON is a {}, but the whole output must be an object",
+                                    other.type_name()
+                                ));
+                            }
+                        },
+                        Output::Path(path) => path.set(&mut out, decoded)?,
+                    }
+                }
+                Rule::Encode {
+                    source,
+                    target,
+                    as_string,
+                } => {
+                    let found = match source {
+                        Input::Root => &input,
+                        Input::Path(path) => match path.get(&input) {
+                            Some(found) => found,
+                            None => continue,
+                        },
+                    };
+                    let text = json::encode(found).map_err(|e| format!("{target}: {e}"))?;
+                    let text = if *as_string {
+                        Value::String(text)
+                    } else {
+                        Value::Bytes(text.into_bytes())
+                    };
+                    target.set(&mut out, text)?;
                 }
                 Rule::Set { target, value } => target.set(&mut out, value.clone())?,
                 Rule::Delete { target } => {
@@ -571,5 +753,216 @@ mod tests {
                 "{errors:?}"
             );
         }
+    }
+
+    fn body_schema() -> SchemaDefinition {
+        parse_json(
+            r#"{"fields": [
+                {"key": "body", "type": "BYTES"},
+                {"key": "topic", "type": "STRING"}
+            ]}"#,
+        )
+        .unwrap()
+    }
+
+    fn reading_schema() -> SchemaDefinition {
+        parse_json(
+            r#"{"fields": [
+                {"key": "device", "type": "STRING"},
+                {"key": "temp", "type": "F64"},
+                {"key": "count", "type": "U64"}
+            ]}"#,
+        )
+        .unwrap()
+    }
+
+    fn body(text: &str) -> PluginPayload {
+        Value::Object(vec![
+            ("body".into(), Value::Bytes(text.as_bytes().to_vec())),
+            ("topic".into(), Value::String("t".into())),
+        ])
+        .into_payload()
+        .unwrap()
+    }
+
+    fn apply(mapping: &Arc<dyn Mapping>, input: &PluginPayload) -> Result<Value, String> {
+        mapping
+            .apply(input, None)
+            .map(|p| Value::from_payload(&p.expect("not filtered")))
+    }
+
+    #[test]
+    fn decodes_json_bodies() {
+        let (from, to) = (body_schema(), reading_schema());
+        let schemas = Schemas {
+            source: Some(&from),
+            target: Some(&to),
+        };
+        // the whole body becomes the output
+        let whole = compile(
+            &spec(json!({"mode": "replace", "rules": [{"target": ".", "source": "body", "decode": "json"}]})),
+            schemas,
+        )
+        .unwrap();
+        let out = apply(
+            &whole,
+            &body(r#"{"device": "d1", "temp": 21.5, "count": 3, "extra": 1}"#),
+        );
+        assert_eq!(
+            out,
+            Ok(Value::Object(vec![
+                ("device".into(), Value::String("d1".into())),
+                ("temp".into(), Value::F64(21.5)),
+                ("count".into(), Value::U64(3)),
+            ]))
+        );
+        // bad JSON, or the wrong shape: a mapping error
+        assert!(
+            apply(&whole, &body("{nope"))
+                .unwrap_err()
+                .contains("body: not JSON")
+        );
+        let e = apply(&whole, &body("[1]")).unwrap_err();
+        assert!(e.contains("can't be a OBJECT"), "{e}");
+        assert!(apply(&whole, &body(r#"{"temp": "warm"}"#)).is_err());
+        // into one field
+        let one = compile(
+            &spec(json!({"mode": "replace", "rules": [
+                {"target": "device", "source": "topic"},
+                {"target": "temp", "source": "body", "decode": "json"}
+            ]})),
+            schemas,
+        )
+        .unwrap();
+        let out = apply(&one, &body("19")).unwrap();
+        assert_eq!(
+            out,
+            Value::Object(vec![
+                ("device".into(), Value::String("t".into())),
+                ("temp".into(), Value::F64(19.0))
+            ])
+        );
+    }
+
+    #[test]
+    fn encodes_values_as_json() {
+        let (from, to) = (reading_schema(), body_schema());
+        let schemas = Schemas {
+            source: Some(&from),
+            target: Some(&to),
+        };
+        let mapping = compile(
+            &spec(json!({"mode": "replace", "rules": [
+                {"target": "body", "source": ".", "encode": "json"},
+                {"target": "topic", "source": "device", "encode": "json"}
+            ]})),
+            schemas,
+        )
+        .unwrap();
+        let input = Value::Object(vec![
+            ("device".into(), Value::String("d1".into())),
+            ("temp".into(), Value::F64(21.5)),
+            ("count".into(), Value::U64(u64::MAX)),
+        ])
+        .into_payload()
+        .unwrap();
+        let Value::Object(out) = apply(&mapping, &input).unwrap() else {
+            panic!()
+        };
+        let Value::Bytes(text) = &out[0].1 else {
+            panic!("{out:?}")
+        };
+        let json: serde_json::Value = serde_json::from_slice(text).unwrap();
+        assert_eq!(
+            json,
+            json!({"device": "d1", "temp": 21.5, "count": 18446744073709551615u64})
+        );
+        assert_eq!(out[1].1, Value::String("\"d1\"".into()));
+    }
+
+    #[test]
+    fn codec_rules_are_checked() {
+        let (bodies, readings) = (body_schema(), reading_schema());
+        let check = |rules: serde_json::Value, mode: Option<&str>| {
+            let mut m = json!({"rules": rules});
+            if let Some(mode) = mode {
+                m["mode"] = json!(mode);
+            }
+            MappingSpec::parse(&m)
+        };
+        for (rules, mode, expected) in [
+            (
+                json!([{"target": ".", "source": "body"}]),
+                Some("replace"),
+                "only for a decode rule",
+            ),
+            (
+                json!([{"target": ".", "source": "body", "decode": "json"}]),
+                None,
+                "needs \"mode\": \"replace\"",
+            ),
+            (
+                json!([{"target": "x", "source": ".", "decode": "json"}]),
+                None,
+                "only for an encode rule",
+            ),
+            (
+                json!([{"target": "x", "value": 1, "decode": "json"}]),
+                None,
+                "go with a source",
+            ),
+            (
+                json!([{"target": "x", "source": "a", "decode": "json", "encode": "json"}]),
+                None,
+                "not both",
+            ),
+            (
+                json!([{"target": "x", "source": "a", "decode": "yaml"}]),
+                None,
+                "unknown variant",
+            ),
+        ] {
+            let errors = check(rules, mode).unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{expected:?} not in {errors:?}"
+            );
+        }
+        // against the schemas: decode only from text, encode only into text
+        let errors = compile(
+            &spec(json!({"rules": [{"target": "device", "source": "temp", "decode": "json"}]})),
+            Schemas {
+                source: Some(&readings),
+                target: Some(&readings),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            errors[0].contains("only BYTES or STRING can be decoded"),
+            "{errors:?}"
+        );
+        let errors = compile(
+            &spec(json!({"rules": [{"target": "temp", "source": "device", "encode": "json"}]})),
+            Schemas {
+                source: Some(&readings),
+                target: Some(&readings),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            errors[0].contains("goes into BYTES or STRING"),
+            "{errors:?}"
+        );
+        // no schemas known: accepted
+        assert!(
+            compile(
+                &spec(json!({"rules": [{"target": "x", "source": "body", "decode": "json"}]})),
+                Schemas {
+                    source: Some(&bodies),
+                    target: None
+                },
+            )
+            .is_ok()
+        );
     }
 }

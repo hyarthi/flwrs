@@ -3,7 +3,17 @@ resolver = "3"
 # Members are listed explicitly (no `plugins/*` glob), so folders under plugins/
 # that aren't Rust crates (non-Rust plugins, installed packages) can't break the
 # workspace. Add each new Rust plugin here.
-members = ["core", "app", "plugin", "plugins/http_sink", "plugins/ticker", "trellis"]
+members = [
+    "core",
+    "app",
+    "plugin",
+    "types",
+    "plugins/http_sink",
+    "plugins/ticker",
+    "plugins/script_transform",
+    "plugins/accumulator",
+    "trellis",
+]
 
 # Shared package metadata; crates opt in with `<field>.workspace = true`.
 [workspace.package]
@@ -20,6 +30,10 @@ repository = "https://github.com/hyarthi/flwrs"
 flwrs-core = { path = "core" }
 # Without default features: crates opt into the SDK's TLS client (feature `tls`).
 flwrs-plugin = { path = "plugin", version = "0.0.6", default-features = false }
+# The value tree, dot paths and Lua sandbox (unpublished; server and in-repo plugins).
+flwrs-types = { path = "types" }
+# The script transform's state store and Lua host (the accumulator builds on them).
+flwrs-script-transform = { path = "plugins/script_transform" }
 # The developer toolkit, as a dev-dependency of the plugins here (their tests run it).
 flwrs-trellis = { path = "trellis" }
 
@@ -48,6 +62,10 @@ jsonschema = { version = "0.60.2", default-features = false, features = ["idna"]
 zip = { version = "9.3.0", default-features = false, features = ["deflate"] }
 # Scene imports from tar / tar.gz archives (no xattr support needed).
 tar = { version = "0.4.44", default-features = false }
+base64 = "0.22.1" # the JSON codec's bytes (flwrs-types)
+# Plugins' own state stores (synchronous SQLite). Must use the same
+# libsqlite3-sys as sqlx (0.37): only one crate may link the C library.
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 glob = "0.3.4" # trellis: test/bench file lists and package include/exclude patterns
 
 # time (ticker): jiff reads the system time zone database on Unix and bundles it

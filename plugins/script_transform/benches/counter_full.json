@@ -1,0 +1,36 @@
+{
+  "schemas": {
+    "in": {
+      "fields": [
+        {
+          "key": "device",
+          "type": "STRING"
+        },
+        {
+          "key": "v",
+          "type": "F64"
+        }
+      ]
+    },
+    "out": {
+      "fields": [
+        {
+          "key": "device",
+          "type": "STRING"
+        },
+        {
+          "key": "n",
+          "type": "I64"
+        },
+        {
+          "key": "sum",
+          "type": "F64"
+        }
+      ]
+    }
+  },
+  "script": "local s = load(payload.device) or { n = 0, sum = 0 }\ns.n = s.n + 1\ns.sum = s.sum + payload.v\nstore(payload.device, s)\nreturn { device = payload.device, n = s.n, sum = s.sum }",
+  "state": {
+    "sync": "full"
+  }
+}

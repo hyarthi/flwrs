@@ -1,0 +1,33 @@
+{
+  "schemas": {
+    "in": {
+      "fields": [
+        {
+          "key": "device",
+          "type": "STRING"
+        },
+        {
+          "key": "v",
+          "type": "F64"
+        }
+      ]
+    },
+    "out": {
+      "fields": [
+        {
+          "key": "device",
+          "type": "STRING"
+        },
+        {
+          "key": "n",
+          "type": "I64"
+        },
+        {
+          "key": "sum",
+          "type": "F64"
+        }
+      ]
+    }
+  },
+  "script": "return { device = payload.device, n = 1, sum = payload.v }"
+}

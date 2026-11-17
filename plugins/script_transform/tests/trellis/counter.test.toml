@@ -1,0 +1,37 @@
+name = "counts per device, exactly once, across restarts"
+launch_args = "counter.json"
+
+[[steps]]
+send = "payloads/a.json"
+expect_ack = "ack"
+expect_outputs = [{ path = "n", eq = 1 }]
+
+[[steps]]
+send = "payloads/a.json"
+expect_ack = "ack"
+expect_outputs = [{ path = "n", eq = 2 }]
+
+# The hub delivers step 2's event again (same event id): the stored outputs
+# come back, and the count doesn't move.
+[[steps]]
+redeliver = 2
+expect_ack = "ack"
+expect_outputs = [{ path = "n", eq = 2 }]
+
+[[steps]]
+send = "payloads/b.json"
+expect_outputs = [{ path = "n", eq = 1 }]   # b has its own count
+
+# A failing script: rejected (on_error = nack), nothing stored.
+[[steps]]
+send = "payloads/bad.json"
+expect_ack = { nack = { retryable = false } }
+expect_outputs = [{ count = 0 }]
+
+# The state is in the node's folder: it survives a restart.
+[[steps]]
+restart = true
+
+[[steps]]
+send = "payloads/a.json"
+expect_outputs = [{ path = "n", eq = 3 }]

@@ -1,0 +1,11 @@
+# The same with every commit on disk before the ACK (sync = full).
+name = "state per device, sync full, max load"
+launch_args = "counter_full.json"
+payloads = ["payloads/d1.json", "payloads/d2.json", "payloads/d3.json", "payloads/d4.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"
+in_flight = 64
