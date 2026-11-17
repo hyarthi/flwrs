@@ -11,7 +11,7 @@ A flwrs plugin is a standalone executable that the server launches (or that runs
 - with the `cli` feature (off by default), the bootstrap arguments the server passes (`--id --host --port --log-level --token`) as a clap struct, `cli::Bootstrap`, to flatten into your own arguments;
 - with the `package` feature (off by default), the plugin package format (`package`): the `manifest.json` model and its validation, the launch-args rules (how a node's `launch_args` become command-line arguments), and the checks the server runs on an uploaded package ZIP. The server and `flwrs-trellis` share this code, so tools built on it accept exactly what the server accepts.
 
-> **Status:** early development. This version speaks plugin protocol version 2 (framing version 2), which isn't compatible with 0.0.2 and earlier. 0.0.4 added the `package` feature; 0.0.5 added the `cli` feature and `LocalSink::ready`; 0.0.6 adds manifest version 2 to `package` (per-node payload schemas, `ui`, the launch-args annotations and `launch::LaunchSpec` with its launch plan and limits; the `json` launch-args style is gone) and `cli::read_json` / `read_text`. The protocol is unchanged from 0.0.3. Expect breaking changes until it's released as stable.
+> **Status:** early development. This version speaks plugin protocol version 2 (framing version 2), which isn't compatible with 0.0.2 and earlier. 0.0.4 added the `package` feature; 0.0.5 added the `cli` feature and `LocalSink::ready`; 0.0.6 adds manifest version 2 to `package` (per-node payload schemas, `ui`, the launch-args annotations and `launch::LaunchSpec` with its launch plan and limits; the `json` launch-args style is gone) and `cli::read_json` / `read_text`; 0.0.7 adds `transform::LocalSink::emit_confirmed` and conversions from the protobuf schema types to the schema builder (for schemas a node's settings carry). The protocol is unchanged from 0.0.3. Expect breaking changes until it's released as stable.
 
 ## Writing a sink
 
@@ -78,7 +78,7 @@ The flwrs repository's [`plugins/http_sink`](https://github.com/hyarthi/flwrs/tr
 
 ```toml
 [dev-dependencies]
-flwrs-trellis = "0.0.3"
+flwrs-trellis = "0.0.4"
 ```
 
 ```rust,ignore
