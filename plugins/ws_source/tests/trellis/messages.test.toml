@@ -1,0 +1,35 @@
+# Messages (sent by the stimulus in tests/trellis.rs, in order, each checked
+# by it: upgrade refused or not, the close code) and the events they become.
+name = "messages become typed events"
+launch_args = "readings.json"
+
+[[steps]]
+wait_ms = 1000
+
+# A reading on /devices/d1, typed, with its path parameter.
+[[steps]]
+stimulus = true
+expect_outputs = [{ payload = "expected/reading.json", match = "subset" }]
+
+# The other message of the channel, sent as a binary frame.
+[[steps]]
+stimulus = true
+expect_outputs = [{ payload = "expected/status.json", match = "subset" }]
+
+# Dropped: against the schema, and not JSON. The connection stays open.
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+# A path the document doesn't have: the upgrade is refused (404).
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+# Time for the last connection's check (tests/trellis.rs) before teardown.
+[[steps]]
+wait_ms = 1500

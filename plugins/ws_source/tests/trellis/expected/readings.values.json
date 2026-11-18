@@ -1,0 +1,115 @@
+{
+  "out_schema": {
+    "fields": [
+      {
+        "description": "The connection the message came on (a ULID)",
+        "key": "connection_id",
+        "type": "STRING"
+      },
+      {
+        "description": "The matched channel address (/devices/{id})",
+        "key": "path",
+        "type": "STRING"
+      },
+      {
+        "description": "The connection's path and query, as requested",
+        "key": "uri",
+        "type": "STRING"
+      },
+      {
+        "description": "text or binary",
+        "key": "message_type",
+        "type": "STRING"
+      },
+      {
+        "description": "The name of the message it matched in the document",
+        "key": "message",
+        "type": "STRING"
+      },
+      {
+        "description": "The message, as sent",
+        "key": "data",
+        "type": "BYTES"
+      },
+      {
+        "description": "The upgrade request's headers (lowercase names; credentials left out)",
+        "key": "headers",
+        "nestedTypeDefinition": {
+          "nestedTypeDefinition": {
+            "type": "STRING"
+          },
+          "type": "ARRAY"
+        },
+        "type": "MAP"
+      },
+      {
+        "description": "The client's address",
+        "key": "remote_addr",
+        "type": "STRING"
+      },
+      {
+        "description": "Who connected: the token's label or the certificate's name",
+        "key": "principal",
+        "type": "STRING"
+      },
+      {
+        "description": "When the server received it",
+        "key": "receive_time",
+        "type": "DATETIME"
+      },
+      {
+        "description": "The message, typed by the document: channels[\"<address>\"].{path_params, messages.<name>}",
+        "key": "channels",
+        "objectFields": [
+          {
+            "key": "/devices/{deviceId}",
+            "objectFields": [
+              {
+                "key": "path_params",
+                "objectFields": [
+                  {
+                    "key": "deviceId",
+                    "type": "STRING"
+                  }
+                ],
+                "type": "OBJECT"
+              },
+              {
+                "key": "messages",
+                "objectFields": [
+                  {
+                    "key": "reading",
+                    "objectFields": [
+                      {
+                        "key": "at",
+                        "type": "DATETIME"
+                      },
+                      {
+                        "key": "temp",
+                        "type": "F64"
+                      }
+                    ],
+                    "type": "OBJECT"
+                  },
+                  {
+                    "key": "status",
+                    "objectFields": [
+                      {
+                        "key": "online",
+                        "type": "BOOL"
+                      }
+                    ],
+                    "type": "OBJECT"
+                  }
+                ],
+                "type": "OBJECT"
+              }
+            ],
+            "type": "OBJECT"
+          }
+        ],
+        "type": "OBJECT"
+      }
+    ]
+  }
+}

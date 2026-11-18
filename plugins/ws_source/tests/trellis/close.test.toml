@@ -1,0 +1,19 @@
+# invalid_messages = close: a message no definition takes closes the
+# connection with 1008; the next connection works.
+name = "invalid messages close the connection"
+launch_args = "close.json"
+
+[[steps]]
+wait_ms = 1000
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ count = 0 }]
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ path = "message", eq = "reading" }]
+
+# Time for the last connection's check (tests/trellis.rs) before teardown.
+[[steps]]
+wait_ms = 1500

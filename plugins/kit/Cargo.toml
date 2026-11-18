@@ -26,6 +26,7 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
+jsonschema.workspace = true # validators inside OpenAPI / AsyncAPI documents
 
 [dev-dependencies]
 axum = { workspace = true, features = ["ws"] } # a WebSocket route through the core

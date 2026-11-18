@@ -3,6 +3,8 @@
 //! the document must be self-contained), into the operations the server
 //! routes: path templates, methods, parameters, request bodies.
 
+use flwrs_plugin_kit::schema::external_refs;
+pub use flwrs_plugin_kit::schema::{escape, resolve};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -77,11 +79,6 @@ pub struct Api {
     pub warnings: Vec<String>,
 }
 
-/// Escapes a key for a JSON pointer.
-pub fn escape(key: &str) -> String {
-    key.replace('~', "~0").replace('/', "~1")
-}
-
 fn kind_of(media_type: &str) -> MediaKind {
     if media_type == "application/json" || media_type.ends_with("+json") {
         MediaKind::Json
@@ -89,54 +86,6 @@ fn kind_of(media_type: &str) -> MediaKind {
         MediaKind::Form
     } else {
         MediaKind::Bytes
-    }
-}
-
-/// Follows local `$ref`s from `pointer` to the object they lead to; returns
-/// it and its pointer.
-pub fn resolve<'a>(doc: &'a Value, pointer: &str) -> Result<(&'a Value, String), String> {
-    let mut pointer = pointer.to_string();
-    for _ in 0..32 {
-        let value = doc
-            .pointer(&pointer)
-            .ok_or_else(|| format!("#{pointer} doesn't exist"))?;
-        match value.get("$ref").and_then(Value::as_str) {
-            Some(r) => {
-                pointer = r
-                    .strip_prefix('#')
-                    .ok_or_else(|| {
-                        format!("#{pointer}: only local references (#/…) are allowed, not {r:?}")
-                    })?
-                    .to_string();
-            }
-            None => return Ok((value, pointer)),
-        }
-    }
-    Err(format!("#{pointer}: references nest too deep (a cycle?)"))
-}
-
-/// Every `$ref` that isn't local (`#/…`): the document must be self-contained.
-fn external_refs(value: &Value, at: &str, out: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (k, v) in map {
-                if k == "$ref"
-                    && let Some(r) = v.as_str()
-                    && !r.starts_with('#')
-                {
-                    out.push(format!(
-                        "#{at}: the reference {r:?} points outside the document; it must be self-contained"
-                    ));
-                }
-                external_refs(v, &format!("{at}/{}", escape(k)), out);
-            }
-        }
-        Value::Array(items) => {
-            for (i, v) in items.iter().enumerate() {
-                external_refs(v, &format!("{at}/{i}"), out);
-            }
-        }
-        _ => {}
     }
 }
 

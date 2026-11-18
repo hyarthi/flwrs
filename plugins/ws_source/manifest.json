@@ -1,0 +1,23 @@
+{
+  "manifest_version": 2,
+  "id": "ws-source",
+  "name": "WebSocket source",
+  "version": "0.0.1",
+  "type": "SOURCE",
+  "description": "A WebSocket server that turns messages into events, typed by an AsyncAPI 3.x document.",
+  "executable": "bin/flwrs-ws-source",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": {
+    "out": { "from_launch_args": "/out_schema" }
+  },
+  "configurator": {
+    "executable": "bin/flwrs-ws-source-config",
+    "fields": ["out_schema"]
+  },
+  "ui": {
+    "icon": "ui/ws-source.svg",
+    "categories": ["Inputs", "WebSocket", "AsyncAPI"],
+    "docs": "README.md"
+  }
+}

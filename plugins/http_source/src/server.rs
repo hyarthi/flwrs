@@ -16,6 +16,7 @@ use axum::routing::{MethodFilter, MethodRouter};
 use flwrs_plugin::plugin::core::Unconfirmed;
 use flwrs_plugin::schema::payload::{FieldDefinition, SchemaDefinition};
 use flwrs_plugin::source::local_sink::LocalSink;
+use flwrs_plugin_kit::schema::validator;
 use flwrs_plugin_kit::server::{ConnInfo, HeaderPolicy, Principal, query_pairs};
 use flwrs_types::value::{Value as FValue, coerce_payload, from_json_base64};
 use serde_json::{Map, Value, json};
@@ -88,37 +89,6 @@ fn shape(doc: &Value, ptr: &str, depth: usize) -> Shape {
         None if schema.get("enum").is_some() => Shape::String,
         _ => Shape::Other,
     }
-}
-
-/// Validates against the schema at `ptr`: the whole document with a root
-/// `$ref`, so `#/components/…` resolve (its other keys aren't keywords).
-fn validator(doc: &Value, ptr: &str) -> Result<jsonschema::Validator, String> {
-    let mut schema = doc.clone();
-    if let Value::Object(map) = &mut schema {
-        map.insert(
-            "$ref".into(),
-            Value::String(format!("#{}", uri_fragment(ptr))),
-        );
-    }
-    jsonschema::options()
-        .with_draft(jsonschema::Draft::Draft202012)
-        .build(&schema)
-        .map_err(|e| format!("#{ptr}: {e}"))
-}
-
-/// A JSON pointer as a URI fragment (RFC 6901 §6): characters a fragment
-/// can't hold (e.g. a path template's `{` and `}`) percent-encoded.
-fn uri_fragment(ptr: &str) -> String {
-    let mut out = String::with_capacity(ptr.len());
-    for b in ptr.bytes() {
-        let keep = b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/".contains(&b);
-        if keep {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 fn object_field<'a>(fields: &'a [FieldDefinition], key: &str) -> Option<&'a FieldDefinition> {

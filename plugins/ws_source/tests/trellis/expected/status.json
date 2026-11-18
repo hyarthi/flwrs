@@ -1,0 +1,10 @@
+{
+  "message_type": "binary",
+  "message": "status",
+  "channels": {
+    "/devices/{deviceId}": {
+      "path_params": { "deviceId": "d2" },
+      "messages": { "status": { "online": true } }
+    }
+  }
+}

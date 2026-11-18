@@ -17,6 +17,7 @@ members = [
     "plugins/ws_sink",
     "plugins/kit",
     "plugins/http_source",
+    "plugins/ws_source",
     "trellis",
 ]
 
@@ -125,6 +126,9 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 # HTTP source: OpenAPI 3.1 (without preserve-order: it would switch serde_json's maps to insertion order workspace-wide), YAML specs
 oas3 = { version = "0.22.0", default-features = false }
 yaml_serde = "0.10.7"
+# WS source: AsyncAPI 2.6 / 3.0 / 3.1 parsing and validation (3.x used); its validation options are an enumset
+roas-asyncapi = { version = "0.5.2", default-features = false, features = ["v3_0", "v3_1"] }
+enumset = "1.1.13"
 x509-parser = "0.18.1"
 
 # testing

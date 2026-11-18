@@ -1,0 +1,3 @@
+name = "the out schema follows the document"
+launch_args = "readings.json"
+values = "expected/readings.values.json"

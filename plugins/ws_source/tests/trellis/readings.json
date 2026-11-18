@@ -1,0 +1,5 @@
+{
+  "listen": "127.0.0.1:${ws}",
+  "asyncapi": "asyncapi: 3.0.0\ninfo: { title: Readings, version: \"1\" }\nchannels:\n  readings:\n    address: /devices/{deviceId}\n    parameters:\n      deviceId: { description: The device }\n    messages:\n      reading:\n        payload:\n          type: object\n          required: [temp]\n          properties:\n            temp: { type: number, maximum: 100 }\n            at: { type: string, format: date-time }\n      status:\n        payload:\n          type: object\n          required: [online]\n          properties:\n            online: { type: boolean }\n          additionalProperties: false\noperations:\n  receiveReadings:\n    action: receive\n    channel: { $ref: \"#/channels/readings\" }\n",
+  "enqueue_timeout_ms": 500
+}

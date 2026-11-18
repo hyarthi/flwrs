@@ -1,0 +1,27 @@
+# No credit: the message waits enqueue_timeout_ms (500), then the connection
+# closes with 1013 (try again later). With credit again, messages go through.
+name = "a slow workflow closes the connection with 1013"
+launch_args = "readings.json"
+initial_credit = 0
+return_credit = false
+
+[[steps]]
+wait_ms = 1000
+
+[[steps]]
+stimulus = true
+
+[[steps]]
+wait_ms = 800
+expect_outputs = [{ count = 0 }]
+
+[[steps]]
+grant = 1
+
+[[steps]]
+stimulus = true
+expect_outputs = [{ path = 'channels["/devices/{deviceId}"].messages.reading.temp', eq = 2 }]
+
+# Time for the last connection's check (tests/trellis.rs) before teardown.
+[[steps]]
+wait_ms = 1500

@@ -1,0 +1,318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "allowed_origins": {
+      "description": "The Origin headers browsers may connect from (e.g. https://app.example.com); empty: any. Clients that send no Origin (not browsers) aren't affected.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Allowed origins",
+      "type": "array",
+      "x-flwrs-launch": {
+        "via": "file"
+      },
+      "x-flwrs-order": 4
+    },
+    "api_key_in": {
+      "default": "header",
+      "enum": [
+        "header",
+        "query"
+      ],
+      "title": "API key in",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 104
+    },
+    "api_key_name": {
+      "default": "x-api-key",
+      "minLength": 1,
+      "title": "API key name",
+      "type": "string",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 103
+    },
+    "asyncapi": {
+      "description": "The API to serve: an AsyncAPI 3.0 or 3.1 document, as JSON or YAML text, or as an object. The channels of its receive operations are the WebSocket paths (their addresses), and their messages' JSON Schema payloads type and validate what clients send. It must be self-contained (no external $refs).",
+      "title": "AsyncAPI document",
+      "type": [
+        "object",
+        "string"
+      ],
+      "x-flwrs-launch": {
+        "via": "file"
+      },
+      "x-flwrs-order": 1
+    },
+    "auth": {
+      "description": "none, bearer (Authorization: Bearer <token>), api_key (a header or query parameter) or mtls (client certificates).",
+      "enum": [
+        "none",
+        "bearer",
+        "api_key",
+        "mtls"
+      ],
+      "title": "Authentication",
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 101
+    },
+    "auth_secrets": {
+      "additionalProperties": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "description": "bearer and api_key: {\"label\": \"secret\"}. The label of the one a request used becomes its event's principal.",
+      "title": "Tokens / keys",
+      "type": "object",
+      "writeOnly": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-launch": {
+        "via": "file"
+      },
+      "x-flwrs-order": 102
+    },
+    "enqueue_timeout_ms": {
+      "default": 5000,
+      "description": "How long a message waits for the workflow to take it (messages are read one at a time, so a slow workflow slows the client down); then the connection closes with 1013 (try again later).",
+      "minimum": 1,
+      "title": "Enqueue timeout (ms)",
+      "type": "integer",
+      "x-flwrs-order": 7
+    },
+    "h2c": {
+      "default": false,
+      "description": "Without TLS: accept HTTP/2 with prior knowledge besides HTTP/1.1.",
+      "title": "Cleartext HTTP/2",
+      "type": "boolean",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 114
+    },
+    "header_allowlist": {
+      "description": "The only request headers events carry (wins over the denylist).",
+      "items": {
+        "type": "string"
+      },
+      "title": "Header allowlist",
+      "type": "array",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 123
+    },
+    "header_denylist": {
+      "description": "Request headers events never carry. Default: authorization, proxy-authorization, cookie, set-cookie, x-api-key (and the API key's header).",
+      "items": {
+        "type": "string"
+      },
+      "title": "Header denylist",
+      "type": "array",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 124
+    },
+    "health_path": {
+      "default": "/healthz",
+      "title": "Liveness path",
+      "type": "string",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 121
+    },
+    "invalid_messages": {
+      "default": "drop",
+      "description": "A message no definition of its channel takes (not JSON, or its payload schema fails): drop it (a WARN once a minute), or close the connection (1008).",
+      "enum": [
+        "drop",
+        "close"
+      ],
+      "title": "Invalid messages",
+      "x-flwrs-order": 8
+    },
+    "limits": {
+      "additionalProperties": false,
+      "properties": {
+        "h2_max_streams": {
+          "default": 128,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "header_read_timeout_ms": {
+          "default": 10000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_body_bytes": {
+          "default": 1048576,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_concurrent_requests": {
+          "default": 256,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_connections": {
+          "default": 1024,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_header_bytes": {
+          "default": 16384,
+          "minimum": 8192,
+          "type": "integer"
+        },
+        "request_timeout_ms": {
+          "default": 30000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "title": "Limits",
+      "type": "object",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 120
+    },
+    "listen": {
+      "default": "127.0.0.1:8080",
+      "description": "Address and port. Anything but loopback needs auth (or auth: none set explicitly).",
+      "title": "Listen on",
+      "type": "string",
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 100
+    },
+    "max_message_bytes": {
+      "default": 1048576,
+      "description": "A larger message (or frame) closes the connection (1009).",
+      "minimum": 16,
+      "title": "Largest message (bytes)",
+      "type": "integer",
+      "x-flwrs-order": 5
+    },
+    "mtls_allow": {
+      "additionalProperties": false,
+      "description": "mtls: SHA-256 fingerprints or names (SAN DNS / URI, or CN). Empty: any certificate the client CA signed.",
+      "properties": {
+        "fingerprints": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "names": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "title": "Allowed client certificates",
+      "type": "object",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 105
+    },
+    "out_schema": {
+      "description": "Set by the plugin's configurator from the document: the common message fields and channels[\"<address>\"].{path_params, messages.<name>}.",
+      "readOnly": true,
+      "title": "Out schema (derived)",
+      "type": "object",
+      "x-flwrs-advanced": true,
+      "x-flwrs-launch": {
+        "via": "file"
+      },
+      "x-flwrs-order": 9
+    },
+    "paths": {
+      "description": "Without a document: the paths clients connect to (default [\"/ws\"]); every message is an event, as bytes.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Paths",
+      "type": "array",
+      "x-flwrs-launch": {
+        "via": "file"
+      },
+      "x-flwrs-order": 2
+    },
+    "ping_interval_s": {
+      "default": 30,
+      "description": "The server pings each client this often; a client that has sent nothing since the last ping is closed.",
+      "minimum": 1,
+      "title": "Ping interval (s)",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 6
+    },
+    "ready_path": {
+      "default": "/readyz",
+      "title": "Readiness path",
+      "type": "string",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 122
+    },
+    "subprotocols": {
+      "description": "The subprotocols the server speaks (Sec-WebSocket-Protocol), in order of preference; a client offering none of them still connects, without one.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Subprotocols",
+      "type": "array",
+      "x-flwrs-launch": {
+        "via": "file"
+      },
+      "x-flwrs-order": 3
+    },
+    "tls_cert": {
+      "description": "Uploaded PEM file: the server's certificate chain. Turns TLS on (HTTP/2 and HTTP/1.1 by ALPN).",
+      "title": "TLS certificate",
+      "type": "string",
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-launch": {
+        "source": "upload",
+        "via": "file"
+      },
+      "x-flwrs-order": 110
+    },
+    "tls_client_auth": {
+      "description": "With a client CA: optional or required (required for auth: mtls).",
+      "enum": [
+        "optional",
+        "required"
+      ],
+      "title": "Client certificates",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 113
+    },
+    "tls_client_ca": {
+      "description": "Uploaded PEM file: the CA(s) of client certificates (mTLS).",
+      "title": "Client CA",
+      "type": "string",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-launch": {
+        "source": "upload",
+        "via": "file"
+      },
+      "x-flwrs-order": 112
+    },
+    "tls_key": {
+      "description": "Uploaded PEM file: the server's private key.",
+      "title": "TLS key",
+      "type": "string",
+      "writeOnly": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-launch": {
+        "source": "upload",
+        "via": "file"
+      },
+      "x-flwrs-order": 111
+    }
+  },
+  "title": "WebSocket source settings",
+  "type": "object"
+}
