@@ -1,17 +1,62 @@
 use crate::modules::node_config::SceneDefaults;
 use crate::modules::scene::service::{EdgeRow, ListFilters, NodeRow, NodeUpload, Scene};
 use chrono::Local;
-use sqlx::{Sqlite, SqliteConnection};
+use sqlx::{AssertSqlSafe, Sqlite, SqliteConnection};
+
+/// Which graph a query reads or writes: the live one, or the scene's draft.
+/// (The queries splice in only these fixed table names and filters, so the
+/// formatted SQL is marked `AssertSqlSafe`.)
+/// The draft tables mirror the live ones (plus `base_hash`, `removed`,
+/// `conflict`), so the same queries serve both; a draft's removed rows are
+/// tombstones, which reads leave out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Store {
+    Live,
+    Draft,
+}
+
+impl Store {
+    pub(crate) fn nodes(self) -> &'static str {
+        match self {
+            Store::Live => "scene_nodes",
+            Store::Draft => "scene_draft_nodes",
+        }
+    }
+
+    pub(crate) fn edges(self) -> &'static str {
+        match self {
+            Store::Live => "scene_edges",
+            Store::Draft => "scene_draft_edges",
+        }
+    }
+
+    pub(crate) fn uploads(self) -> &'static str {
+        match self {
+            Store::Live => "scene_node_uploads",
+            Store::Draft => "scene_draft_node_uploads",
+        }
+    }
+
+    /// ` AND <alias>removed = FALSE` for drafts (tombstones don't count).
+    fn present(self, alias: &str) -> String {
+        match self {
+            Store::Live => String::new(),
+            Store::Draft => format!(" AND {alias}removed = FALSE"),
+        }
+    }
+}
 
 // --- uploaded node files ---
 
 pub(super) async fn list_uploads(
     conn: &mut SqliteConnection,
+    store: Store,
     node_id: &str,
 ) -> Result<Vec<NodeUpload>, sqlx::Error> {
-    sqlx::query_as::<Sqlite, NodeUpload>(
-        "SELECT * FROM scene_node_uploads WHERE node_id = $1 ORDER BY \"name\"",
-    )
+    sqlx::query_as::<Sqlite, NodeUpload>(AssertSqlSafe(format!(
+        "SELECT * FROM {} WHERE node_id = $1 ORDER BY \"name\"",
+        store.uploads()
+    )))
     .bind(node_id)
     .fetch_all(conn)
     .await
@@ -19,12 +64,16 @@ pub(super) async fn list_uploads(
 
 pub(super) async fn list_scene_uploads(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
 ) -> Result<Vec<NodeUpload>, sqlx::Error> {
-    sqlx::query_as::<Sqlite, NodeUpload>(
-        "SELECT u.* FROM scene_node_uploads u JOIN scene_nodes n ON n.id = u.node_id \
-         WHERE n.scene_id = $1 ORDER BY u.node_id, u.\"name\"",
-    )
+    sqlx::query_as::<Sqlite, NodeUpload>(AssertSqlSafe(format!(
+        "SELECT u.* FROM {} u JOIN {} n ON n.id = u.node_id \
+         WHERE n.scene_id = $1{} ORDER BY u.node_id, u.\"name\"",
+        store.uploads(),
+        store.nodes(),
+        store.present("n.")
+    )))
     .bind(scene_id)
     .fetch_all(conn)
     .await
@@ -32,12 +81,14 @@ pub(super) async fn list_scene_uploads(
 
 pub(super) async fn get_upload(
     conn: &mut SqliteConnection,
+    store: Store,
     node_id: &str,
     name: &str,
 ) -> Result<NodeUpload, sqlx::Error> {
-    sqlx::query_as::<Sqlite, NodeUpload>(
-        "SELECT * FROM scene_node_uploads WHERE node_id = $1 AND \"name\" = $2",
-    )
+    sqlx::query_as::<Sqlite, NodeUpload>(AssertSqlSafe(format!(
+        "SELECT * FROM {} WHERE node_id = $1 AND \"name\" = $2",
+        store.uploads()
+    )))
     .bind(node_id)
     .bind(name)
     .fetch_one(conn)
@@ -47,18 +98,20 @@ pub(super) async fn get_upload(
 /// Adds or replaces the node's upload named `name`.
 pub(super) async fn put_upload(
     conn: &mut SqliteConnection,
+    store: Store,
     node_id: &str,
     name: &str,
     sha256: &str,
     size: i64,
 ) -> Result<NodeUpload, sqlx::Error> {
-    sqlx::query_as::<Sqlite, NodeUpload>(
-        "INSERT INTO scene_node_uploads (node_id, \"name\", sha256, \"size\", create_time) \
+    sqlx::query_as::<Sqlite, NodeUpload>(AssertSqlSafe(format!(
+        "INSERT INTO {} (node_id, \"name\", sha256, \"size\", create_time) \
          VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (node_id, \"name\") DO UPDATE SET sha256 = excluded.sha256, \
              \"size\" = excluded.\"size\", create_time = excluded.create_time \
          RETURNING *",
-    )
+        store.uploads()
+    )))
     .bind(node_id)
     .bind(name)
     .bind(sha256)
@@ -70,23 +123,29 @@ pub(super) async fn put_upload(
 
 pub(super) async fn delete_upload(
     conn: &mut SqliteConnection,
+    store: Store,
     node_id: &str,
     name: &str,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM scene_node_uploads WHERE node_id = $1 AND \"name\" = $2")
-        .bind(node_id)
-        .bind(name)
-        .execute(conn)
-        .await?;
+    let result = sqlx::query(AssertSqlSafe(format!(
+        "DELETE FROM {} WHERE node_id = $1 AND \"name\" = $2",
+        store.uploads()
+    )))
+    .bind(node_id)
+    .bind(name)
+    .execute(conn)
+    .await?;
     Ok(result.rows_affected())
 }
 
-/// Every stored file some node still has: (name, sha256).
+/// Every stored file some node still has, live or in a draft (tombstones
+/// included: a restore brings their files back): (name, sha256).
 pub(super) async fn stored_files(
     conn: &mut SqliteConnection,
 ) -> Result<Vec<(String, String)>, sqlx::Error> {
     sqlx::query_as::<Sqlite, (String, String)>(
-        "SELECT DISTINCT \"name\", sha256 FROM scene_node_uploads",
+        "SELECT \"name\", sha256 FROM scene_node_uploads \
+         UNION SELECT \"name\", sha256 FROM scene_draft_node_uploads",
     )
     .fetch_all(conn)
     .await
@@ -138,6 +197,18 @@ pub(super) async fn update_scene(
     .await
 }
 
+/// Counts a committed change to the scene's live graph.
+pub(super) async fn bump_revision(
+    conn: &mut SqliteConnection,
+    scene_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE scenes SET revision = revision + 1 WHERE id = $1")
+        .bind(scene_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 pub(super) async fn set_scene_enabled(
     conn: &mut SqliteConnection,
     id: &str,
@@ -177,6 +248,28 @@ pub(super) async fn list_scenes(
     .await
 }
 
+/// Every scene, newest first (ids are ULIDs: within a second, too; the live
+/// list; no paging).
+pub(super) async fn all_scenes(conn: &mut SqliteConnection) -> Result<Vec<Scene>, sqlx::Error> {
+    sqlx::query_as::<Sqlite, Scene>("SELECT * FROM scenes ORDER BY create_time DESC, id DESC")
+        .fetch_all(conn)
+        .await
+}
+
+/// `(scene id, nodes, edges)` for every scene.
+pub(super) async fn graph_sizes(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<(String, i64, i64)>, sqlx::Error> {
+    sqlx::query_as::<Sqlite, (String, i64, i64)>(
+        "SELECT s.id, \
+             (SELECT COUNT(*) FROM scene_nodes n WHERE n.scene_id = s.id), \
+             (SELECT COUNT(*) FROM scene_edges e WHERE e.scene_id = s.id) \
+         FROM scenes s",
+    )
+    .fetch_all(conn)
+    .await
+}
+
 pub(super) async fn enabled_scene_ids(
     conn: &mut SqliteConnection,
 ) -> Result<Vec<String>, sqlx::Error> {
@@ -191,11 +284,14 @@ pub(super) async fn enabled_scene_ids(
 
 pub(super) async fn list_nodes(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
 ) -> Result<Vec<NodeRow>, sqlx::Error> {
-    sqlx::query_as::<Sqlite, NodeRow>(
-        "SELECT * FROM scene_nodes WHERE scene_id = $1 ORDER BY create_time, id",
-    )
+    sqlx::query_as::<Sqlite, NodeRow>(AssertSqlSafe(format!(
+        "SELECT * FROM {} WHERE scene_id = $1{} ORDER BY create_time, id",
+        store.nodes(),
+        store.present("")
+    )))
     .bind(scene_id)
     .fetch_all(conn)
     .await
@@ -203,14 +299,19 @@ pub(super) async fn list_nodes(
 
 pub(super) async fn get_node(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
     id: &str,
 ) -> Result<NodeRow, sqlx::Error> {
-    sqlx::query_as::<Sqlite, NodeRow>("SELECT * FROM scene_nodes WHERE scene_id = $1 AND id = $2")
-        .bind(scene_id)
-        .bind(id)
-        .fetch_one(conn)
-        .await
+    sqlx::query_as::<Sqlite, NodeRow>(AssertSqlSafe(format!(
+        "SELECT * FROM {} WHERE scene_id = $1 AND id = $2{}",
+        store.nodes(),
+        store.present("")
+    )))
+    .bind(scene_id)
+    .bind(id)
+    .fetch_one(conn)
+    .await
 }
 
 pub(super) struct NodeValues<'a> {
@@ -223,14 +324,16 @@ pub(super) struct NodeValues<'a> {
 
 pub(super) async fn insert_node(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
     id: &str,
     v: &NodeValues<'_>,
 ) -> Result<NodeRow, sqlx::Error> {
-    sqlx::query_as::<Sqlite, NodeRow>(
-        "INSERT INTO scene_nodes (id, name, scene_id, \"type\", plugin_id, plugin_version, config) \
+    sqlx::query_as::<Sqlite, NodeRow>(AssertSqlSafe(format!(
+        "INSERT INTO {} (id, name, scene_id, \"type\", plugin_id, plugin_version, config) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
-    )
+        store.nodes()
+    )))
     .bind(id)
     .bind(v.name)
     .bind(scene_id)
@@ -244,14 +347,17 @@ pub(super) async fn insert_node(
 
 pub(super) async fn update_node(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
     id: &str,
     v: &NodeValues<'_>,
 ) -> Result<NodeRow, sqlx::Error> {
-    sqlx::query_as::<Sqlite, NodeRow>(
-        "UPDATE scene_nodes SET name = $1, \"type\" = $2, plugin_id = $3, plugin_version = $4, config = $5, update_time = $6 \
-         WHERE scene_id = $7 AND id = $8 RETURNING *",
-    )
+    sqlx::query_as::<Sqlite, NodeRow>(AssertSqlSafe(format!(
+        "UPDATE {} SET name = $1, \"type\" = $2, plugin_id = $3, plugin_version = $4, config = $5, update_time = $6 \
+         WHERE scene_id = $7 AND id = $8{} RETURNING *",
+        store.nodes(),
+        store.present("")
+    )))
     .bind(v.name)
     .bind(v.node_type)
     .bind(v.plugin_id)
@@ -264,16 +370,43 @@ pub(super) async fn update_node(
     .await
 }
 
+/// Sets a node's layout (`ui`), tombstones included; no update time: layout
+/// isn't content. Returns whether the node is there.
+pub(super) async fn set_ui(
+    conn: &mut SqliteConnection,
+    store: Store,
+    scene_id: &str,
+    id: &str,
+    ui: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {} SET ui = $1 WHERE scene_id = $2 AND id = $3",
+        store.nodes()
+    )))
+    .bind(ui)
+    .bind(scene_id)
+    .bind(id)
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Deletes the row (a draft's tombstone too: drafts mark removals with
+/// `draft::query::remove_node` instead).
 pub(super) async fn delete_node(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
     id: &str,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM scene_nodes WHERE scene_id = $1 AND id = $2")
-        .bind(scene_id)
-        .bind(id)
-        .execute(conn)
-        .await?;
+    let result = sqlx::query(AssertSqlSafe(format!(
+        "DELETE FROM {} WHERE scene_id = $1 AND id = $2",
+        store.nodes()
+    )))
+    .bind(scene_id)
+    .bind(id)
+    .execute(conn)
+    .await?;
     Ok(result.rows_affected())
 }
 
@@ -281,11 +414,14 @@ pub(super) async fn delete_node(
 
 pub(super) async fn list_edges(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
 ) -> Result<Vec<EdgeRow>, sqlx::Error> {
-    sqlx::query_as::<Sqlite, EdgeRow>(
-        "SELECT * FROM scene_edges WHERE scene_id = $1 ORDER BY create_time, id",
-    )
+    sqlx::query_as::<Sqlite, EdgeRow>(AssertSqlSafe(format!(
+        "SELECT * FROM {} WHERE scene_id = $1{} ORDER BY create_time, id",
+        store.edges(),
+        store.present("")
+    )))
     .bind(scene_id)
     .fetch_all(conn)
     .await
@@ -293,14 +429,19 @@ pub(super) async fn list_edges(
 
 pub(super) async fn get_edge(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
     id: &str,
 ) -> Result<EdgeRow, sqlx::Error> {
-    sqlx::query_as::<Sqlite, EdgeRow>("SELECT * FROM scene_edges WHERE scene_id = $1 AND id = $2")
-        .bind(scene_id)
-        .bind(id)
-        .fetch_one(conn)
-        .await
+    sqlx::query_as::<Sqlite, EdgeRow>(AssertSqlSafe(format!(
+        "SELECT * FROM {} WHERE scene_id = $1 AND id = $2{}",
+        store.edges(),
+        store.present("")
+    )))
+    .bind(scene_id)
+    .bind(id)
+    .fetch_one(conn)
+    .await
 }
 
 pub(super) struct EdgeValues<'a> {
@@ -312,14 +453,16 @@ pub(super) struct EdgeValues<'a> {
 
 pub(super) async fn insert_edge(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
     id: &str,
     v: &EdgeValues<'_>,
 ) -> Result<EdgeRow, sqlx::Error> {
-    sqlx::query_as::<Sqlite, EdgeRow>(
-        "INSERT INTO scene_edges (id, name, scene_id, source_node_id, target_node_id, mapping) \
+    sqlx::query_as::<Sqlite, EdgeRow>(AssertSqlSafe(format!(
+        "INSERT INTO {} (id, name, scene_id, source_node_id, target_node_id, mapping) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
-    )
+        store.edges()
+    )))
     .bind(id)
     .bind(v.name)
     .bind(scene_id)
@@ -332,14 +475,17 @@ pub(super) async fn insert_edge(
 
 pub(super) async fn update_edge(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
     id: &str,
     v: &EdgeValues<'_>,
 ) -> Result<EdgeRow, sqlx::Error> {
-    sqlx::query_as::<Sqlite, EdgeRow>(
-        "UPDATE scene_edges SET name = $1, source_node_id = $2, target_node_id = $3, mapping = $4, update_time = $5 \
-         WHERE scene_id = $6 AND id = $7 RETURNING *",
-    )
+    sqlx::query_as::<Sqlite, EdgeRow>(AssertSqlSafe(format!(
+        "UPDATE {} SET name = $1, source_node_id = $2, target_node_id = $3, mapping = $4, update_time = $5 \
+         WHERE scene_id = $6 AND id = $7{} RETURNING *",
+        store.edges(),
+        store.present("")
+    )))
     .bind(v.name)
     .bind(v.source_node_id)
     .bind(v.target_node_id)
@@ -353,13 +499,17 @@ pub(super) async fn update_edge(
 
 pub(super) async fn delete_edge(
     conn: &mut SqliteConnection,
+    store: Store,
     scene_id: &str,
     id: &str,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM scene_edges WHERE scene_id = $1 AND id = $2")
-        .bind(scene_id)
-        .bind(id)
-        .execute(conn)
-        .await?;
+    let result = sqlx::query(AssertSqlSafe(format!(
+        "DELETE FROM {} WHERE scene_id = $1 AND id = $2",
+        store.edges()
+    )))
+    .bind(scene_id)
+    .bind(id)
+    .execute(conn)
+    .await?;
     Ok(result.rows_affected())
 }

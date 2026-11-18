@@ -65,6 +65,19 @@ pub(super) async fn put_upload(
     Path((id, node_id, name)): Path<(String, String, String)>,
     body: Body,
 ) -> Result<(StatusCode, Json<Upload>), ApiError> {
+    let path = receive(service, body).await?;
+    let (upload, created) = service.put_upload(&id, &node_id, &name, &path).await?;
+    let status = if created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(upload.into())))
+}
+
+/// Streams a request body to a fresh incoming file under
+/// `[scenes] max_upload_bytes`, for [`Service::put_upload_in`].
+pub(super) async fn receive(service: Svc, body: Body) -> Result<std::path::PathBuf, ApiError> {
     let path = service.incoming_path().await?;
     let limit = service.files().max_upload_bytes;
     let written: Result<(), ApiError> = async {
@@ -102,13 +115,7 @@ pub(super) async fn put_upload(
         let _ = tokio::fs::remove_file(&path).await;
         return Err(e);
     }
-    let (upload, created) = service.put_upload(&id, &node_id, &name, &path).await?;
-    let status = if created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(upload.into())))
+    Ok(path)
 }
 
 #[utoipa::path(
@@ -177,7 +184,15 @@ pub(super) async fn get_upload_content(
     Path((id, node_id, name)): Path<(String, String, String)>,
 ) -> Result<Response, ApiError> {
     let (upload, path) = service.upload_content(&id, &node_id, &name).await?;
-    let file = tokio::fs::File::open(&path).await.map_err(|e| {
+    file_response(upload, &path).await
+}
+
+/// An upload's bytes as a download.
+pub(super) async fn file_response(
+    upload: NodeUpload,
+    path: &std::path::Path,
+) -> Result<Response, ApiError> {
+    let file = tokio::fs::File::open(path).await.map_err(|e| {
         log::error!("Scenes API: upload {} is missing: {e}", path.display());
         api_error(
             StatusCode::INTERNAL_SERVER_ERROR,

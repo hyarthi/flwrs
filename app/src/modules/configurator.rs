@@ -6,11 +6,11 @@
 //! run one: their configured fields are set by the user.
 
 use crate::modules::plugin::service::Plugin;
-use crate::modules::scene::service::stored_name;
+use crate::modules::scene::service::{Store, stored_name};
 use flwrs_plugin::package::configure::{self, Configured, Invocation};
 use flwrs_plugin::package::{LaunchSpec, Manifest};
 use serde_json::Value;
-use sqlx::SqliteConnection;
+use sqlx::{AssertSqlSafe, SqliteConnection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -51,14 +51,17 @@ impl PackageRef {
 /// A node's uploads: name → stored file.
 pub(crate) async fn uploads(
     conn: &mut SqliteConnection,
+    store: Store,
     files_dir: &Path,
     node_id: &str,
 ) -> Result<HashMap<String, PathBuf>, sqlx::Error> {
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT \"name\", sha256 FROM scene_node_uploads WHERE node_id = $1")
-            .bind(node_id)
-            .fetch_all(conn)
-            .await?;
+    let rows: Vec<(String, String)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT \"name\", sha256 FROM {} WHERE node_id = $1",
+        store.uploads()
+    )))
+    .bind(node_id)
+    .fetch_all(conn)
+    .await?;
     Ok(rows
         .into_iter()
         .map(|(name, sha)| {
@@ -330,6 +333,7 @@ fn remote_client(
 /// are collected as garbage if the transaction doesn't commit).
 pub(crate) async fn store_files(
     conn: &mut SqliteConnection,
+    store: Store,
     files_dir: &Path,
     node_id: &str,
     configured: &Configured,
@@ -355,12 +359,13 @@ pub(crate) async fn store_files(
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("storing {}: {e}", file.name))?;
-        sqlx::query(
-            "INSERT INTO scene_node_uploads (node_id, \"name\", sha256, \"size\", create_time) \
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {} (node_id, \"name\", sha256, \"size\", create_time) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (node_id, \"name\") DO UPDATE SET sha256 = excluded.sha256, \
                  \"size\" = excluded.\"size\", create_time = excluded.create_time",
-        )
+            store.uploads()
+        )))
         .bind(node_id)
         .bind(&file.name)
         .bind(&sha)

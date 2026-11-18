@@ -3,12 +3,12 @@
 use super::api::Svc;
 use crate::modules::api_error::{ApiError, ErrorBody};
 use crate::modules::plugin::node_rules::strip;
-use crate::modules::scene::service::{self, EdgeInput, NodeInput};
+use crate::modules::scene::service::{self, EdgeInput, NodeInput, Position};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -36,6 +36,8 @@ pub(crate) struct Node {
     /// `/password`) and whether this node has it set. On update, a secret
     /// left out is kept, `null` clears it.
     pub launch_args_secrets: BTreeMap<String, bool>,
+    /// Where the node sits on the editor's canvas; `null` = not placed.
+    pub position: Option<Position>,
     pub create_time: i64,
     pub update_time: i64,
 }
@@ -57,6 +59,7 @@ impl From<service::Node> for Node {
             node_type: n.node_type,
             plugin_id: n.plugin_id,
             plugin_version: n.plugin_version,
+            position: n.position,
             create_time: n.create_time.timestamp_millis(),
             update_time: n.update_time.timestamp_millis(),
         }
@@ -75,6 +78,9 @@ pub(crate) struct NodeRequest {
     /// Node config. On update, omitting `token` keeps the stored one (if the launch mode is unchanged).
     #[schema(value_type = Option<Object>)]
     pub config: Option<Value>,
+    /// Where to place the node on the canvas. Layout only (no graph
+    /// change); omitted = kept. `PATCH …/layout` moves several at once.
+    pub position: Option<Position>,
 }
 
 impl From<NodeRequest> for NodeInput {
@@ -84,8 +90,49 @@ impl From<NodeRequest> for NodeInput {
             plugin_id: r.plugin_id,
             node_type: r.node_type,
             config: r.config.unwrap_or(Value::Null),
+            position: r.position,
         }
     }
+}
+
+/// The most nodes one layout request may place.
+const MAX_LAYOUT_NODES: usize = 10_000;
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LayoutRequest {
+    /// Node id → its position (`null` = not placed). Nodes left out keep theirs.
+    #[schema(value_type = BTreeMap<String, Position>)]
+    pub nodes: BTreeMap<String, Option<Position>>,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/by-id/{id}/layout",
+    operation_id = "set-layout",
+    summary = "Place nodes on the editor's canvas",
+    description = "Sets the positions of several nodes at once, live and in the scene's draft (a node only in the draft too). Layout isn't content: no revision, no reload, not a draft change.",
+    params(("id" = String, Path, description = "Scene ID")),
+    request_body(content = LayoutRequest, content_type = "application/json"),
+    responses(
+        (status = 204, description = "Placed"),
+        (status = 404, description = "Scene not found", body = ErrorBody),
+        (status = 422, description = "Unknown nodes or bad positions; nothing was changed", body = ErrorBody),
+    )
+)]
+pub(crate) async fn set_layout(
+    State(service): State<Svc>,
+    Path(id): Path<String>,
+    Json(req): Json<LayoutRequest>,
+) -> Result<StatusCode, ApiError> {
+    if req.nodes.len() > MAX_LAYOUT_NODES {
+        return Err(service::ServiceError::Invalid(vec![format!(
+            "at most {MAX_LAYOUT_NODES} nodes per request"
+        )])
+        .into());
+    }
+    service.set_layout(&id, &req.nodes).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize, ToSchema)]
@@ -394,6 +441,7 @@ pub(super) fn routes() -> Router<Svc> {
             "/scenes/by-id/{id}/edges",
             get(list_edges).post(create_edge),
         )
+        .route("/scenes/by-id/{id}/layout", patch(set_layout))
         .route(
             "/scenes/by-id/{id}/edges/by-id/{edge_id}",
             get(get_edge).put(update_edge).delete(delete_edge),

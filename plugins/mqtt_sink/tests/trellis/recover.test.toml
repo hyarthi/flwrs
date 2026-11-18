@@ -1,5 +1,6 @@
-# The broker starts about 2 s into the test (tests/trellis.rs): the sink keeps
-# retrying with its backoff, connects, and publishes again.
+# No broker at first: a retryable NACK. The stimulus then starts the broker
+# (tests/trellis.rs); the sink retries with its backoff (from ~1 s, jitter),
+# connects, and publishes again.
 name = "recovers when the broker comes up"
 launch_args = "recover.json"
 
@@ -8,7 +9,10 @@ send = "payloads/default.json"
 expect_ack = { nack = { retryable = true } }
 
 [[steps]]
-wait_ms = 6000
+stimulus = true
+
+[[steps]]
+wait_ms = 3000
 
 [[steps]]
 send = "payloads/named.json"

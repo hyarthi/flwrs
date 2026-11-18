@@ -1,0 +1,86 @@
+/*
+ * Design tokens: every colour, size and duration the UI uses. Components use
+ * these, never literal values. Light and dark come from one definition each
+ * (`light-dark()`), picked by `color-scheme`: the system's, unless the theme
+ * toggle sets `data-theme` on <html>.
+ */
+:root {
+  color-scheme: light dark;
+
+  /* Surfaces */
+  --bg: light-dark(#f6f7f9, #0e1014);
+  --surface: light-dark(#ffffff, #161920);
+  --surface-2: light-dark(#f0f2f5, #1d2129);
+  --surface-hover: light-dark(#e9ecf1, #252a34);
+  --border: light-dark(#e2e5ea, #2a2f3a);
+  --border-strong: light-dark(#cdd2da, #3a4150);
+
+  /* Text */
+  --text: light-dark(#14171c, #e7e9ee);
+  --text-muted: light-dark(#5d6573, #9aa2b1);
+  --text-faint: light-dark(#8b93a1, #6b7382);
+
+  /* Accent and states */
+  --accent: light-dark(#3b63f0, #7d9bff);
+  --accent-hover: light-dark(#2d51d4, #98b0ff);
+  --accent-soft: light-dark(#e8edfe, #1e2847);
+  --on-accent: light-dark(#ffffff, #0e1014);
+  --ok: light-dark(#1f9d55, #4cc98a);
+  --warn: light-dark(#b7791f, #e6b450);
+  --danger: light-dark(#d64545, #f07a7a);
+  --ok-soft: light-dark(#e3f6eb, #15301f);
+  --warn-soft: light-dark(#fbf0dc, #33280f);
+  --danger-soft: light-dark(#fbe6e6, #3a1a1a);
+  --focus-ring: light-dark(#3b63f080, #7d9bff80);
+
+  /* Type */
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-md: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+  --leading: 1.5;
+
+  /* Spacing (4 px scale) */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+
+  /* Shape and depth */
+  --radius-sm: 4px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shadow-sm: 0 1px 2px light-dark(#0f172a14, #00000066);
+  --shadow: 0 4px 16px light-dark(#0f172a14, #00000080);
+
+  /* Motion */
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --dur-fast: 120ms;
+  --dur: 200ms;
+
+  /* Layout */
+  --sidebar-width: 220px;
+  --topbar-height: 52px;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur: 0ms;
+  }
+}

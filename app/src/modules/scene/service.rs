@@ -1,11 +1,16 @@
+pub(crate) mod apply;
 #[cfg(all(test, unix))]
 mod configure_tests;
+pub(crate) mod draft;
+#[cfg(test)]
+mod draft_tests;
 mod query_sqlite;
 mod transfer;
 mod uploads;
 
 pub(crate) use uploads::{NodeFiles, NodeUpload, stored_name};
 
+use crate::modules::changes::ChangeLock;
 use crate::modules::configurator;
 use crate::modules::director::DirectorHandle;
 use crate::modules::director::handle::{SceneState, SceneStatus};
@@ -20,13 +25,13 @@ use chrono::Local;
 use flwrs_core::db::{Database, DbError};
 use flwrs_plugin::package::configure::{self, Configured};
 use flwrs_plugin::schema::payload::SchemaDefinition;
+pub(crate) use query_sqlite::Store;
 use query_sqlite::{EdgeValues, NodeValues};
 use serde_json::Value;
 use sqlx::Connection;
 use sqlx::error::ErrorKind;
 use std::collections::{BTreeMap, HashMap};
 use thiserror::Error;
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
 const MAX_NAME_CHARS: usize = 200;
@@ -41,6 +46,9 @@ pub(crate) struct Scene {
     /// Defaults for the scene's nodes (durable queues, remote auth).
     #[sqlx(json)]
     pub defaults: SceneDefaults,
+    /// Counts committed changes to the live graph (settings, nodes, edges,
+    /// uploads); a draft remembers the one it's based on.
+    pub revision: i64,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
 }
@@ -55,8 +63,49 @@ pub(crate) struct NodeRow {
     pub plugin_id: String,
     pub plugin_version: Option<String>,
     pub config: String,
+    /// Layout (`Position` as JSON); not part of the node's content.
+    pub ui: Option<String>,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
+}
+
+/// Where a node sits on the editor's canvas. Layout only: setting it is no
+/// change to the graph (no revision, no reload, no draft change).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Position {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Canvas coordinates beyond this are refused (a typo, not a layout).
+const MAX_COORDINATE: f64 = 1e7;
+
+impl Position {
+    pub(crate) fn check(&self) -> Result<(), String> {
+        if self.x.is_finite()
+            && self.y.is_finite()
+            && self.x.abs() <= MAX_COORDINATE
+            && self.y.abs() <= MAX_COORDINATE
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "position: x and y must be finite numbers within ±{MAX_COORDINATE}"
+            ))
+        }
+    }
+
+    /// As stored in the `ui` column.
+    pub(crate) fn to_json(self) -> String {
+        serde_json::to_string(&self).expect("a position serializes")
+    }
+
+    /// From the `ui` column; anything unreadable counts as no position.
+    pub(crate) fn from_json(text: Option<&str>) -> Option<Self> {
+        text.and_then(|t| serde_json::from_str::<Self>(t).ok())
+            .filter(|p| p.check().is_ok())
+    }
 }
 
 /// A scene node: one plugin instance.
@@ -75,6 +124,8 @@ pub(crate) struct Node {
     /// The plugin version the node was configured with, if known.
     pub plugin_version: Option<String>,
     pub config: NodeConfig,
+    /// Where the node sits on the editor's canvas, if placed.
+    pub position: Option<Position>,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
     /// The launch-args secrets the plugin declares (JSON pointers) and
@@ -104,6 +155,7 @@ impl TryFrom<NodeRow> for Node {
             plugin_id: row.plugin_id,
             plugin_version: row.plugin_version,
             config,
+            position: Position::from_json(row.ui.as_deref()),
             create_time: row.create_time,
             update_time: row.update_time,
             secrets: BTreeMap::new(),
@@ -166,14 +218,18 @@ impl From<EdgeRow> for Edge {
     }
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct NodeInput {
     pub name: Option<String>,
     pub plugin_id: String,
     /// Optional; if given it must match the plugin's type.
     pub node_type: Option<String>,
     pub config: Value,
+    /// Where to place the node; `None` keeps its position (or none, new).
+    pub position: Option<Position>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct EdgeInput {
     pub name: Option<String>,
     pub source_node_id: String,
@@ -248,8 +304,9 @@ pub(crate) struct Service {
     /// Where nodes' folders and uploaded files are.
     files: NodeFiles,
     /// Serializes graph changes, so whole-scene checks see a stable graph.
-    /// Also held while uploaded files are stored or removed.
-    lock: Mutex<()>,
+    /// Also held while uploaded files are stored or removed. Its release
+    /// counts as a change for the live views (`changes()`).
+    lock: ChangeLock,
 }
 
 type Conn = sqlx::pool::PoolConnection<sqlx::Sqlite>;
@@ -271,8 +328,24 @@ impl Service {
             plugins,
             director,
             files,
-            lock: Mutex::new(()),
+            lock: ChangeLock::new(),
         }
+    }
+
+    /// Bumped after every change to scenes, nodes, edges or uploads (for the
+    /// live views).
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.lock.subscribe()
+    }
+
+    /// The director this service reports to.
+    pub(crate) fn director(&self) -> &DirectorHandle {
+        &self.director
+    }
+
+    /// The plugin registry's changes (scenes' checks depend on it).
+    pub(crate) fn plugin_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.plugins.changes()
     }
 
     async fn conn(&self) -> Result<Conn, ServiceError> {
@@ -297,6 +370,7 @@ impl Service {
         let scene =
             query_sqlite::create_scene(&mut conn, &id, &name, max_hops, &input.defaults).await?;
         log::debug!("Scene service: created scene [{}]", scene.id);
+        self.lock.bump();
         Ok(scene)
     }
 
@@ -315,6 +389,11 @@ impl Service {
         let scene = query_sqlite::update_scene(&mut conn, id, &name, max_hops, &input.defaults)
             .await
             .map_err(not_found("scene"))?;
+        query_sqlite::bump_revision(&mut conn, id).await?;
+        let scene = Scene {
+            revision: scene.revision + 1,
+            ..scene
+        };
         // A rename doesn't change the workflow; a new hop limit or new
         // defaults do.
         if scene.enabled && (scene.max_hops != before.max_hops || scene.defaults != before.defaults)
@@ -388,6 +467,37 @@ impl Service {
         Ok(scene)
     }
 
+    /// Every scene with its graph's size and its check (the live list).
+    /// Checks are per scene, so a scene whose check fails to run still lists
+    /// (with the failure as a problem).
+    pub(crate) async fn overview_rows(&self) -> Result<Vec<SceneRow>, ServiceError> {
+        let mut conn = self.conn().await?;
+        let scenes = query_sqlite::all_scenes(&mut conn).await?;
+        let sizes: HashMap<String, (i64, i64)> = query_sqlite::graph_sizes(&mut conn)
+            .await?
+            .into_iter()
+            .map(|(id, nodes, edges)| (id, (nodes, edges)))
+            .collect();
+        let mut rows = Vec::with_capacity(scenes.len());
+        for scene in scenes {
+            let (nodes, edges) = sizes.get(&scene.id).copied().unwrap_or_default();
+            let check = match self.check_nodes(&mut conn, &scene.id).await {
+                Ok(check) => check,
+                Err(e) => SceneCheck {
+                    problems: vec![format!("couldn't check the scene: {e}")],
+                    warnings: vec![],
+                },
+            };
+            rows.push(SceneRow {
+                scene,
+                nodes: usize::try_from(nodes).unwrap_or_default(),
+                edges: usize::try_from(edges).unwrap_or_default(),
+                check,
+            });
+        }
+        Ok(rows)
+    }
+
     /// Whether the scene can run on this server, and why not. Enabling is
     /// refused while there are problems. A scene created here normally has
     /// none; an imported one (or one whose plugin was removed or replaced)
@@ -405,10 +515,11 @@ impl Service {
     async fn listeners(
         &self,
         conn: &mut sqlx::SqliteConnection,
+        store: Store,
         scene_id: &str,
     ) -> Result<Vec<(String, String, String)>, ServiceError> {
         let mut out = vec![];
-        for row in query_sqlite::list_nodes(conn, scene_id).await? {
+        for row in query_sqlite::list_nodes(conn, store, scene_id).await? {
             let node = Node::try_from(row)?;
             if node.config.launch != crate::modules::node_config::LaunchMode::Local {
                 continue;
@@ -435,12 +546,25 @@ impl Service {
         conn: &mut sqlx::SqliteConnection,
         scene_id: &str,
     ) -> Result<SceneCheck, ServiceError> {
-        let mut check = SceneCheck::default();
         let defaults = query_sqlite::get_scene(conn, scene_id)
             .await
             .map_err(not_found("scene"))?
             .defaults;
-        for row in query_sqlite::list_nodes(conn, scene_id).await? {
+        self.check_store(conn, Store::Live, scene_id, &defaults)
+            .await
+    }
+
+    /// The scene's check, on its live graph or its draft (with the draft's
+    /// scene defaults).
+    async fn check_store(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        store: Store,
+        scene_id: &str,
+        defaults: &SceneDefaults,
+    ) -> Result<SceneCheck, ServiceError> {
+        let mut check = SceneCheck::default();
+        for row in query_sqlite::list_nodes(conn, store, scene_id).await? {
             let node = Node::try_from(row)?;
             let label = match &node.name {
                 Some(name) => format!("node {} ({name})", node.id),
@@ -456,7 +580,7 @@ impl Service {
                     // What doesn't depend on the plugin can still be listed.
                     check.problems.extend(
                         [
-                            node.config.missing_token(&defaults),
+                            node.config.missing_token(defaults),
                             node.config.unsupported(),
                         ]
                         .into_iter()
@@ -489,7 +613,7 @@ impl Service {
                 ));
             }
             check.problems.extend(
-                validate_against_plugin(&node.config, &plugin, &defaults)?
+                validate_against_plugin(&node.config, &plugin, defaults)?
                     .into_iter()
                     .map(|p| format!("{label}: {p}")),
             );
@@ -564,7 +688,7 @@ impl Service {
             }
             // Uploaded files its launch args name (a local node gets them).
             if node.config.launch == crate::modules::node_config::LaunchMode::Local {
-                let uploads = query_sqlite::list_uploads(conn, &node.id).await?;
+                let uploads = query_sqlite::list_uploads(conn, store, &node.id).await?;
                 for (field, name, _) in rules.uploads_referenced(&node.config.launch_args) {
                     if !uploads.iter().any(|u| u.name == name) {
                         check.problems.push(format!(
@@ -576,7 +700,7 @@ impl Service {
             }
         }
         // Two local nodes listening on the same address: only one can bind it.
-        let mine = self.listeners(conn, scene_id).await?;
+        let mine = self.listeners(conn, store, scene_id).await?;
         for (i, (a_label, a_field, a)) in mine.iter().enumerate() {
             for (b_label, b_field, b) in &mine[i + 1..] {
                 if listen_clash(a, b) {
@@ -590,7 +714,7 @@ impl Service {
             if other == scene_id {
                 continue;
             }
-            let theirs = self.listeners(conn, &other).await?;
+            let theirs = self.listeners(conn, Store::Live, &other).await?;
             for (a_label, a_field, a) in &mine {
                 for (b_label, _, b) in theirs.iter().filter(|(_, _, b)| listen_clash(a, b)) {
                     check.warnings.push(format!(
@@ -600,7 +724,7 @@ impl Service {
             }
         }
         // Mappings, against this server's plugin schemas.
-        for edge in query_sqlite::list_edges(conn, scene_id).await? {
+        for edge in query_sqlite::list_edges(conn, store, scene_id).await? {
             let Some(mapping) = edge.mapping.as_deref() else {
                 continue;
             };
@@ -615,7 +739,13 @@ impl Service {
                 continue;
             };
             let (source, target) = self
-                .edge_schemas(conn, scene_id, &edge.source_node_id, &edge.target_node_id)
+                .edge_schemas(
+                    conn,
+                    store,
+                    scene_id,
+                    &edge.source_node_id,
+                    &edge.target_node_id,
+                )
                 .await?;
             if let Err(errors) = mapping::compile(
                 &spec,
@@ -641,19 +771,33 @@ impl Service {
     async fn edge_schemas(
         &self,
         conn: &mut sqlx::SqliteConnection,
+        store: Store,
         scene_id: &str,
         source_node_id: &str,
         target_node_id: &str,
     ) -> Result<(Option<SchemaDefinition>, Option<SchemaDefinition>), ServiceError> {
+        let mut nodes = [None, None];
+        for (slot, node_id) in nodes.iter_mut().zip([source_node_id, target_node_id]) {
+            if let Ok(row) = query_sqlite::get_node(conn, store, scene_id, node_id).await {
+                *slot = Some(Node::try_from(row)?);
+            }
+        }
+        let [source, target] = nodes;
+        self.node_schemas(source.as_ref(), target.as_ref()).await
+    }
+
+    /// The source node's `out` and the target node's `in` schema (see
+    /// [`Service::edge_schemas`]), for nodes at hand.
+    pub(super) async fn node_schemas(
+        &self,
+        source: Option<&Node>,
+        target: Option<&Node>,
+    ) -> Result<(Option<SchemaDefinition>, Option<SchemaDefinition>), ServiceError> {
         let mut schemas = [None, None];
-        for (slot, (node_id, side)) in schemas
-            .iter_mut()
-            .zip([(source_node_id, "out"), (target_node_id, "in")])
-        {
-            let Ok(row) = query_sqlite::get_node(conn, scene_id, node_id).await else {
+        for (slot, (node, side)) in schemas.iter_mut().zip([(source, "out"), (target, "in")]) {
+            let Some(node) = node else {
                 continue;
             };
-            let node = Node::try_from(row)?;
             let plugin = match self.plugins.get(&node.plugin_id).await {
                 Ok(plugin) if plugin.plugin_type == node.node_type => plugin,
                 Ok(_) | Err(PluginError::NotFound) => continue,
@@ -723,21 +867,21 @@ impl Service {
     /// A scene with its whole graph and the registry entries of its plugins,
     /// read under the service lock, so it never reflects a half-applied change.
     pub(crate) async fn snapshot(&self, id: &str) -> Result<SceneSnapshot, ServiceError> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.lock.lock_read().await;
         let mut conn = self.conn().await?;
         let scene = query_sqlite::get_scene(&mut conn, id)
             .await
             .map_err(not_found("scene"))?;
-        let mut nodes = query_sqlite::list_nodes(&mut conn, id)
+        let mut nodes = query_sqlite::list_nodes(&mut conn, Store::Live, id)
             .await?
             .into_iter()
             .map(Node::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut uploads = query_sqlite::list_scene_uploads(&mut conn, id).await?;
+        let mut uploads = query_sqlite::list_scene_uploads(&mut conn, Store::Live, id).await?;
         for node in &mut nodes {
             node.uploads = uploads.extract_if(.., |u| u.node_id == node.id).collect();
         }
-        let edges: Vec<Edge> = query_sqlite::list_edges(&mut conn, id)
+        let edges: Vec<Edge> = query_sqlite::list_edges(&mut conn, Store::Live, id)
             .await?
             .into_iter()
             .map(Edge::from)
@@ -771,15 +915,24 @@ impl Service {
             .await
             .map_err(not_found("scene"))?;
         let mut nodes = vec![];
-        for row in query_sqlite::list_nodes(&mut conn, scene_id).await? {
+        for row in query_sqlite::list_nodes(&mut conn, Store::Live, scene_id).await? {
             nodes.push(self.with_secrets(row.try_into()?).await?);
         }
         Ok(nodes)
     }
 
     pub(crate) async fn get_node(&self, scene_id: &str, id: &str) -> Result<Node, ServiceError> {
+        self.get_node_in(Store::Live, scene_id, id).await
+    }
+
+    pub(crate) async fn get_node_in(
+        &self,
+        store: Store,
+        scene_id: &str,
+        id: &str,
+    ) -> Result<Node, ServiceError> {
         let mut conn = self.conn().await?;
-        let node = query_sqlite::get_node(&mut conn, scene_id, id)
+        let node = query_sqlite::get_node(&mut conn, store, scene_id, id)
             .await
             .map_err(not_found("node"))?
             .try_into()?;
@@ -805,19 +958,7 @@ impl Service {
         scene_id: &str,
         input: NodeInput,
     ) -> Result<Node, ServiceError> {
-        let _guard = self.lock.lock().await;
-        let mut conn = self.conn().await?;
-        let scene = query_sqlite::get_scene(&mut conn, scene_id)
-            .await
-            .map_err(not_found("scene"))?;
-        let id = Ulid::generate().to_string();
-        let prepared = self.prepare_node(&id, input, None, &scene.defaults).await?;
-        let mut tx = conn.begin_with(WRITE_TX).await?;
-        let row = query_sqlite::insert_node(&mut tx, scene_id, &id, &prepared.values()).await?;
-        self.store_configured(&mut tx, &id, &prepared).await?;
-        tx.commit().await?;
-        self.changed(&scene);
-        self.with_secrets(row.try_into()?).await
+        self.save_node(Store::Live, scene_id, None, input).await
     }
 
     pub(crate) async fn update_node(
@@ -826,26 +967,129 @@ impl Service {
         id: &str,
         input: NodeInput,
     ) -> Result<Node, ServiceError> {
+        self.save_node(Store::Live, scene_id, Some(id), input).await
+    }
+
+    /// Creates (`id` = `None`) or replaces a node, live or in the scene's
+    /// draft (started from live if there's none). A draft takes an incomplete
+    /// node (its problems show in the draft's check); live refuses it.
+    pub(super) async fn save_node(
+        &self,
+        store: Store,
+        scene_id: &str,
+        id: Option<&str>,
+        input: NodeInput,
+    ) -> Result<Node, ServiceError> {
         let _guard = self.lock.lock().await;
         let mut conn = self.conn().await?;
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        let existing: Node = query_sqlite::get_node(&mut conn, scene_id, id)
-            .await
-            .map_err(not_found("node"))?
-            .try_into()?;
+        let defaults = match store {
+            Store::Live => scene.defaults.clone(),
+            Store::Draft => self.ensure_draft(&mut conn, &scene).await?.defaults,
+        };
+        let existing: Option<Node> = match id {
+            Some(id) => Some(
+                query_sqlite::get_node(&mut conn, store, scene_id, id)
+                    .await
+                    .map_err(not_found("node"))?
+                    .try_into()?,
+            ),
+            None => None,
+        };
+        let id = id.map_or_else(|| Ulid::generate().to_string(), str::to_string);
+        let position = input.position;
+        if let Some(p) = &position {
+            p.check().map_err(|e| ServiceError::Invalid(vec![e]))?;
+        }
         let prepared = self
-            .prepare_node(id, input, Some(&existing), &scene.defaults)
+            .prepare_node(store, &id, input, existing.as_ref(), &defaults)
             .await?;
         let mut tx = conn.begin_with(WRITE_TX).await?;
-        let row = query_sqlite::update_node(&mut tx, scene_id, id, &prepared.values()).await?;
-        self.store_configured(&mut tx, id, &prepared).await?;
-        // A new plugin type or queue policy can break edges that were valid before.
-        check_graph(&mut tx, scene_id).await?;
+        let mut row = match existing {
+            None => {
+                query_sqlite::insert_node(&mut tx, store, scene_id, &id, &prepared.values()).await?
+            }
+            Some(_) => {
+                let row =
+                    query_sqlite::update_node(&mut tx, store, scene_id, &id, &prepared.values())
+                        .await?;
+                // A new plugin type or queue policy can break edges that
+                // were valid before.
+                check_graph(&mut tx, store, scene_id).await?;
+                row
+            }
+        };
+        if let Some(p) = position {
+            let ui = p.to_json();
+            query_sqlite::set_ui(&mut tx, store, scene_id, &id, Some(&ui)).await?;
+            row.ui = Some(ui);
+        }
+        self.store_configured(&mut tx, store, &id, &prepared)
+            .await?;
+        self.committed(&mut tx, store, scene_id).await?;
         tx.commit().await?;
-        self.changed(&scene);
+        if store == Store::Live {
+            self.changed(&scene);
+        }
         self.with_secrets(row.try_into()?).await
+    }
+
+    /// Places nodes on the canvas, live and in the draft (wherever each one
+    /// is; tombstones too). All or nothing: an unknown node or a bad
+    /// position refuses the whole request. Layout isn't content: no
+    /// revision, no reload, no draft change (the change counter still moves,
+    /// so live views see it).
+    pub(crate) async fn set_layout(
+        &self,
+        scene_id: &str,
+        nodes: &BTreeMap<String, Option<Position>>,
+    ) -> Result<(), ServiceError> {
+        let errors: Vec<String> = nodes
+            .iter()
+            .filter_map(|(id, p)| p.as_ref()?.check().err().map(|e| format!("{id}: {e}")))
+            .collect();
+        if !errors.is_empty() {
+            return Err(ServiceError::Invalid(errors));
+        }
+        let _guard = self.lock.lock().await;
+        let mut conn = self.conn().await?;
+        query_sqlite::get_scene(&mut conn, scene_id)
+            .await
+            .map_err(not_found("scene"))?;
+        let mut tx = conn.begin_with(WRITE_TX).await?;
+        let mut unknown = vec![];
+        for (id, position) in nodes {
+            let ui = position.map(Position::to_json);
+            let live =
+                query_sqlite::set_ui(&mut tx, Store::Live, scene_id, id, ui.as_deref()).await?;
+            let draft =
+                query_sqlite::set_ui(&mut tx, Store::Draft, scene_id, id, ui.as_deref()).await?;
+            if !live && !draft {
+                unknown.push(format!("{id}: no such node in this scene"));
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(ServiceError::Invalid(unknown));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Records a committed change in the transaction: the live graph's
+    /// revision, or the draft's update time.
+    pub(super) async fn committed(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        store: Store,
+        scene_id: &str,
+    ) -> Result<(), ServiceError> {
+        match store {
+            Store::Live => query_sqlite::bump_revision(tx, scene_id).await?,
+            Store::Draft => draft::query::touch(tx, scene_id).await?,
+        }
+        Ok(())
     }
 
     /// Deletes a node and (by cascade) its edges.
@@ -855,9 +1099,10 @@ impl Service {
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        if query_sqlite::delete_node(&mut conn, scene_id, id).await? == 0 {
+        if query_sqlite::delete_node(&mut conn, Store::Live, scene_id, id).await? == 0 {
             return Err(ServiceError::NotFound("node"));
         }
+        query_sqlite::bump_revision(&mut conn, scene_id).await?;
         self.collect_garbage(&mut conn).await?;
         if !scene.enabled {
             // Nothing runs it: its folder goes now. (A running scene's
@@ -882,13 +1127,21 @@ impl Service {
     /// Validates a node request against its plugin. `existing` is the node
     /// being updated: a remote node's token and its launch-args secrets are
     /// kept if the request omits them.
-    async fn prepare_node(
+    ///
+    /// In a draft, a node that doesn't validate against its plugin yet is
+    /// taken as it is (incomplete): its configurator doesn't run, and its
+    /// configured fields are left out until it validates. Errors in its
+    /// structure (an unknown plugin, an unreadable config, a wrong type) are
+    /// refused either way.
+    pub(super) async fn prepare_node(
         &self,
+        store: Store,
         node_id: &str,
         input: NodeInput,
         existing: Option<&Node>,
         defaults: &SceneDefaults,
     ) -> Result<PreparedNode, ServiceError> {
+        let lenient = store == Store::Draft;
         let mut errors = vec![];
         let name = optional_name(input.name, &mut errors);
         let plugin = match self.plugins.get(&input.plugin_id).await {
@@ -940,10 +1193,43 @@ impl Service {
             .map(NodeRules::of)
             .transpose()
             .map_err(ServiceError::Unknown)?;
+        if let (Some(plugin), Some(t)) = (&plugin, &input.node_type)
+            && *t != plugin.plugin_type
+        {
+            errors.push(format!(
+                "type {t:?} doesn't match plugin {}, which is a {}",
+                plugin.id, plugin.plugin_type
+            ));
+        }
+        // A draft's incomplete node: stored without running its configurator.
+        let mut incomplete = false;
+        if lenient
+            && errors.is_empty()
+            && let (Some(plugin), Some(config), Some(rules)) = (&plugin, config.as_mut(), &rules)
+        {
+            let configured_fields = rules.spec.configured_fields();
+            let user_part = configure::without_configured(&rules.spec, &config.launch_args);
+            let mut probe = config.clone();
+            probe.launch_args = user_part.clone();
+            incomplete = validate_against_plugin(&probe, plugin, defaults)?
+                .iter()
+                .any(|e| {
+                    !configured_fields
+                        .iter()
+                        .any(|f| e.starts_with(&format!("config.launch_args/{f}")))
+                });
+            if incomplete && !configured_fields.is_empty() {
+                config.launch_args = user_part;
+            }
+        }
         if let (Some(plugin), Some(config)) = (&plugin, config.as_mut())
             && errors.is_empty()
+            && !incomplete
         {
-            match self.configure(node_id, plugin, config, existing).await? {
+            match self
+                .configure(store, node_id, plugin, config, existing)
+                .await?
+            {
                 // The configurator's own errors are the answer.
                 Err(problems) => return Err(ServiceError::Invalid(problems)),
                 Ok(Configure::Ran(c)) => configured = Some(c),
@@ -953,15 +1239,9 @@ impl Service {
                 Ok(Configure::Kept | Configure::NotApplicable) => {}
             }
         }
-        if let (Some(plugin), Some(t)) = (&plugin, &input.node_type)
-            && *t != plugin.plugin_type
+        if let (Some(plugin), Some(config)) = (&plugin, &config)
+            && !lenient
         {
-            errors.push(format!(
-                "type {t:?} doesn't match plugin {}, which is a {}",
-                plugin.id, plugin.plugin_type
-            ));
-        }
-        if let (Some(plugin), Some(config)) = (&plugin, &config) {
             // Waiting for an upload, the configured fields aren't set yet:
             // that's for `check` to report, not a reason to refuse the node.
             errors.extend(
@@ -996,6 +1276,7 @@ impl Service {
     /// problems.
     async fn configure(
         &self,
+        store: Store,
         node_id: &str,
         plugin: &Plugin,
         config: &mut NodeConfig,
@@ -1045,7 +1326,8 @@ impl Service {
             return Ok(Ok(Configure::Kept));
         }
         let mut conn = self.conn().await?;
-        let uploads = configurator::uploads(&mut conn, &self.files.files_dir, node_id).await?;
+        let uploads =
+            configurator::uploads(&mut conn, store, &self.files.files_dir, node_id).await?;
         drop(conn);
         // A file the settings name may not be uploaded yet (a new node can't
         // have uploads): the configurator runs once it is (`put_upload`);
@@ -1127,14 +1409,15 @@ impl Service {
     }
 
     /// Stores a configurator's files as the node's uploads (in `tx`).
-    async fn store_configured(
+    pub(super) async fn store_configured(
         &self,
         tx: &mut sqlx::SqliteConnection,
+        store: Store,
         node_id: &str,
         prepared: &PreparedNode,
     ) -> Result<(), ServiceError> {
         if let Some(configured) = &prepared.configured {
-            configurator::store_files(tx, &self.files.files_dir, node_id, configured)
+            configurator::store_files(tx, store, &self.files.files_dir, node_id, configured)
                 .await
                 .map_err(ServiceError::Unknown)?;
         }
@@ -1153,7 +1436,7 @@ impl Service {
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        let node: Node = query_sqlite::get_node(&mut conn, scene_id, id)
+        let node: Node = query_sqlite::get_node(&mut conn, Store::Live, scene_id, id)
             .await
             .map_err(not_found("node"))?
             .try_into()?;
@@ -1183,7 +1466,8 @@ impl Service {
                 }
             },
         };
-        let uploads = configurator::uploads(&mut conn, &self.files.files_dir, id).await?;
+        let uploads =
+            configurator::uploads(&mut conn, Store::Live, &self.files.files_dir, id).await?;
         let configured = self
             .run_configurator(
                 &package,
@@ -1210,8 +1494,11 @@ impl Service {
             configured: Some(configured),
         };
         let mut tx = conn.begin_with(WRITE_TX).await?;
-        let row = query_sqlite::update_node(&mut tx, scene_id, id, &prepared.values()).await?;
-        self.store_configured(&mut tx, id, &prepared).await?;
+        let row = query_sqlite::update_node(&mut tx, Store::Live, scene_id, id, &prepared.values())
+            .await?;
+        self.store_configured(&mut tx, Store::Live, id, &prepared)
+            .await?;
+        query_sqlite::bump_revision(&mut tx, scene_id).await?;
         tx.commit().await?;
         self.collect_garbage(&mut conn).await?;
         self.changed(&scene);
@@ -1225,7 +1512,7 @@ impl Service {
         query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        Ok(query_sqlite::list_edges(&mut conn, scene_id)
+        Ok(query_sqlite::list_edges(&mut conn, Store::Live, scene_id)
             .await?
             .into_iter()
             .map(Edge::from)
@@ -1233,8 +1520,17 @@ impl Service {
     }
 
     pub(crate) async fn get_edge(&self, scene_id: &str, id: &str) -> Result<Edge, ServiceError> {
+        self.get_edge_in(Store::Live, scene_id, id).await
+    }
+
+    pub(crate) async fn get_edge_in(
+        &self,
+        store: Store,
+        scene_id: &str,
+        id: &str,
+    ) -> Result<Edge, ServiceError> {
         let mut conn = self.conn().await?;
-        Ok(query_sqlite::get_edge(&mut conn, scene_id, id)
+        Ok(query_sqlite::get_edge(&mut conn, store, scene_id, id)
             .await
             .map_err(not_found("edge"))?
             .into())
@@ -1245,7 +1541,7 @@ impl Service {
         scene_id: &str,
         input: EdgeInput,
     ) -> Result<Edge, ServiceError> {
-        self.write_edge(scene_id, None, input).await
+        self.write_edge(Store::Live, scene_id, None, input).await
     }
 
     pub(crate) async fn update_edge(
@@ -1254,7 +1550,8 @@ impl Service {
         id: &str,
         input: EdgeInput,
     ) -> Result<Edge, ServiceError> {
-        self.write_edge(scene_id, Some(id), input).await
+        self.write_edge(Store::Live, scene_id, Some(id), input)
+            .await
     }
 
     pub(crate) async fn delete_edge(&self, scene_id: &str, id: &str) -> Result<(), ServiceError> {
@@ -1263,15 +1560,20 @@ impl Service {
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        if query_sqlite::delete_edge(&mut conn, scene_id, id).await? == 0 {
+        if query_sqlite::delete_edge(&mut conn, Store::Live, scene_id, id).await? == 0 {
             return Err(ServiceError::NotFound("edge"));
         }
+        query_sqlite::bump_revision(&mut conn, scene_id).await?;
         self.changed(&scene);
         Ok(())
     }
 
-    async fn write_edge(
+    /// Creates (`id` = `None`) or replaces an edge, live or in the scene's
+    /// draft (started from live if there's none). Edges are checked the same
+    /// way in both: their mapping must compile against the nodes' schemas.
+    pub(super) async fn write_edge(
         &self,
+        store: Store,
         scene_id: &str,
         id: Option<&str>,
         input: EdgeInput,
@@ -1290,12 +1592,15 @@ impl Service {
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
+        if store == Store::Draft {
+            self.ensure_draft(&mut conn, &scene).await?;
+        }
         for (field, node_id) in [
             ("source_node_id", &input.source_node_id),
             ("target_node_id", &input.target_node_id),
         ] {
             if let Err(sqlx::Error::RowNotFound) =
-                query_sqlite::get_node(&mut conn, scene_id, node_id).await
+                query_sqlite::get_node(&mut conn, store, scene_id, node_id).await
             {
                 errors.push(format!("{field} {node_id:?} isn't a node of this scene"));
             }
@@ -1306,6 +1611,7 @@ impl Service {
             let (source, target) = self
                 .edge_schemas(
                     &mut conn,
+                    store,
                     scene_id,
                     &input.source_node_id,
                     &input.target_node_id,
@@ -1333,10 +1639,10 @@ impl Service {
         let mut tx = conn.begin_with(WRITE_TX).await?;
         let written = match id {
             None => {
-                query_sqlite::insert_edge(&mut tx, scene_id, &Ulid::generate().to_string(), &values)
-                    .await
+                let id = Ulid::generate().to_string();
+                query_sqlite::insert_edge(&mut tx, store, scene_id, &id, &values).await
             }
-            Some(id) => query_sqlite::update_edge(&mut tx, scene_id, id, &values).await,
+            Some(id) => query_sqlite::update_edge(&mut tx, store, scene_id, id, &values).await,
         };
         let row = written.map_err(|e| match e {
             sqlx::Error::RowNotFound => ServiceError::NotFound("edge"),
@@ -1351,9 +1657,12 @@ impl Service {
             }
             e => e.into(),
         })?;
-        check_graph(&mut tx, scene_id).await?;
+        check_graph(&mut tx, store, scene_id).await?;
+        self.committed(&mut tx, store, scene_id).await?;
         tx.commit().await?;
-        self.changed(&scene);
+        if store == Store::Live {
+            self.changed(&scene);
+        }
         Ok(row.into())
     }
 
@@ -1377,7 +1686,7 @@ enum Configure {
     NotApplicable,
 }
 
-struct PreparedNode {
+pub(super) struct PreparedNode {
     name: Option<String>,
     node_type: String,
     plugin_id: String,
@@ -1412,16 +1721,32 @@ fn validate_against_plugin(
 /// Whole-scene rules the DB can't express, checked before commit:
 /// - a SINK can't be an edge source, and a SOURCE can't be an edge target;
 /// - a node on a cycle can't use the `block` queue policy (it can deadlock).
-async fn check_graph(
+pub(super) async fn check_graph(
     conn: &mut sqlx::SqliteConnection,
+    store: Store,
     scene_id: &str,
 ) -> Result<(), ServiceError> {
-    let nodes: Vec<Node> = query_sqlite::list_nodes(conn, scene_id)
+    let nodes: Vec<Node> = query_sqlite::list_nodes(conn, store, scene_id)
         .await?
         .into_iter()
         .map(Node::try_from)
         .collect::<Result<_, _>>()?;
-    let edges = query_sqlite::list_edges(conn, scene_id).await?;
+    let edges = query_sqlite::list_edges(conn, store, scene_id).await?;
+    let pairs: Vec<(&str, &str)> = edges
+        .iter()
+        .map(|e| (e.source_node_id.as_str(), e.target_node_id.as_str()))
+        .collect();
+    let errors = graph_rule_errors(&nodes, &pairs);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ServiceError::Invalid(errors))
+    }
+}
+
+/// The rules of [`check_graph`] on a graph at hand: edges as (source,
+/// target) node ids.
+pub(super) fn graph_rule_errors(nodes: &[Node], pairs: &[(&str, &str)]) -> Vec<String> {
     let type_of = |id: &str| {
         nodes
             .iter()
@@ -1429,27 +1754,21 @@ async fn check_graph(
             .map(|n| n.node_type.as_str())
     };
     let mut errors = vec![];
-    for edge in &edges {
-        if type_of(&edge.source_node_id) == Some("SINK") {
+    for (source, target) in pairs {
+        if type_of(source) == Some("SINK") {
             errors.push(format!(
-                "edge {} → {}: node {} is a SINK, which can't send events",
-                edge.source_node_id, edge.target_node_id, edge.source_node_id
+                "edge {source} → {target}: node {source} is a SINK, which can't send events"
             ));
         }
-        if type_of(&edge.target_node_id) == Some("SOURCE") {
+        if type_of(target) == Some("SOURCE") {
             errors.push(format!(
-                "edge {} → {}: node {} is a SOURCE, which can't receive events",
-                edge.source_node_id, edge.target_node_id, edge.target_node_id
+                "edge {source} → {target}: node {target} is a SOURCE, which can't receive events"
             ));
         }
     }
     let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-    let pairs: Vec<(&str, &str)> = edges
-        .iter()
-        .map(|e| (e.source_node_id.as_str(), e.target_node_id.as_str()))
-        .collect();
-    let in_cycles = graph::nodes_in_cycles(&ids, &pairs);
-    for node in &nodes {
+    let in_cycles = graph::nodes_in_cycles(&ids, pairs);
+    for node in nodes {
         if in_cycles.contains(node.id.as_str())
             && node.config.runtime.when_full() == Some(WhenFull::Block)
         {
@@ -1459,11 +1778,16 @@ async fn check_graph(
             ));
         }
     }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(ServiceError::Invalid(errors))
-    }
+    errors
+}
+
+/// A scene as the live list shows it.
+#[derive(Debug)]
+pub(crate) struct SceneRow {
+    pub scene: Scene,
+    pub nodes: usize,
+    pub edges: usize,
+    pub check: SceneCheck,
 }
 
 /// What [`Service::check`] found.
@@ -1713,6 +2037,7 @@ pub(crate) mod tests {
             plugin_id: plugin.into(),
             node_type: None,
             config,
+            position: None,
         }
     }
 

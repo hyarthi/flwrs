@@ -1,7 +1,7 @@
 use crate::modules::api_error::{ApiError, ErrorBody, api_error, internal};
 use crate::modules::node_config::SceneDefaults;
 use crate::modules::scene::service::{self, ListFilters, Service, ServiceError};
-use crate::modules::scene::{api_graph, api_status, api_transfer, api_uploads};
+use crate::modules::scene::{api_draft, api_graph, api_status, api_transfer, api_uploads};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -45,6 +45,10 @@ pub(crate) struct Scene {
     pub max_hops: Option<u32>,
     /// Defaults for the scene's nodes; a node's own setting wins.
     pub defaults: SceneDefaults,
+    /// Counts committed changes to the live graph (settings, nodes, edges,
+    /// uploads). A draft records the one it's based on; the bulk endpoint
+    /// can require it (`base_revision`).
+    pub revision: i64,
     pub create_time: i64,
     pub update_time: i64,
 }
@@ -57,6 +61,7 @@ impl From<service::Scene> for Scene {
             enabled: value.enabled,
             max_hops: value.max_hops,
             defaults: value.defaults,
+            revision: value.revision,
             create_time: value.create_time.timestamp_millis(),
             update_time: value.update_time.timestamp_millis(),
         }
@@ -272,6 +277,7 @@ async fn disable_scene(
         api_graph::get_edge,
         api_graph::update_edge,
         api_graph::delete_edge,
+        api_graph::set_layout,
         api_uploads::put_upload,
         api_uploads::list_uploads,
         api_uploads::get_upload,
@@ -288,6 +294,8 @@ async fn disable_scene(
         api_graph::NodeRequest,
         api_graph::Edge,
         api_graph::EdgeRequest,
+        api_graph::LayoutRequest,
+        crate::modules::scene::service::Position,
         api_transfer::SceneCheckResponse,
         api_transfer::ImportResponse,
         api_transfer::SceneUpload,
@@ -313,6 +321,7 @@ impl Api {
             .merge(api_transfer::routes())
             .merge(api_status::routes())
             .merge(api_uploads::routes())
+            .merge(api_draft::routes())
             .with_state(service)
     }
 }

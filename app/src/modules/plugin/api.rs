@@ -1,6 +1,6 @@
 use super::service::{Plugin, Service, ServiceError};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
@@ -31,6 +31,8 @@ pub(crate) struct PluginInfo {
     /// Payload schema the plugin emits (SOURCE, TRANSFORM), as `SchemaDefinition` JSON.
     #[schema(value_type = Option<Object>)]
     pub out_schema: Option<serde_json::Value>,
+    /// How a UI presents it (the manifest's `ui`); absent if it says nothing.
+    pub ui: Option<PluginUi>,
     /// Whether the package's files are present on disk.
     pub installed: bool,
     pub archive_sha256: String,
@@ -43,7 +45,17 @@ impl PluginInfo {
         let installed = service.is_installed(&plugin);
         let manifest = plugin.parsed_manifest();
         let json = |s: &Option<String>| s.as_deref().and_then(|s| serde_json::from_str(s).ok());
+        let ui = manifest
+            .as_ref()
+            .and_then(|m| m.ui.as_ref())
+            .map(|ui| PluginUi {
+                icon: ui.icon.is_some(),
+                categories: ui.categories.clone(),
+                color: ui.color.clone(),
+                docs: ui.docs.is_some(),
+            });
         Self {
+            ui,
             installed,
             platforms: manifest.as_ref().and_then(|m| m.platforms.clone()),
             launch_args_style: manifest
@@ -64,6 +76,116 @@ impl PluginInfo {
             update_time: plugin.update_time.timestamp_millis(),
         }
     }
+}
+
+/// The manifest's `ui` block. The icon and the docs are served by
+/// `GET …/by-id/{id}/ui/icon` and `…/ui/docs`.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PluginUi {
+    /// Whether the package has an icon (SVG or PNG).
+    pub icon: bool,
+    /// Tags for grouping and filtering.
+    pub categories: Vec<String>,
+    /// `#RRGGBB`.
+    pub color: Option<String>,
+    /// Whether the package has docs (Markdown).
+    pub docs: bool,
+}
+
+/// Which of the manifest's `ui` files.
+#[derive(Clone, Copy, Debug, serde::Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UiFile {
+    Icon,
+    Docs,
+}
+
+/// Largest `ui` file served (they're read whole).
+const MAX_UI_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+#[utoipa::path(
+    get,
+    path = "/by-id/{id}/ui/{file}",
+    operation_id = "get-plugin-ui-file",
+    summary = "Get a plugin's icon or docs",
+    description = "Only the files the manifest's `ui` names: `icon` (image/svg+xml or image/png) and `docs` (text/markdown). They come from the uploaded package, so they're served sandboxed (a `Content-Security-Policy` that runs nothing): show the icon with an `<img>`, and sanitize the docs before rendering them. `ETag` = the package's hash.",
+    params(
+        ("id" = String, Path, description = "Plugin id"),
+        ("file" = UiFile, Path, description = "icon or docs"),
+    ),
+    responses(
+        (status = 200, description = "The file", content_type = "application/octet-stream", body = Vec<u8>),
+        (status = 304, description = "Not modified (If-None-Match)"),
+        (status = 404, description = "Plugin not found, or it has no such file", body = ErrorBody),
+    )
+)]
+async fn get_ui_file(
+    State(service): State<Svc>,
+    Path((id, file)): Path<(String, UiFile)>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let plugin = service.get(&id).await?;
+    let not_found = || api_error(StatusCode::NOT_FOUND, "plugin has no such file", vec![]);
+    let ui = plugin
+        .parsed_manifest()
+        .and_then(|m| m.ui)
+        .ok_or_else(not_found)?;
+    let relative = match file {
+        UiFile::Icon => ui.icon,
+        UiFile::Docs => ui.docs,
+    }
+    .ok_or_else(not_found)?;
+    let content_type = match file {
+        UiFile::Docs => "text/markdown; charset=utf-8",
+        UiFile::Icon if relative.to_ascii_lowercase().ends_with(".png") => "image/png",
+        UiFile::Icon => "image/svg+xml",
+    };
+    let etag = format!("\"{}\"", plugin.archive_sha256);
+    let common = [
+        (header::CACHE_CONTROL, "no-cache"),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        // Package content: nothing in it may run, even opened directly.
+        (
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+        ),
+    ];
+    let matches = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
+    if matches {
+        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag)], common).into_response());
+    }
+    // The manifest's paths were checked at install (relative, no `..`).
+    let path = std::path::Path::new(&plugin.install_path).join(&relative);
+    let size = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| not_found())?
+        .len();
+    if size > MAX_UI_FILE_BYTES {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "plugin's file is too large to serve",
+            vec![format!(
+                "{relative}: {size} bytes, at most {MAX_UI_FILE_BYTES}"
+            )],
+        ));
+    }
+    let bytes = tokio::fs::read(&path).await.map_err(|_| not_found())?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (header::ETAG, etag),
+        ],
+        common,
+        bytes,
+    )
+        .into_response())
 }
 
 /// Error response with a list of details (e.g. every problem in a package).
@@ -117,9 +239,15 @@ impl From<ServiceError> for ApiError {
     }
 }
 
-/// Mutating endpoints run uploaded code eventually, so they're gated:
-/// `[plugins] allow_upload` must be on, and the caller must present the admin
-/// token (if one is configured) or connect from a loopback address.
+/// The header carrying `[plugins] admin_token`. Not `Authorization`: that
+/// one carries the API's own credentials (`[http.auth]`), and plugin changes
+/// need both.
+pub(crate) const ADMIN_TOKEN_HEADER: &str = "x-flwrs-admin-token";
+
+/// Mutating endpoints run uploaded code eventually, so they're gated on top
+/// of the API's auth: `[plugins] allow_upload` must be on, and the caller must
+/// present the admin token (`X-Flwrs-Admin-Token`, if one is configured) or
+/// connect from a loopback address.
 fn authorize(service: Svc, headers: &HeaderMap, peer: SocketAddr) -> Result<(), ApiError> {
     let config = service.config();
     if !config.allow_upload {
@@ -132,16 +260,16 @@ fn authorize(service: Svc, headers: &HeaderMap, peer: SocketAddr) -> Result<(), 
     match &config.admin_token {
         Some(token) => {
             let presented = headers
-                .get(header::AUTHORIZATION)
+                .get(ADMIN_TOKEN_HEADER)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "));
+                .map(str::trim);
             if presented.is_some_and(|p| constant_time_eq(p.as_bytes(), token.as_bytes())) {
                 Ok(())
             } else {
                 Err(api_error(
                     StatusCode::UNAUTHORIZED,
                     "missing or wrong admin token",
-                    vec![],
+                    vec!["send `X-Flwrs-Admin-Token: <[plugins] admin_token>`".into()],
                 ))
             }
         }
@@ -274,7 +402,7 @@ async fn get_launch_args_schema(
     path = "",
     operation_id = "upload-plugin",
     summary = "Upload and register a plugin package",
-    description = "Requires `[plugins] allow_upload = true`, and the admin token (if configured) or a loopback client.",
+    description = "Requires `[plugins] allow_upload = true`, and the admin token (`X-Flwrs-Admin-Token`, if configured) or a loopback client, on top of the API's own auth.",
     request_body(content = PluginUpload, content_type = "multipart/form-data"),
     responses(
         (status = 201, description = "Registered", body = PluginInfo),
@@ -361,11 +489,12 @@ async fn delete_plugin(
         list_plugins,
         get_plugin,
         get_launch_args_schema,
+        get_ui_file,
         upload_plugin,
         upgrade_plugin,
         delete_plugin
     ),
-    components(schemas(PluginInfo, ErrorBody, PluginUpload))
+    components(schemas(PluginInfo, PluginUi, UiFile, ErrorBody, PluginUpload))
 )]
 pub(crate) struct Api;
 
@@ -382,6 +511,7 @@ impl Api {
                 "/plugins/by-id/{id}/launch-args-schema",
                 get(get_launch_args_schema),
             )
+            .route("/plugins/by-id/{id}/ui/{file}", get(get_ui_file))
             .layer(DefaultBodyLimit::max(limit))
             .with_state(service)
     }
@@ -394,7 +524,7 @@ mod tests {
     use crate::modules::plugin::service::tests::{Fixture, fixture};
     use axum::body::Body;
     use axum::extract::connect_info::MockConnectInfo;
-    use axum::http::Request;
+    use axum::http::{Request, header};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -444,13 +574,107 @@ mod tests {
             format!("multipart/form-data; boundary={BOUNDARY}"),
         );
         if let Some(t) = token {
-            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+            builder = builder.header(ADMIN_TOKEN_HEADER, t);
         }
         builder.body(Body::from(body)).unwrap()
     }
 
     const LOCAL: &str = "127.0.0.1:5000";
     const REMOTE: &str = "203.0.113.7:5000";
+
+    #[tokio::test]
+    async fn serves_the_manifests_ui_files_sandboxed() {
+        use crate::modules::plugin::package::tests::{IN_SCHEMA, Item, PLATFORM, build_zip};
+        let f = fixture(|_| {}).await;
+        let path = f.service.new_upload_path();
+        let manifest = format!(
+            r##"{{"manifest_version": 2, "id": "with-ui", "name": "UI", "version": "1.0.0",
+                "type": "SINK", "executable": "bin/run", "platforms": ["{PLATFORM}"],
+                "payload_schemas": {{"in": "schema/in.json"}},
+                "ui": {{"icon": "ui/icon.svg", "categories": ["Web"], "color": "#336699", "docs": "README.md"}}}}"##
+        );
+        build_zip(
+            &path,
+            &[
+                Item::File("manifest.json", manifest.as_bytes()),
+                Item::File("bin/run", b"#!/bin/sh\n"),
+                Item::File("schema/in.json", IN_SCHEMA.as_bytes()),
+                Item::File("ui/icon.svg", b"<svg xmlns='http://www.w3.org/2000/svg'/>"),
+                Item::File("README.md", b"# Hello"),
+            ],
+        );
+        f.service.install(&path).await.unwrap();
+
+        let get = |uri: &str| Request::get(uri).body(Body::empty()).unwrap();
+        let (status, info) = call(&f, LOCAL, get("/plugins/by-id/with-ui")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            info["ui"],
+            serde_json::json!({"icon": true, "categories": ["Web"], "color": "#336699", "docs": true})
+        );
+
+        let app = Api::build_router(f.service);
+        let icon = app
+            .clone()
+            .oneshot(get("/plugins/by-id/with-ui/ui/icon"))
+            .await
+            .unwrap();
+        assert_eq!(icon.status(), StatusCode::OK);
+        assert_eq!(icon.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        assert!(
+            icon.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .contains("sandbox")
+        );
+        assert_eq!(icon.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        let etag = icon.headers()[header::ETAG].clone();
+        let docs = app
+            .clone()
+            .oneshot(get("/plugins/by-id/with-ui/ui/docs"))
+            .await
+            .unwrap();
+        assert!(
+            docs.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/markdown")
+        );
+        assert_eq!(
+            &docs.into_body().collect().await.unwrap().to_bytes()[..],
+            b"# Hello"
+        );
+        let cached = app
+            .clone()
+            .oneshot(
+                Request::get("/plugins/by-id/with-ui/ui/icon")
+                    .header(header::IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+
+        // Nothing but the two names; a plugin without a ui has none.
+        let other = app
+            .clone()
+            .oneshot(get("/plugins/by-id/with-ui/ui/manifest"))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::BAD_REQUEST);
+        f.service
+            .install(&f.upload("plain", "1.0.0"))
+            .await
+            .unwrap();
+        let none = app
+            .oneshot(get("/plugins/by-id/plain/ui/icon"))
+            .await
+            .unwrap();
+        assert_eq!(none.status(), StatusCode::NOT_FOUND);
+        let (_, plain) = call(&f, LOCAL, get("/plugins/by-id/plain")).await;
+        assert!(plain["ui"].is_null());
+    }
 
     #[tokio::test]
     async fn uploads_are_disabled_by_default() {

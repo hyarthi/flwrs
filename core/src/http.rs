@@ -52,12 +52,21 @@ impl ServerConfig {
     pub fn swagger_ui(&self) -> bool {
         self.swagger_ui
     }
+
+    /// The address it listens on.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
 }
 
 pub struct HttpServer {
     config: ServerConfig,
     api_delegate: Router,
     root_delegate: Router,
+    /// Cancelled when the server starts shutting down. Long-lived responses
+    /// (event streams) end on it; the graceful shutdown waits for every
+    /// open response.
+    stopping: CancellationToken,
 }
 
 impl Default for HttpServer {
@@ -66,6 +75,7 @@ impl Default for HttpServer {
             config: ServerConfig::read(),
             api_delegate: Router::new(),
             root_delegate: Router::new(),
+            stopping: CancellationToken::new(),
         }
     }
 }
@@ -74,6 +84,12 @@ impl HttpServer {
     /// Its `[http]` settings.
     pub fn config(&self) -> &ServerConfig {
         &self.config
+    }
+
+    /// Cancelled when the server starts shutting down: streaming handlers
+    /// end their streams on it.
+    pub fn stopping(&self) -> CancellationToken {
+        self.stopping.clone()
     }
 
     pub fn new(apis: Vec<Router>, swagger_ui: Option<Router>) -> Self {
@@ -137,9 +153,10 @@ impl HttpServer {
         router
     }
 
-    async fn shutdown(token: CancellationToken) {
+    async fn shutdown(token: CancellationToken, stopping: CancellationToken) {
         token.cancelled().await;
         log::debug!("HTTP server shutting down.");
+        stopping.cancel();
     }
 }
 
@@ -181,7 +198,7 @@ impl registry::Service for HttpServer {
             .nest("/api", api_router)
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
         match axum::serve(listener, app)
-            .with_graceful_shutdown(Self::shutdown(token))
+            .with_graceful_shutdown(Self::shutdown(token, self.stopping.clone()))
             .await
         {
             Ok(()) => {

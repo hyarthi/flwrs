@@ -48,14 +48,14 @@ impl Service {
         id: &str,
         include_secrets: bool,
     ) -> Result<Export, ServiceError> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.lock.lock_read().await;
         let mut conn = self.conn().await?;
         let scene = query_sqlite::get_scene(&mut conn, id)
             .await
             .map_err(not_found("scene"))?;
         let mut nodes = vec![];
         let mut files: Vec<(String, PathBuf)> = vec![];
-        for row in query_sqlite::list_nodes(&mut conn, id).await? {
+        for row in query_sqlite::list_nodes(&mut conn, Store::Live, id).await? {
             let node = Node::try_from(row)?;
             let mut config = node.config.clone();
             if config.launch == LaunchMode::Remote {
@@ -99,7 +99,7 @@ impl Service {
                     config.launch_args = rules.without_secrets(&config.launch_args);
                 }
             }
-            let uploads = query_sqlite::list_uploads(&mut conn, &node.id).await?;
+            let uploads = query_sqlite::list_uploads(&mut conn, Store::Live, &node.id).await?;
             for upload in &uploads {
                 if include_secrets || !secret_uploads.contains(&upload.name) {
                     let stored = upload.stored_name();
@@ -110,6 +110,7 @@ impl Service {
                 }
             }
             nodes.push(pb::Node {
+                position: node.position.map(|p| pb::Position { x: p.x, y: p.y }),
                 omitted_secrets,
                 files: uploads
                     .into_iter()
@@ -127,7 +128,7 @@ impl Service {
                 config_json: serde_json::to_string(&config).expect("config serializes"),
             });
         }
-        let edges = query_sqlite::list_edges(&mut conn, id)
+        let edges = query_sqlite::list_edges(&mut conn, Store::Live, id)
             .await?
             .into_iter()
             .map(|e| pb::Edge {
@@ -291,7 +292,11 @@ impl Service {
                 plugin_version: node.plugin_version.as_deref(),
                 config: &node.config_json,
             };
-            query_sqlite::insert_node(&mut tx, &scene_id, &id, &values).await?;
+            query_sqlite::insert_node(&mut tx, Store::Live, &scene_id, &id, &values).await?;
+            if node.ui.is_some() {
+                query_sqlite::set_ui(&mut tx, Store::Live, &scene_id, &id, node.ui.as_deref())
+                    .await?;
+            }
             for upload in &node.files {
                 let Some(source) = files.get(&upload.sha256).cloned() else {
                     missing.push(format!(
@@ -316,7 +321,15 @@ impl Service {
                     files.insert(upload.sha256.clone(), stored.clone());
                 }
                 let size = i64::try_from(upload.size).unwrap_or(i64::MAX);
-                query_sqlite::put_upload(&mut tx, &id, &upload.name, &upload.sha256, size).await?;
+                query_sqlite::put_upload(
+                    &mut tx,
+                    Store::Live,
+                    &id,
+                    &upload.name,
+                    &upload.sha256,
+                    size,
+                )
+                .await?;
             }
             ids.insert(node.key.as_str(), id);
         }
@@ -327,7 +340,7 @@ impl Service {
                 target_node_id: &ids[edge.target_key.as_str()],
                 mapping: edge.mapping_json.as_deref(),
             };
-            query_sqlite::insert_edge(&mut tx, &scene_id, &next_id(), &values)
+            query_sqlite::insert_edge(&mut tx, Store::Live, &scene_id, &next_id(), &values)
                 .await
                 .map_err(|e| match e.as_database_error().map(|d| d.kind()) {
                     Some(ErrorKind::UniqueViolation) => ServiceError::Invalid(vec![format!(
@@ -338,7 +351,7 @@ impl Service {
                 })?;
         }
         // Edge direction by node type, no `block` on a cycle.
-        check_graph(&mut tx, &scene_id).await?;
+        check_graph(&mut tx, Store::Live, &scene_id).await?;
         tx.commit().await?;
         // Files stored for an import that failed above go here too.
         self.collect_garbage(&mut conn).await?;
@@ -399,6 +412,8 @@ struct PlannedNode {
     config_json: String,
     omitted_secrets: Vec<String>,
     files: Vec<pb::NodeFile>,
+    /// Layout (the `ui` column), if the file places the node.
+    ui: Option<String>,
 }
 
 struct PlannedEdge {
@@ -515,6 +530,12 @@ fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
             config_json,
             omitted_secrets: node.omitted_secrets,
             files: node.files,
+            // A bad position is layout, not content: dropped, not refused.
+            ui: node
+                .position
+                .map(|p| Position { x: p.x, y: p.y })
+                .filter(|p| p.check().is_ok())
+                .map(Position::to_json),
         });
     }
 

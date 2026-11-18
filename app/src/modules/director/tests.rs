@@ -349,61 +349,85 @@ impl Drop for Setup {
     }
 }
 
-/// Registers the test plugins: `t-source`, `t-ticker`, `t-upper`, `t-pass`,
-/// `t-sink`, `t-slow-sink`.
-async fn register_plugins(f: &Fixture, dir: &Path) {
+/// The test plugins' launch scripts: one per mode, shared by every test of
+/// this binary and kept between runs, in a folder named after the binary.
+///
+/// A new executable's first run can be slow (the OS may check it first): ten
+/// fresh scripts per test would add up. Stable scripts pay that once. A
+/// script finds its test's output file from its working directory, the node
+/// folder `<test dir>/nodes/<scene>/<node>` (see `start_director`).
+fn plugin_scripts() -> &'static Path {
     use std::os::unix::fs::PermissionsExt;
-    let exe = std::env::current_exe().unwrap();
-    let out = dir.join("out.txt");
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let exe = std::env::current_exe().unwrap();
+        let tag = &sha256::digest(exe.to_string_lossy().as_bytes())[..16];
+        let dir = std::env::temp_dir().join(format!("flwrs-director-test-plugins-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (_, _, mode, _) in PLUGINS {
+            let path = dir.join(format!("{mode}.sh"));
+            let script = format!(
+                "#!/bin/sh\n[ -n \"$WARM_UP\" ] && exit 0\n{MODE_ENV}='{mode}' {OUT_ENV}=\"$PWD/../../../out.txt\" {ARGS_ENV}=\"$*\" exec '{}' {CHILD_TEST} --exact --ignored --test-threads=1\n",
+                exe.display()
+            );
+            // Rewritten only when it changes (a new file is scanned again);
+            // atomically, as another run of this binary may be reading it.
+            if std::fs::read_to_string(&path).ok().as_deref() != Some(script.as_str()) {
+                let partial = dir.join(format!(".{mode}.{}", std::process::id()));
+                std::fs::write(&partial, &script).unwrap();
+                std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::fs::rename(&partial, &path).unwrap();
+            }
+            // Its first run here, not in a test.
+            assert!(
+                std::process::Command::new(&path)
+                    .env("WARM_UP", "1")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        dir
+    })
+}
+
+/// The test plugins: id, type, mode, payload schemas.
+const PLUGINS: [(&str, &str, &str, &str); 10] = [
+    ("t-source", "SOURCE", "source", r#"{"out":"o.json"}"#),
+    ("t-ticker", "SOURCE", "ticker", r#"{"out":"o.json"}"#),
+    (
+        "t-upper",
+        "TRANSFORM",
+        "upper",
+        r#"{"in":"i.json","out":"o.json"}"#,
+    ),
+    (
+        "t-pass",
+        "TRANSFORM",
+        "pass",
+        r#"{"in":"i.json","out":"o.json"}"#,
+    ),
+    ("t-sink", "SINK", "sink", r#"{"in":"i.json"}"#),
+    ("t-slow-sink", "SINK", "slow-sink", r#"{"in":"i.json"}"#),
+    ("t-flaky-sink", "SINK", "flaky-sink", r#"{"in":"i.json"}"#),
+    (
+        "t-failing-sink",
+        "SINK",
+        "failing-sink",
+        r#"{"in":"i.json"}"#,
+    ),
+    ("t-crash-sink", "SINK", "crash-sink", r#"{"in":"i.json"}"#),
+    ("t-gated-sink", "SINK", "gated-sink", r#"{"in":"i.json"}"#),
+];
+
+/// Registers the test plugins (`PLUGINS`), their scripts in
+/// [`plugin_scripts`]. Their output goes to `<dir>/out.txt`.
+async fn register_plugins(f: &Fixture, _dir: &Path) {
+    let scripts = plugin_scripts();
     let Database::SQLite(db) = f.plugins.service.db();
     let mut conn = db.get_connection().await.unwrap();
-    for (id, plugin_type, mode, schemas) in [
-        ("t-source", "SOURCE", "source", r#"{"out":"o.json"}"#),
-        ("t-ticker", "SOURCE", "ticker", r#"{"out":"o.json"}"#),
-        (
-            "t-upper",
-            "TRANSFORM",
-            "upper",
-            r#"{"in":"i.json","out":"o.json"}"#,
-        ),
-        (
-            "t-pass",
-            "TRANSFORM",
-            "pass",
-            r#"{"in":"i.json","out":"o.json"}"#,
-        ),
-        ("t-sink", "SINK", "sink", r#"{"in":"i.json"}"#),
-        ("t-slow-sink", "SINK", "slow-sink", r#"{"in":"i.json"}"#),
-        ("t-flaky-sink", "SINK", "flaky-sink", r#"{"in":"i.json"}"#),
-        (
-            "t-failing-sink",
-            "SINK",
-            "failing-sink",
-            r#"{"in":"i.json"}"#,
-        ),
-        ("t-crash-sink", "SINK", "crash-sink", r#"{"in":"i.json"}"#),
-        ("t-gated-sink", "SINK", "gated-sink", r#"{"in":"i.json"}"#),
-    ] {
-        let script = format!("{id}.sh");
-        let path = dir.join(&script);
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\n[ -n \"$WARM_UP\" ] && exit 0\n{MODE_ENV}='{mode}' {OUT_ENV}='{}' {ARGS_ENV}=\"$*\" exec '{}' {CHILD_TEST} --exact --ignored --test-threads=1\n",
-                out.display(),
-                exe.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // macOS scans a new executable on its first run; do that now.
-        assert!(
-            std::process::Command::new(&path)
-                .env("WARM_UP", "1")
-                .status()
-                .unwrap()
-                .success()
-        );
+    for (id, plugin_type, mode, schemas) in PLUGINS {
+        let script = format!("{mode}.sh");
         let manifest = format!(
             r#"{{"manifest_version":1,"id":"{id}","name":"{id}","version":"1.0.0","type":"{plugin_type}","executable":"{script}","payload_schemas":{schemas}}}"#
         );
@@ -416,7 +440,7 @@ async fn register_plugins(f: &Fixture, dir: &Path) {
         .bind(id)
         .bind(plugin_type)
         .bind(manifest)
-        .bind(dir.to_string_lossy().into_owned())
+        .bind(scripts.to_string_lossy().into_owned())
         .bind(has_in.then_some(TEXT_SCHEMA_JSON))
         .bind(has_out.then_some(TEXT_SCHEMA_JSON))
         .execute(&mut *conn)
@@ -524,6 +548,22 @@ impl Setup {
             .lines()
             .map(|l| l.split(' ').map(str::to_string).collect())
             .collect()
+    }
+
+    /// The sink plugin, started by hand (a remote node): run where a node
+    /// folder would be, so its output goes to this test's `out.txt`.
+    #[cfg(feature = "remote")]
+    fn remote_sink(&self) -> tokio::process::Command {
+        let cwd = self
+            .dir
+            .path()
+            .join("nodes")
+            .join("remote")
+            .join("far-sink");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut command = tokio::process::Command::new(plugin_scripts().join("sink.sh"));
+        command.current_dir(cwd);
+        command
     }
 
     async fn wait_lines(&self, n: usize) -> Vec<Vec<String>> {
@@ -977,7 +1017,8 @@ async fn a_changed_remote_node_keeps_its_plugin_connected() {
     s.edge(&scene, &ticker, &remote).await;
     s.director.reload(&scene).await.unwrap();
     let addr = s.hub_addr.unwrap();
-    let mut plugin = tokio::process::Command::new(s.dir.path().join("t-sink.sh"))
+    let mut plugin = s
+        .remote_sink()
         .args([
             "--id",
             "far-sink",
@@ -1186,7 +1227,8 @@ async fn a_remote_node_is_reached_by_its_remote_id() {
 
     // The operator starts the remote plugin with its remote_id, not the node id.
     let addr = s.hub_addr.unwrap();
-    let mut plugin = tokio::process::Command::new(s.dir.path().join("t-sink.sh"))
+    let mut plugin = s
+        .remote_sink()
         .args([
             "--id",
             "far-sink",

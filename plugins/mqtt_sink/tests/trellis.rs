@@ -114,7 +114,10 @@ async fn subscribe(port: u16) -> std::sync::Arc<std::sync::Mutex<HashMap<String,
 }
 
 async fn run(file: &str, vars: &[(&str, String)]) {
-    let mut tester = Tester::new(target());
+    run_tester(Tester::new(target()), file, vars).await;
+}
+
+async fn run_tester(mut tester: Tester, file: &str, vars: &[(&str, String)]) {
     for (name, value) in vars {
         tester = tester.var(*name, value.clone());
     }
@@ -194,9 +197,13 @@ async fn nacks_retryably_while_the_broker_is_down() {
 #[tokio::test]
 async fn recovers_when_the_broker_comes_up() {
     let (v4, v5) = (free_port(), free_port());
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(2));
-        start_broker_on(v4, v5);
-    });
-    run("recover.test.toml", &[("broker", v5.to_string())]).await;
+    // The test file's stimulus step starts the broker, after the first NACK.
+    let start = move |_: flwrs_trellis::StimulusCtx| {
+        Box::pin(async move {
+            std::thread::spawn(move || start_broker_on(v4, v5));
+            Ok(None)
+        })
+    };
+    let tester = Tester::new(target()).stimulus(start);
+    run_tester(tester, "recover.test.toml", &[("broker", v5.to_string())]).await;
 }

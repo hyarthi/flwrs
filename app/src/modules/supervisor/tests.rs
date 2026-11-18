@@ -105,8 +105,8 @@ impl Env {
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // macOS scans a new executable on its first run, which can take a
-        // noticeable fraction of a second; take that hit here, not in a timeout.
+        // A new executable's first run can be slow (the OS may check it
+        // first); take that hit here, not in a timeout.
         let warm_up = std::process::Command::new(&path)
             .env("WARM_UP", "1")
             .status();

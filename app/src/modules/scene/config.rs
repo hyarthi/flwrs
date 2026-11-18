@@ -14,6 +14,9 @@ pub(crate) struct ScenesConfig {
     pub max_import_bytes: u64,
     /// Most entries in an imported archive.
     pub max_import_entries: usize,
+    /// How often the live list (`GET /api/scenes/stream`) sends the scenes'
+    /// status. At least 100.
+    pub stream_interval_ms: u64,
 }
 
 impl Default for ScenesConfig {
@@ -22,6 +25,7 @@ impl Default for ScenesConfig {
             max_upload_bytes: 1024 * 1024 * 1024,
             max_import_bytes: 1024 * 1024 * 1024,
             max_import_entries: 10_000,
+            stream_interval_ms: 1_000,
         }
     }
 }
@@ -31,5 +35,10 @@ impl ScenesConfig {
         // A missing or invalid section falls back to the defaults (errors are
         // printed by the config reader).
         config::read_struct(main_config(), &["scenes".to_string()]).unwrap_or_default()
+    }
+
+    /// `stream_interval_ms`, at least 100 ms.
+    pub(crate) fn stream_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.stream_interval_ms.max(100))
     }
 }

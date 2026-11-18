@@ -187,6 +187,7 @@ async fn run(command: Command) -> Result<ExitCode, String> {
                 release: !debug,
                 out,
                 config: common.config,
+                target_dir: None,
             })?;
             println!("{}", packaged.path.display());
             Ok(ExitCode::SUCCESS)
@@ -418,6 +419,7 @@ fn open(plugin: &PluginArgs, default_profile: Profile) -> Result<(Target, Option
                 release: matches!(profile, Profile::Release),
                 out: Some(temp.path().to_path_buf()),
                 config: plugin.config.config.clone(),
+                target_dir: None,
             })?;
             eprintln!("packaged {}", packaged.path.display());
             Target::from_zip(&packaged.path)?

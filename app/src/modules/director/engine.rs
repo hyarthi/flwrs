@@ -337,6 +337,9 @@ async fn gather(
                     .filter(|n| n.status.state == NodeState::Running)
                     .count(),
                 errors: status.errors.len(),
+                emitted: status.nodes.iter().map(|n| n.counters.emitted).sum(),
+                received: status.nodes.iter().map(|n| n.counters.received).sum(),
+                dropped: status.nodes.iter().map(|n| n.counters.dropped).sum(),
             };
             scenes.push(summary);
             statuses.push((scene_id, status));

@@ -1,6 +1,9 @@
 pub(crate) mod api_error;
+pub(crate) mod auth;
+pub(crate) mod changes;
 pub(crate) mod configurator;
 pub(crate) mod director;
+pub(crate) mod duration;
 pub(crate) mod hub;
 pub(crate) mod mapping;
 pub(crate) mod node_config;
@@ -10,3 +13,5 @@ pub(crate) mod scene;
 pub(crate) mod status_api;
 pub(crate) mod supervisor;
 pub(crate) mod telemetry;
+#[cfg(feature = "web-ui")]
+pub(crate) mod web_ui;

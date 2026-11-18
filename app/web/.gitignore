@@ -1,0 +1,4 @@
+# npm install output and local builds (cargo builds the UI into its OUT_DIR)
+node_modules/
+dist/
+.build-lock

@@ -31,7 +31,7 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 | Folder | Crate | Purpose |
 |---|---|---|
 | `core/` | `flwrs-core` | Shared library: config, logging, SQLite + migrations, HTTP server, service registry. |
-| `app/` | `flwrs-app` | The flwrs server. |
+| `app/` | `flwrs-app` | The flwrs server, and its web UI (`app/web/`: Svelte + Vite, built and embedded by the server's build). |
 | `plugin/` | `flwrs-plugin` | Plugin protocol definition (`schema/*.proto`) and the reference Rust SDK: wire framing, `Source`/`Transform`/`Sink` traits and runners. |
 | `types/` | `flwrs-types` | Types shared by the server and plugins: the typed value tree, dot paths and the Lua sandbox (unpublished). |
 | `plugins/` | — | Base plugin library. Currently `http_sink`, `ticker`, `script_transform`, `accumulator`, `mqtt_sink`, `mqtt_source`, `ws_sink`, `http_source`, `ws_source`, `http_push_sink` and `ws_push_sink` (Rust), and `kit` (code they share: the HTTP server core, the push sinks' broadcast core). Plugins in other languages can live here too. |
@@ -45,7 +45,7 @@ See [AGENTS.md](AGENTS.md) for a file-by-file map.
 
 ## Building
 
-Requirements: Rust 1.94+ (edition 2024), and a C compiler for the target (for the bundled SQLite, TLS and Lua sources). `protoc` is bundled through a build dependency, so you don't need to install it.
+Requirements: Rust 1.94+ (edition 2024), and a C compiler for the target (for the bundled SQLite, TLS and Lua sources). `protoc` is bundled through a build dependency, so you don't need to install it. The server's web UI (the `web-ui` feature, in `full` and `edge`) also needs **Node.js 20.19+ and npm** at build time: the build runs `npm ci` (when `app/web/node_modules` is missing or older than the lockfile) and `npm run build`, and embeds the result (set `FLWRS_NPM` to use another npm). Barebones builds (`--no-default-features`) don't need Node.
 
 The repo is a Cargo workspace. Run commands from the root:
 
@@ -53,12 +53,14 @@ The repo is a Cargo workspace. Run commands from the root:
 cargo build --workspace            # everything
 cargo build -p flwrs-app           # server only
 cargo build -p flwrs-http-sink     # HTTP sink plugin only
-cargo test --workspace             # all tests
+cargo nextest run --workspace      # all tests, in parallel (cargo-nextest; settings in .config/nextest.toml)
+cargo test --workspace --doc       # doctests (nextest doesn't run them)
+cargo test --workspace             # all tests without nextest (one test binary after another)
 ```
 
-Binaries end up in `target/debug/` (or `target/release/`).
+Binaries end up in `target/debug/` (or `target/release/`). The tests run fastest with [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`): each test is its own process, and all test binaries run at once.
 
-**Build flavours** of the server, as cargo features: `full` (the default: everything), `edge` (for mid-range edge devices: `mapping-lua` for Lua edge mappings, `otel` for OpenTelemetry export, `telemetry-file` for telemetry files and `remote` for remote plugins with tokens, `remote_id`, the TLS listener and client certificates; no Swagger UI), and barebones, `--no-default-features` (low-end devices: none of them, a server that only runs local plugins), e.g. `cargo build -p flwrs-app --no-default-features --features edge`. Features can be added one by one too (`--no-default-features --features telemetry-file`). A server built without a feature can still import scenes that use it (Lua mappings, remote nodes), but lists them as problems and won't run them.
+**Build flavours** of the server, as cargo features: `full` (the default: everything), `edge` (for mid-range edge devices: `mapping-lua` for Lua edge mappings, `otel` for OpenTelemetry export, `telemetry-file` for telemetry files, `remote` for remote plugins with tokens, `remote_id`, the TLS listener and client certificates, and `web-ui` for the web UI; no Swagger UI), and barebones, `--no-default-features` (low-end devices: none of them, a server that only runs local plugins), e.g. `cargo build -p flwrs-app --no-default-features --features edge`. Features can be added one by one too (`--no-default-features --features telemetry-file`). A server built without a feature can still import scenes that use it (Lua mappings, remote nodes), but lists them as problems and won't run them.
 
 ## Running the server
 
@@ -68,8 +70,14 @@ Create a `config.toml` (pass a different path with `--config`). Every section is
 [http]
 host = "0.0.0.0"
 port = 8080
-# enabled = true      # false: no management API (scenes still run; e.g. an edge box once configured)
+# enabled = true      # false: no management API and no web UI (scenes still run; e.g. an edge box once configured)
 # swagger_ui = false  # opt-in: Swagger UI at /swagger-ui (builds with the swagger-ui feature); /api-docs/openapi.json is always served
+
+[http.auth]          # who may use the API and the web UI; without a key, loopback clients only
+# secret_key = "…"    # or secret_key_file = "/run/secrets/flwrs-key", or FLWRS_SECRET_KEY; at least 16 bytes (openssl rand -hex 32)
+# session_ttl = "7d"  # how long a login lasts
+# allowed_origins = ["https://flwrs.example.com"]   # a proxy serving the UI under another name
+# secure_cookie = true   # default: when a proxy says the request came over HTTPS (X-Forwarded-Proto)
 
 [runtime]
 # threads = 0        # cores the server uses: 1 = single-threaded, N = main + N - 1 workers; 0 / unset = one worker per core
@@ -112,6 +120,7 @@ key = "hub.key"
 [scenes]
 # max_upload_bytes = 1073741824   # one file uploaded to a node
 # max_import_bytes = 1073741824   # one scene import (and what an archive unpacks to)
+# stream_interval_ms = 1000       # how often the live list (GET /api/scenes/stream) sends status
 ```
 
 ```sh
@@ -121,13 +130,23 @@ cargo run -p flwrs-app -- --config config.toml
 **For development**, use the checked-in `config.dev.toml` from the repo root:
 
 ```sh
-cargo run -p flwrs-app -- --config config.dev.toml   # serves on 127.0.0.1:8080
+cargo dev   # = cargo run --bin flwrs-app --target-dir target/dev -- --config config.dev.toml; serves on 127.0.0.1:8080
 ```
 
-It keeps everything the server writes at run time (database, installed plugins, node folders, uploaded files, spool files, telemetry files) under `./.data/`, which is gitignored, so runtime data never mixes with the source tree. To start over, stop the server and run `chmod -R u+w .data && rm -rf .data` (node folders' `config/` are read-only, so a plain `rm -rf` stops there).
+`cargo dev` builds into its own folder, `target/dev`: a plain build of the server enables other dependency features than `cargo test --workspace`, so sharing `target/debug` they'd rebuild a good part of the workspace after each other. It keeps everything the server writes at run time (database, installed plugins, node folders, uploaded files, spool files, telemetry files) under `./.data/`, which is gitignored, so runtime data never mixes with the source tree. To start over, stop the server and run `chmod -R u+w .data && rm -rf .data` (node folders' `config/` are read-only, so a plain `rm -rf` stops there).
 
+- Web UI: `http://localhost:8080/` (builds with the `web-ui` feature)
 - REST API: `http://localhost:8080/api/scenes`
 - Swagger UI: `http://localhost:8080/swagger-ui` (opt-in: `config.dev.toml` sets `[http] swagger_ui = true`); the OpenAPI document: `http://localhost:8080/api-docs/openapi.json`
+
+### Access to the API and the web UI
+
+The management API and the web UI are behind `[http.auth]`:
+
+- **With a secret key** (`secret_key`, `secret_key_file` or the `FLWRS_SECRET_KEY` environment variable; checked at start, at least 16 bytes): the web UI asks for it once and keeps a session cookie (`flwrs_session`: HttpOnly, `SameSite=Strict`, `session_ttl` long). The cookie holds signed and encrypted claims, never the key, and the server keeps no sessions, so changing the key logs everyone out. Scripts send the key on each request instead: `Authorization: Bearer <key>`. `POST /api/auth/login` (`{"key": "…"}`), `POST /api/auth/logout`, `GET /api/auth/session` (who's calling), `GET /api/auth/providers`. Failed logins are limited per client address (429). The key travels with every login or bearer request, so put TLS in front of the server (a reverse proxy) when it's reached over a network.
+- **Without a key:** only loopback clients get in, and only when they name the server by a loopback address (`localhost`, `127.0.0.1`, `[::1]`), so a web page can't reach it through DNS rebinding. Note that behind a reverse proxy on the same machine every client looks like loopback: set a key there.
+- Browsers' state-changing requests from another origin are refused (`Origin` must be the server itself or in `allowed_origins`), unless they carry the key as a bearer token.
+- Unknown `/api/…` paths are JSON 404s (after auth). The OpenAPI document and Swagger UI are public, but their calls need auth too.
 
 ## Plugin protocol
 
@@ -161,9 +180,36 @@ A **scene** is a workflow: a directed graph whose **nodes** are plugin instances
 | `DELETE …/nodes/by-id/{node_id}/workdir` | Empty a node's folder (the plugin's state and caches), while the scene is disabled. |
 | `GET /api/scenes/by-id/{id}/check` | Whether the scene can run here: `launchable`, `problems` (block enabling), `warnings`. |
 | `GET /api/scenes/by-id/{id}/status` | What the scene is doing right now (see *Status*, below). |
+| `GET /api/scenes/stream` | The scenes list, live (Server-Sent Events; the web UI's list): `scenes` (every scene with its node and edge counts and its check, sent first and after each change to scenes or plugins), `status` (each running scene's state and event counters, every `[scenes] stream_interval_ms`, 1 s by default). |
+| `…/scenes/by-id/{id}/draft…` | The scene's **draft**: edit the graph apart from the live one, then submit it at once (see *Drafts*, below). |
+| `POST /api/scenes/by-id/{id}/graph/batch` | Several changes to the live graph in one step, all or nothing (see *Drafts*, below). |
 | `DELETE /api/scenes/by-id/{id}/spool`, `…/nodes/by-id/{node_id}/spool` | Start the queues of the scene's nodes over, or one node's: the lever for corrupted, overflowing or lagging spool files. Every queued event goes, including those handed to a plugin and not acknowledged yet (they aren't delivered again), and spool files are deleted (running queues start fresh ones). For a disabled scene, that's what its durable queues kept. Also brings back a durable queue whose file couldn't be opened. Returns `purged_events`. |
 
 Invalid requests return **422** with every problem listed in `details`.
+
+Every scene has a **`revision`**: it counts committed changes to its live graph (settings, nodes, edges, uploads).
+
+### Drafts and batches
+
+Each change through the endpoints above is committed (and a running scene reloaded) at once. To restructure a scene without its intermediate states running, edit a **draft** and submit it, or send a **batch**.
+
+**Drafts** (`/api/scenes/by-id/{id}/draft…`; one per scene, shared by every client):
+
+- `POST …/draft` starts one from the live graph (any draft edit does too); `GET` shows it, `DELETE` discards it. Every node and edge in it carries its state against live: `unchanged`, `added`, `changed` (with the `parts` that differ: `name`, `plugin`, `config.<key>`, `uploads`), or `removed` (kept as a shadow, until `…/restore`). Node and edge ids are the live ones.
+- Its graph is edited with the same requests as live, under `…/draft`: `PUT …/draft/settings`, `…/draft/nodes…`, `…/draft/edges…`, `…/draft/nodes/by-id/{node_id}/uploads/{name}`. A draft takes an **incomplete node** (one that doesn't validate against its plugin yet; its configurator runs once it does); structural errors (an unknown plugin, an unreadable config, a broken graph rule) are refused as live.
+- `GET …/draft/diff` lists what would change; `GET …/draft/check` is the scene check on the draft.
+- `POST …/draft/submit` (`{"base_revision": n, "disable": false}`, both optional) commits it in one transaction: one revision, one reload (only changed nodes restart), and the draft goes. An enabled scene takes a draft only without problems, unless `disable` disables it in the same step.
+- If live changed since the draft started (direct edits, a batch), submit asks for a **rebase** first: `POST …/draft/rebase` merges per node, edge and the settings what changed on one side only, and marks what both sides changed as a **conflict**; `POST …/draft/resolve` (`{"target": "node", "id": "…", "keep": "draft" | "live"}`) settles each before submitting.
+
+**Batches** (`POST /api/scenes/by-id/{id}/graph/batch`): a list of operations (`op`: `update_scene`, `create_node`, `update_node`, `delete_node`, `create_edge`, `update_edge`, `delete_edge`), each checked as its own endpoint checks it, in order. Created nodes and edges can take a `key`, and later operations name them `"$<key>"`. Everything is then written in one transaction, with one revision and one reload; nothing is written if an operation fails (its index is in the error: `ops[2] (create_edge): …`). `base_revision` makes it refuse (409) if the scene changed meanwhile.
+
+```json
+{ "base_revision": 7, "ops": [
+  { "op": "create_node", "key": "parse", "plugin_id": "script-transform", "config": { "launch_args": { "script": "return payload" } } },
+  { "op": "delete_edge", "id": "01J…" },
+  { "op": "create_edge", "source_node_id": "01J…", "target_node_id": "$parse" }
+] }
+```
 
 **Hop limit:** every handover of an event between nodes counts as a hop, and an event is dropped (and counted) once it exceeds the limit. That stops events from circling forever in a cycle. The limit is `[director] max_hops` (32) unless the scene sets its own `max_hops` (1 to 10 000), for complex scenes with long chains or deliberate loops:
 
@@ -255,7 +301,7 @@ The output is then shaped to the target node's input schema. Conversions that lo
   - `counters`: `emitted` (events the plugin produced), `received` (events delivered to it), `dropped`, `mapping_errors`, `restarts`;
   - the inbound `queue`: depth in events and bytes, drops by reason, time producers spent blocked (`blocked_ms`), delivery (`in_flight`, `redelivered`, `nacked`, `dead_lettered`), and disk details (`spill`, `durable`, on disk, written, refilled, whether the free-space guard is holding writes);
   - the plugin's `link`, for spotting slow links and setup problems: `heartbeats` (`last_rtt_ms`, the latest round trip of the hub's `PING`; `answered`; `missed`, not answered within three heartbeat intervals; `unexpected`, `PONG`s with a nonce the hub didn't send) and `connections` (`accepted`; `rejected`, declarations that don't match the node; `replaced` by a newer connection, e.g. two plugins started with the same id; and lost ones by cause: `closed_by_plugin` without `Exit`, `timed_out`, `io_errors` such as resets, `protocol_violations`). Closes the hub asks for (stop, reload, token renewal) aren't counted.
-- **`GET /api/status`**: the server at a glance: every scene the director has handled since it started (state, node counts), the hub's address and `hub_connections` (open now, still in their handshake, closed at once for the pending limits, handshakes that failed before reaching a node: bad or late `Initialize`, TLS, unknown id, wrong credentials), and memory and disk in use against their limits (the hub-wide queue budget, spill memory, spool files).
+- **`GET /api/status`**: the server at a glance: every scene the director has handled since it started (state, node counts, its nodes' `emitted` / `received` / `dropped` counters added up), the hub's address and `hub_connections` (open now, still in their handshake, closed at once for the pending limits, handshakes that failed before reaching a node: bad or late `Initialize`, TLS, unknown id, wrong credentials), and memory and disk in use against their limits (the hub-wide queue budget, spill memory, spool files).
 
 Counters start at zero when a node starts: when its scene starts, or when a reload restarts that node. Nodes a reload leaves running keep counting.
 
@@ -370,7 +416,7 @@ cargo trellis package plugins/http_sink                 # → target/plugins/htt
 curl -F file=@target/plugins/http-sink-0.0.1-macos-aarch64.zip http://localhost:8080/api/plugins
 ```
 
-> **Security:** an uploaded plugin is code the server will run. Upload, upgrade and delete are **off by default** (`[plugins] allow_upload = true` turns them on). When they're on, callers need `Authorization: Bearer <[plugins] admin_token>`, or, if no token is configured, must connect from loopback. `config.dev.toml` enables uploads from loopback for development.
+> **Security:** an uploaded plugin is code the server will run. Upload, upgrade and delete are **off by default** (`[plugins] allow_upload = true` turns them on). When they're on, callers need, on top of the API's own auth, the admin token in `X-Flwrs-Admin-Token: <[plugins] admin_token>`, or, if no token is configured, must connect from loopback. `config.dev.toml` enables uploads from loopback for development.
 
 ## Writing a plugin
 
@@ -402,7 +448,7 @@ flwrs is in early development. The main things still missing, roughly in order:
    - the WebSocket source ([plugins/ws_source](plugins/ws_source): an AsyncAPI 3.x document's channels, messages typed by their payload schemas);
    - the HTTP push sink ([plugins/http_push_sink](plugins/http_push_sink): events broadcast to subscribers over Server-Sent Events and long polling, with replay);
    - the WebSocket push sink ([plugins/ws_push_sink](plugins/ws_push_sink): events broadcast to connected WebSocket clients, with replay).
-2. **A web UI** for building and running scenes visually (nodes, edges, mappings, status), instead of through the REST API.
+2. **A web UI** for building and running scenes visually (nodes, edges, mappings, status), instead of through the REST API. In progress: the frame (served at `/` by the server, light and dark themes), login with the secret key, and the live scenes list (create, import, export, enable, delete) are in; the scene editor comes next.
 3. **Alternative storage back-ends**, such as PostgreSQL. Today scenes, nodes, edges and the plugin registry live in SQLite only (the `Database` enum in `flwrs-core` has a single variant); a shared database is also a step towards running several servers.
 4. **Running as a cluster.** The server currently runs in **single-node mode only**: one server runs every scene it has, and there's no swarming, no handover of scenes between servers, and no load balancing. Remote plugins can run on other machines, but they all connect to one hub. Running properly in a data-centre environment (in-cluster) needs scenes spread across servers, failover, and load balancing.
 5. **Profiling and optimisation.** Throughput, latency and memory are measured per plugin with `trellis bench` (each plugin's README has a *Footprint* section), so far on an Apple M2 (but needs a proper dedicated benchmark test - just playing around so far, no serious measurements yet); edge devices (an Intel NUC, a Raspberry Pi) are next. Done so far: credit handed to a source's waiting senders in order, longest-waiting first (up to 1.7× for sources whose clients outrun their credit); per-connection buffer settings for the WebSocket plugins (~130 → ~11 KiB per push-sink client); a small HTTP/2 send buffer for the server plugins (1 000 HTTP/2 SSE subscribers: ~3.7× the throughput at a fifth of the memory); trellis's own timer lateness kept out of its latency numbers. Open: batching writes to many WebSocket clients, durable queues' fixed 5 ms batching window, keyed parallelism in the script transforms, TLS handshake cost when connections churn, and the HTTP and WebSocket sources' binary sizes (18–22 MB). See `ideas/` for the designs.

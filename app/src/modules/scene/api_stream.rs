@@ -1,0 +1,435 @@
+//! `GET /api/scenes/stream`: the scenes list, live (Server-Sent Events).
+//!
+//! - `scenes`: every scene with its graph's size and its check, sent first
+//!   and again after each change to scenes or plugins (bursts coalesced).
+//! - `status`: the director's summary of the scenes it runs (state, nodes,
+//!   event counters), every `[scenes] stream_interval_ms`.
+//! - `stream_error`: the list couldn't be read (`{error, details}`); the
+//!   stream goes on.
+//!
+//! The stream ends when the HTTP server starts shutting down.
+
+use crate::modules::api_error::ErrorBody;
+use crate::modules::director::handle::{SceneState, SceneSummary};
+use crate::modules::scene::api::Svc;
+use crate::modules::scene::service::SceneRow;
+use axum::Router;
+use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::routing::get;
+use futures_util::Stream;
+use serde::Serialize;
+use std::convert::Infallible;
+use std::time::Duration;
+use tokio::sync::watch;
+use tokio::time::{Interval, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
+use utoipa::{OpenApi, ToSchema};
+
+/// Changes within this long after the first one go out as one `scenes` event.
+pub(super) const COALESCE: Duration = Duration::from_millis(150);
+
+#[derive(Clone)]
+pub(crate) struct StreamState {
+    pub scenes: Svc,
+    /// Ends the streams (the HTTP server is stopping).
+    pub stopping: CancellationToken,
+    pub interval: Duration,
+}
+
+/// A scene in the live list.
+#[derive(Serialize, ToSchema, Debug)]
+pub(crate) struct SceneListRow {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub max_hops: Option<u32>,
+    pub create_time: i64,
+    pub update_time: i64,
+    pub nodes: usize,
+    pub edges: usize,
+    /// Why it can't be enabled (`…/check`); empty = it can run.
+    pub problems: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl From<SceneRow> for SceneListRow {
+    fn from(row: SceneRow) -> Self {
+        Self {
+            id: row.scene.id,
+            name: row.scene.name,
+            enabled: row.scene.enabled,
+            max_hops: row.scene.max_hops,
+            create_time: row.scene.create_time.timestamp_millis(),
+            update_time: row.scene.update_time.timestamp_millis(),
+            nodes: row.nodes,
+            edges: row.edges,
+            problems: row.check.problems,
+            warnings: row.check.warnings,
+        }
+    }
+}
+
+/// The `scenes` event.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ScenesEvent {
+    pub scenes: Vec<SceneListRow>,
+}
+
+/// The `status` event.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct StatusEvent {
+    /// When it was taken (Unix milliseconds), for rates.
+    pub time: i64,
+    /// The scenes the director has handled since it started; any other is
+    /// stopped.
+    pub scenes: Vec<SceneSummary>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/stream",
+    operation_id = "scenes-stream",
+    summary = "The scenes list, live (Server-Sent Events)",
+    description = "Events: `scenes` (`ScenesEvent`: every scene with its node and edge counts and its check; first, and after each change to scenes or plugins), `status` (`StatusEvent`: the director's per-scene state and event counters, every `[scenes] stream_interval_ms`), `stream_error` (`ErrorBody`: the list couldn't be read). Keep-alive comments every 15 s.",
+    responses(
+        (status = 200, description = "An event stream", content_type = "text/event-stream", body = String),
+    )
+)]
+async fn stream(
+    State(state): State<StreamState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(feed(state)).keep_alive(KeepAlive::default())
+}
+
+struct Feed {
+    state: StreamState,
+    scene_changes: watch::Receiver<u64>,
+    plugin_changes: watch::Receiver<u64>,
+    ticker: Interval,
+    first: bool,
+}
+
+fn feed(state: StreamState) -> impl Stream<Item = Result<Event, Infallible>> {
+    let mut ticker = tokio::time::interval(state.interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let feed = Feed {
+        scene_changes: state.scenes.changes(),
+        plugin_changes: state.scenes.plugin_changes(),
+        state,
+        ticker,
+        first: true,
+    };
+    futures_util::stream::unfold(feed, |mut feed| async move {
+        let event = feed.next().await?;
+        Some((Ok(event), feed))
+    })
+}
+
+impl Feed {
+    async fn next(&mut self) -> Option<Event> {
+        if self.first {
+            self.first = false;
+            self.scene_changes.mark_unchanged();
+            self.plugin_changes.mark_unchanged();
+            return Some(self.scenes().await);
+        }
+        loop {
+            let stopping = self.state.stopping.clone();
+            tokio::select! {
+                biased;
+                () = stopping.cancelled() => return None,
+                changed = self.scene_changes.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    return self.after_change().await;
+                }
+                changed = self.plugin_changes.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    return self.after_change().await;
+                }
+                _ = self.ticker.tick() => {
+                    if let Some(event) = self.status().await {
+                        return Some(event);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Waits for the rest of a burst, then sends the list once.
+    async fn after_change(&mut self) -> Option<Event> {
+        let stopping = self.state.stopping.clone();
+        tokio::select! {
+            () = stopping.cancelled() => return None,
+            () = tokio::time::sleep(COALESCE) => {}
+        }
+        self.scene_changes.mark_unchanged();
+        self.plugin_changes.mark_unchanged();
+        Some(self.scenes().await)
+    }
+
+    async fn scenes(&self) -> Event {
+        match self.state.scenes.overview_rows().await {
+            Ok(rows) => json_event(
+                "scenes",
+                &ScenesEvent {
+                    scenes: rows.into_iter().map(SceneListRow::from).collect(),
+                },
+            ),
+            Err(e) => {
+                log::warn!("Scenes stream: couldn't read the scenes: {e}");
+                json_event(
+                    "stream_error",
+                    &ErrorBody {
+                        error: "couldn't read the scenes".into(),
+                        details: vec![],
+                    },
+                )
+            }
+        }
+    }
+
+    /// `None` if the director doesn't answer within an interval (skipped).
+    async fn status(&self) -> Option<Event> {
+        let overview =
+            tokio::time::timeout(self.state.interval, self.state.scenes.director().overview())
+                .await
+                .ok()?
+                .ok()?;
+        Some(json_event(
+            "status",
+            &StatusEvent {
+                time: chrono::Utc::now().timestamp_millis(),
+                scenes: overview.scenes,
+            },
+        ))
+    }
+}
+
+pub(super) fn json_event(name: &str, data: &impl Serialize) -> Event {
+    let data = serde_json::to_string(data).unwrap_or_else(|_| "{}".into());
+    Event::default().event(name).data(data)
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(stream),
+    components(schemas(
+        ScenesEvent,
+        SceneListRow,
+        StatusEvent,
+        SceneSummary,
+        SceneState,
+        ErrorBody
+    ))
+)]
+pub(crate) struct Api;
+
+/// `/scenes/stream`, with its own state (merged into the API next to the
+/// scenes router).
+pub(crate) fn router(state: StreamState) -> Router {
+    Router::new()
+        .route("/scenes/stream", get(stream))
+        .with_state(state)
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+    use crate::modules::director::handle::{DirectorCommand, Overview, Usage};
+    use crate::modules::scene::service::SceneInput;
+    use crate::modules::scene::service::tests::fixture;
+    use axum::body::{Body, BodyDataStream};
+    use axum::http::{Request, StatusCode, header};
+    use flwrs_core::db::Database;
+    use futures_util::StreamExt;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    /// Reads an event stream's named events.
+    pub(crate) struct Reader {
+        body: BodyDataStream,
+        buffer: String,
+    }
+
+    impl Reader {
+        pub(crate) fn new(response: axum::response::Response) -> Self {
+            Self {
+                body: response.into_body().into_data_stream(),
+                buffer: String::new(),
+            }
+        }
+
+        /// The next event (keep-alive comments skipped): its name and data.
+        pub(crate) async fn next_any(&mut self) -> (String, Value) {
+            let wait = async {
+                loop {
+                    while let Some(end) = self.buffer.find("\n\n") {
+                        let block: String = self.buffer.drain(..end + 2).collect();
+                        let mut event = None;
+                        let mut data = String::new();
+                        for line in block.lines() {
+                            if let Some(v) = line.strip_prefix("event:") {
+                                event = Some(v.trim().to_string());
+                            } else if let Some(v) = line.strip_prefix("data:") {
+                                data.push_str(v.trim_start());
+                            }
+                        }
+                        if let Some(event) = event {
+                            return (event, serde_json::from_str(&data).unwrap());
+                        }
+                    }
+                    let chunk = self.body.next().await.expect("stream ended").unwrap();
+                    self.buffer.push_str(std::str::from_utf8(&chunk).unwrap());
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .expect("no event")
+        }
+
+        /// Reads until the next event named `name` (others skipped).
+        pub(crate) async fn next(&mut self, name: &str) -> Value {
+            let wait = async {
+                loop {
+                    let (event, data) = self.next_any().await;
+                    if event == name {
+                        return data;
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .unwrap_or_else(|_| panic!("no {name} event"))
+        }
+
+        pub(crate) async fn ended(&mut self) -> bool {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(chunk) = self.body.next().await {
+                    chunk.unwrap();
+                }
+            })
+            .await
+            .is_ok()
+        }
+    }
+
+    #[tokio::test]
+    async fn sends_the_list_then_changes_and_status_and_ends_on_stopping() {
+        let f = fixture().await;
+        let s = f.scene().await;
+        f.node(&s.id, "test-sink", Value::Null).await;
+        // A node whose plugin isn't here (as after an import).
+        let other = f.node(&s.id, "test-sink", Value::Null).await;
+        let Database::SQLite(db) = f.plugins.service.db();
+        sqlx::query("UPDATE scene_nodes SET plugin_id = 'missing-plugin' WHERE id = $1")
+            .bind(&other.id)
+            .execute(&mut *db.get_connection().await.unwrap())
+            .await
+            .unwrap();
+
+        let stopping = CancellationToken::new();
+        let app = router(StreamState {
+            scenes: f.service,
+            stopping: stopping.clone(),
+            interval: Duration::from_millis(100),
+        });
+        let response = app
+            .oneshot(Request::get("/scenes/stream").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        let mut reader = Reader::new(response);
+
+        // First: the list, with sizes and the check.
+        let first = reader.next("scenes").await;
+        let row = &first["scenes"][0];
+        assert_eq!(row["id"], s.id.as_str());
+        assert_eq!(row["nodes"], 2);
+        assert_eq!(row["edges"], 0);
+        assert_eq!(row["enabled"], false);
+        assert!(
+            row["problems"][0]
+                .as_str()
+                .unwrap()
+                .contains("missing-plugin"),
+            "{row}"
+        );
+
+        // A change: the list again (newest first).
+        f.service
+            .create_scene(&SceneInput::named("second"))
+            .await
+            .unwrap();
+        let second = reader.next("scenes").await;
+        assert_eq!(second["scenes"].as_array().unwrap().len(), 2);
+        assert_eq!(second["scenes"][0]["name"], "second");
+
+        // A plugin change counts too (checks depend on the plugins).
+        f.plugins
+            .service
+            .install(&f.plugins.upload("another-sink", "1.0.0"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.next("scenes").await["scenes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Status, from the director.
+        let mut commands = f.director.lock().await;
+        let answer = async {
+            loop {
+                if let Some(DirectorCommand::Overview { reply }) = commands.recv().await {
+                    let usage = Usage {
+                        used_bytes: 0,
+                        limit_bytes: 1,
+                    };
+                    let _ = reply.send(Overview {
+                        hub_address: "127.0.0.1:1".into(),
+                        hub_connections: Default::default(),
+                        queued_memory: usage.clone(),
+                        spill_memory: usage.clone(),
+                        spill_disk: usage,
+                        scenes: vec![SceneSummary {
+                            scene_id: s.id.clone(),
+                            state: SceneState::Running,
+                            nodes: 2,
+                            running_nodes: 2,
+                            errors: 0,
+                            emitted: 10,
+                            received: 9,
+                            dropped: 1,
+                        }],
+                    });
+                }
+            }
+        };
+        let status = tokio::select! {
+            status = reader.next("status") => status,
+            () = answer => unreachable!(),
+        };
+        assert!(status["time"].as_i64().unwrap() > 0);
+        assert_eq!(
+            status["scenes"][0],
+            json!({"scene_id": s.id, "state": "RUNNING", "nodes": 2, "running_nodes": 2, "errors": 0, "emitted": 10, "received": 9, "dropped": 1})
+        );
+
+        stopping.cancel();
+        assert!(
+            reader.ended().await,
+            "the stream ends when the server stops"
+        );
+    }
+}

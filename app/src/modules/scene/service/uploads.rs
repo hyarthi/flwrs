@@ -86,6 +86,19 @@ impl Service {
         name: &str,
         incoming: &Path,
     ) -> Result<(NodeUpload, bool), ServiceError> {
+        self.put_upload_in(Store::Live, scene_id, node_id, name, incoming)
+            .await
+    }
+
+    /// [`Service::put_upload`], live or in the scene's draft.
+    pub(crate) async fn put_upload_in(
+        &self,
+        store: Store,
+        scene_id: &str,
+        node_id: &str,
+        name: &str,
+        incoming: &Path,
+    ) -> Result<(NodeUpload, bool), ServiceError> {
         let _incoming = Incoming(incoming.to_path_buf());
         check_file_name(name)
             .map_err(|e| ServiceError::Invalid(vec![format!("upload name {name:?}: {e}")]))?;
@@ -103,18 +116,21 @@ impl Service {
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        let node: Node = query_sqlite::get_node(&mut conn, scene_id, node_id)
+        if store == Store::Draft {
+            self.ensure_draft(&mut conn, &scene).await?;
+        }
+        let node: Node = query_sqlite::get_node(&mut conn, store, scene_id, node_id)
             .await
             .map_err(not_found("node"))?
             .try_into()?;
-        let existed = query_sqlite::get_upload(&mut conn, node_id, name)
+        let existed = query_sqlite::get_upload(&mut conn, store, node_id, name)
             .await
             .is_ok();
         // A file the settings name feeds the node's configurator (if its
         // plugin has one): it runs on the new file first, and a failure
         // refuses the upload.
         let reconfigured = self
-            .configure_for_upload(&mut conn, &node, name, incoming)
+            .configure_for_upload(&mut conn, store, &node, name, incoming)
             .await?;
         let stored = self.files.files_dir.join(stored_name(name, &sha256));
         if !stored.exists() {
@@ -126,6 +142,7 @@ impl Service {
         let mut tx = conn.begin_with(WRITE_TX).await?;
         let upload = query_sqlite::put_upload(
             &mut tx,
+            store,
             node_id,
             name,
             &sha256,
@@ -133,14 +150,19 @@ impl Service {
         )
         .await?;
         if let Some(prepared) = &reconfigured {
-            query_sqlite::update_node(&mut tx, scene_id, node_id, &prepared.values()).await?;
-            self.store_configured(&mut tx, node_id, prepared).await?;
+            query_sqlite::update_node(&mut tx, store, scene_id, node_id, &prepared.values())
+                .await?;
+            self.store_configured(&mut tx, store, node_id, prepared)
+                .await?;
         }
+        self.committed(&mut tx, store, scene_id).await?;
         tx.commit().await?;
         self.collect_garbage(&mut conn).await?;
         // A running node gets the new file when it restarts (the director's
         // diff restarts nodes whose uploads changed).
-        self.changed(&scene);
+        if store == Store::Live {
+            self.changed(&scene);
+        }
         log::info!(
             "Scene service: node [{node_id}] got upload {name:?} ({size} bytes, sha256 {sha256})"
         );
@@ -152,6 +174,7 @@ impl Service {
     async fn configure_for_upload(
         &self,
         conn: &mut sqlx::SqliteConnection,
+        store: Store,
         node: &Node,
         name: &str,
         incoming: &Path,
@@ -185,7 +208,8 @@ impl Service {
         {
             return Ok(None);
         }
-        let mut uploads = configurator::uploads(conn, &self.files.files_dir, &node.id).await?;
+        let mut uploads =
+            configurator::uploads(conn, store, &self.files.files_dir, &node.id).await?;
         uploads.insert(name.to_string(), incoming.to_path_buf());
         // Still waiting for another file: it runs once that one arrives.
         if named.iter().any(|(_, n, _)| !uploads.contains_key(n))
@@ -226,11 +250,20 @@ impl Service {
         scene_id: &str,
         node_id: &str,
     ) -> Result<Vec<NodeUpload>, ServiceError> {
+        self.list_uploads_in(Store::Live, scene_id, node_id).await
+    }
+
+    pub(crate) async fn list_uploads_in(
+        &self,
+        store: Store,
+        scene_id: &str,
+        node_id: &str,
+    ) -> Result<Vec<NodeUpload>, ServiceError> {
         let mut conn = self.conn().await?;
-        query_sqlite::get_node(&mut conn, scene_id, node_id)
+        query_sqlite::get_node(&mut conn, store, scene_id, node_id)
             .await
             .map_err(not_found("node"))?;
-        Ok(query_sqlite::list_uploads(&mut conn, node_id).await?)
+        Ok(query_sqlite::list_uploads(&mut conn, store, node_id).await?)
     }
 
     pub(crate) async fn get_upload(
@@ -239,11 +272,22 @@ impl Service {
         node_id: &str,
         name: &str,
     ) -> Result<NodeUpload, ServiceError> {
+        self.get_upload_in(Store::Live, scene_id, node_id, name)
+            .await
+    }
+
+    pub(crate) async fn get_upload_in(
+        &self,
+        store: Store,
+        scene_id: &str,
+        node_id: &str,
+        name: &str,
+    ) -> Result<NodeUpload, ServiceError> {
         let mut conn = self.conn().await?;
-        query_sqlite::get_node(&mut conn, scene_id, node_id)
+        query_sqlite::get_node(&mut conn, store, scene_id, node_id)
             .await
             .map_err(not_found("node"))?;
-        query_sqlite::get_upload(&mut conn, node_id, name)
+        query_sqlite::get_upload(&mut conn, store, node_id, name)
             .await
             .map_err(not_found("upload"))
     }
@@ -256,8 +300,19 @@ impl Service {
         node_id: &str,
         name: &str,
     ) -> Result<(NodeUpload, PathBuf), ServiceError> {
-        let upload = self.get_upload(scene_id, node_id, name).await?;
-        let node = self.get_node(scene_id, node_id).await?;
+        self.upload_content_in(Store::Live, scene_id, node_id, name)
+            .await
+    }
+
+    pub(crate) async fn upload_content_in(
+        &self,
+        store: Store,
+        scene_id: &str,
+        node_id: &str,
+        name: &str,
+    ) -> Result<(NodeUpload, PathBuf), ServiceError> {
+        let upload = self.get_upload_in(store, scene_id, node_id, name).await?;
+        let node = self.get_node_in(store, scene_id, node_id).await?;
         if let Ok(plugin) = self.plugins.get(&node.plugin_id).await
             && let Ok(rules) = NodeRules::of(&plugin)
             && let Some((field, _, _)) = rules
@@ -291,12 +346,26 @@ impl Service {
         node_id: &str,
         name: &str,
     ) -> Result<(), ServiceError> {
+        self.delete_upload_in(Store::Live, scene_id, node_id, name)
+            .await
+    }
+
+    pub(crate) async fn delete_upload_in(
+        &self,
+        store: Store,
+        scene_id: &str,
+        node_id: &str,
+        name: &str,
+    ) -> Result<(), ServiceError> {
         let _guard = self.lock.lock().await;
         let mut conn = self.conn().await?;
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        let node: Node = query_sqlite::get_node(&mut conn, scene_id, node_id)
+        if store == Store::Draft {
+            self.ensure_draft(&mut conn, &scene).await?;
+        }
+        let node: Node = query_sqlite::get_node(&mut conn, store, scene_id, node_id)
             .await
             .map_err(not_found("node"))?
             .try_into()?;
@@ -325,11 +394,14 @@ impl Service {
                 ));
             }
         }
-        if query_sqlite::delete_upload(&mut conn, node_id, name).await? == 0 {
+        if query_sqlite::delete_upload(&mut conn, store, node_id, name).await? == 0 {
             return Err(ServiceError::NotFound("upload"));
         }
+        self.committed(&mut conn, store, scene_id).await?;
         self.collect_garbage(&mut conn).await?;
-        self.changed(&scene);
+        if store == Store::Live {
+            self.changed(&scene);
+        }
         Ok(())
     }
 
@@ -345,7 +417,7 @@ impl Service {
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        query_sqlite::get_node(&mut conn, scene_id, node_id)
+        query_sqlite::get_node(&mut conn, Store::Live, scene_id, node_id)
             .await
             .map_err(not_found("node"))?;
         if scene.enabled {

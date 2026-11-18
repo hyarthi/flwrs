@@ -32,6 +32,8 @@ jsonschema.workspace = true
 zip.workspace = true
 sha256.workspace = true
 getrandom.workspace = true # per-launch plugin tokens
+ring.workspace = true # API sessions: the sealed session cookie (HKDF, ChaCha20-Poly1305), key digests
+base64.workspace = true # session cookies
 fs4.workspace = true # free disk space for the spill guard (cross-platform, safe API)
 reqwest = { workspace = true, optional = true } # OTLP/HTTP export (feature otel); remote configurators (feature remote)
 webpki-roots = { workspace = true, optional = true } # remote configurators' default roots (feature remote)
@@ -61,11 +63,16 @@ junction.workspace = true # node folders: links to the package's folders
 # optional feature).
 default = ["full"]
 full = ["edge", "swagger-ui"]
-edge = ["mapping-lua", "otel", "telemetry-file", "remote"]
+edge = ["mapping-lua", "otel", "telemetry-file", "remote", "web-ui"]
 # Swagger UI for the management API (its assets are embedded). The OpenAPI
 # document is served either way; the UI is opt-in at run time too
 # (`[http] swagger_ui = true`).
 swagger-ui = ["dep:utoipa-swagger-ui"]
+# The web UI, served from `/` with the management API (`[http] enabled`). Built
+# by build.rs from `web/` (needs Node.js >= 20.19 and npm at build time) and
+# embedded, precompressed. In `full` and `edge`; barebones builds go without
+# it (and without Node).
+web-ui = []
 # Lua edge mappings (lua rules, script, filter). On by default; build with
 # --no-default-features for targets without a working C toolchain or with very
 # little flash. Without it, scenes with Lua mappings can be imported but not run.

@@ -58,6 +58,13 @@ message Node {
   // The files uploaded to the node. A `.far` archive carries their content
   // (found by its SHA-256); a bare `.flwr` only lists them.
   repeated NodeFile files = 7;
+  // Where the node sits in the editor's canvas; unset = not placed.
+  optional Position position = 9;
+}
+
+message Position {
+  double x = 1;
+  double y = 2;
 }
 
 message NodeFile {

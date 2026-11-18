@@ -85,9 +85,10 @@ croner = { version = "4.0.3", default-features = false, features = ["jiff"] }
 
 # storage
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "chrono", "derive"] }
-rust-embed = { version = "8.13.0", features = ["debug-embed"] }
+rust-embed = { version = "8.13.0", features = ["debug-embed", "interpolate-folder-path", "mime-guess"] }
 sha256 = "1.6.0"
 getrandom = "0.4.3"
+ring = "0.17.14" # web UI / API sessions: HKDF + ChaCha20-Poly1305 (already in the tree through rustls)
 fs4 = "1.1.0"
 flate2 = "1.1.10"
 # Lua 5.4 for edge mappings, compiled from vendored C sources (needs a C compiler for the target).
@@ -105,7 +106,10 @@ tower-service = "0.3.3"
 tower-layer = "0.3.3"
 utoipa = { version = "6.0.0", features = ["yaml", "axum_extras", "chrono", "preserve_order", "debug"] }
 utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
-reqwest = "0.13.5"
+# Without `system-proxy`: proxies come from HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+# only. Reading the OS settings blocked each new process for seconds on its
+# first client, in the server, the plugins and every test that built one.
+reqwest = { version = "0.13.5", default-features = false, features = ["default-tls", "charset", "http2"] }
 
 # plugin protocol
 prost = "0.14.4"
@@ -150,3 +154,9 @@ hyper-util = { version = "0.1.21", features = ["server", "server-auto", "tokio",
 # Denied everywhere; the single allowed exception is the Windows process
 # control in app/src/modules/supervisor/process/windows.rs (see AGENTS.md).
 unsafe_code = "deny"
+
+# Dependencies with line tables only (backtraces stay readable); the
+# workspace's own crates keep full debug info. Cuts debug builds' size (and
+# link time) by much of what the dependencies' debug info took.
+[profile.dev.package."*"]
+debug = "line-tables-only"

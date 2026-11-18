@@ -1,0 +1,22 @@
+# cargo-nextest (https://nexte.st): runs every test as its own process, across
+# all test binaries at once. `cargo nextest run --workspace`; doctests aren't
+# covered: `cargo test --workspace --doc` runs them.
+
+[profile.default]
+# No retries: a flaky test should show as one, not pass on a second try.
+retries = 0
+# A test still running after 30 s is reported as slow, every 30 s; one still
+# running after 4 periods (2 min) is a hang: it's killed and fails. Tests wait
+# for what they expect with deadlines of seconds, never minutes.
+slow-timeout = { period = "30s", terminate-after = 4 }
+# Slow tests are listed again at the end, with the failures: a test that takes
+# about a timeout's length is usually waiting on one.
+final-status-level = "slow"
+# Keep going after a failure, to see every one.
+fail-fast = false
+
+# The end-to-end test builds the server and four plugin packages (cargo, in
+# its own target folders): minutes on the first run, ~15 s once warm.
+[[profile.default.overrides]]
+filter = "package(flwrs-e2e)"
+slow-timeout = { period = "60s", terminate-after = 5 }

@@ -85,6 +85,9 @@ mod tests {
                             nodes: 2,
                             running_nodes: 1,
                             errors: 0,
+                            emitted: 7,
+                            received: 5,
+                            dropped: 1,
                         }],
                     });
                 }

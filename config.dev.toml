@@ -1,5 +1,6 @@
 # Dev configuration. Run from the repo root:
-#   cargo run -p flwrs-app -- --config config.dev.toml
+#   cargo dev   (an alias in .cargo/config.toml: builds in target/dev and runs
+#               the server with this file)
 # Everything the server writes at run time goes under ./.data/ (gitignored),
 # so it never mixes with the source tree (e.g. installed plugins vs. plugins/ sources).
 
@@ -7,6 +8,11 @@
 host = "127.0.0.1"
 port = 8080
 swagger_ui = true   # opt-in (off by default): http://127.0.0.1:8080/swagger-ui
+
+# No secret key in dev: the API and web UI answer loopback clients only. To
+# try logging in, run with FLWRS_SECRET_KEY=<16+ bytes> (or uncomment this).
+# [http.auth]
+# secret_key = "dev-secret-key-0123456789"
 
 [logging]
 format = "PLAIN"

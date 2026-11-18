@@ -32,6 +32,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Order matters: the hub is bound first (the director will launch plugins
     // pointing at its address), the director's handle is used by the plugin
     // and scene services, and the scene service uses the plugin registry.
+    // Auth first: a broken [http.auth] stops the start before anything runs.
+    modules::auth::init()?;
     let hub = modules::hub::init().await?;
     log::info!("Hub bound to {}", hub.local_addr());
     let director = modules::director::init();

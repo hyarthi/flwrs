@@ -2,7 +2,8 @@
 //! MQTT source → HTTP push sink, in a real server, with an SSE client.
 //!
 //! The server and the four packages are built from this workspace (a debug
-//! build, like `cargo test`'s), the plugins installed through the REST API,
+//! build, like `cargo test`'s; in parallel, each in its own target folder
+//! under `<target>/e2e/`), the plugins installed through the REST API,
 //! the scene built and enabled through it; the broker (rumqttd) runs in this
 //! process. A request to the HTTP source must come out of the push sink's
 //! SSE stream, typed and mapped on the way.
@@ -54,17 +55,34 @@ fn start_broker() -> u16 {
     port
 }
 
-/// The server binary, built like the rest of this test run.
+/// Where this test builds `what` (a package): `<target>/e2e/<what>`.
+///
+/// Not the outer run's target folder, and not one shared folder either: a
+/// workspace crate's build artifacts don't depend on its features, and a
+/// single-package build enables fewer of them (the server's `flwrs-plugin`
+/// has `package`, a plugin's has `cli`). Sharing a folder, each build would
+/// rebuild `flwrs-plugin` and everything on it for its own features, the
+/// next `cargo test` would rebuild them back, and the outer run's doctests
+/// lost the artifacts they were using ("can't find crate"). One folder per
+/// build stays warm between runs, and lets the builds run in parallel.
+fn target_dir(what: &str) -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root().join("target"))
+        .join("e2e")
+        .join(what)
+}
+
+/// The server binary, built like the rest of this test run (debug).
 fn server_binary() -> PathBuf {
+    let target = target_dir("flwrs-app");
     let status = Command::new(env!("CARGO"))
         .args(["build", "-q", "-p", "flwrs-app"])
+        .env("CARGO_TARGET_DIR", &target)
         .current_dir(root())
         .status()
         .unwrap();
     assert!(status.success(), "building flwrs-app");
-    let target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root().join("target"));
     target
         .join("debug")
         .join(format!("flwrs-app{}", std::env::consts::EXE_SUFFIX))
@@ -79,6 +97,7 @@ fn package(plugin: &str, out: &Path) -> PathBuf {
         release: false,
         out: Some(out.to_path_buf()),
         config: None,
+        target_dir: Some(target_dir(plugin)),
     };
     flwrs_trellis::package::package(&options)
         .unwrap_or_else(|e| panic!("packaging {plugin}: {e}"))
@@ -98,7 +117,7 @@ impl Drop for Server {
     }
 }
 
-fn start_server(dir: &Path) -> Server {
+fn start_server(dir: &Path, binary: &Path) -> Server {
     let port = free_port();
     let config = format!(
         r#"
@@ -132,7 +151,7 @@ files_dir = "files"
 "#
     );
     std::fs::write(dir.join("config.toml"), config).unwrap();
-    let child = Command::new(server_binary())
+    let child = Command::new(binary)
         .args(["--config", "config.toml"])
         .current_dir(dir)
         .stdout(Stdio::inherit())
@@ -227,12 +246,21 @@ async fn http_to_mqtt_to_sse() {
     let packages = work.path().join("packages");
     let data = work.path().join("server");
     std::fs::create_dir_all(&data).unwrap();
-    let zips: Vec<PathBuf> = ["http_source", "mqtt_sink", "mqtt_source", "http_push_sink"]
-        .iter()
-        .map(|p| package(p, &packages))
-        .collect();
+    // The server and the packages build at once, each in its own folder.
+    let (server_bin, zips) = std::thread::scope(|scope| {
+        let server = scope.spawn(server_binary);
+        let plugins: Vec<_> = ["http_source", "mqtt_sink", "mqtt_source", "http_push_sink"]
+            .into_iter()
+            .map(|p| {
+                let packages = &packages;
+                scope.spawn(move || package(p, packages))
+            })
+            .collect();
+        let zips: Vec<PathBuf> = plugins.into_iter().map(|h| h.join().unwrap()).collect();
+        (server.join().unwrap(), zips)
+    });
     let broker = start_broker();
-    let server = start_server(&data);
+    let server = start_server(&data, &server_bin);
     let client = reqwest::Client::new();
     let base = server.base.clone();
     for zip in &zips {

@@ -2,3 +2,9 @@
 # The plugin developer toolkit (flwrs-trellis): package, audit, test, bench.
 # `cargo trellis package plugins/http_sink`, `cargo trellis audit plugins/http_sink`, …
 trellis = "run --quiet --package flwrs-trellis --"
+
+# The dev server (`cargo dev`), in its own target folder: a plain build of
+# the server enables other features than `cargo test --workspace` (dev-only
+# crates turn on extras in shared dependencies), and in one folder each would
+# rebuild flwrs-plugin and everything above it after the other.
+dev = "run --bin flwrs-app --target-dir target/dev -- --config config.dev.toml"

@@ -36,6 +36,11 @@ pub struct PackageOptions {
     pub out: Option<PathBuf>,
     /// A `trellis.toml` other than `<dir>/trellis.toml`.
     pub config: Option<PathBuf>,
+    /// The cargo target directory for a Rust crate's build (default: cargo's
+    /// own). A build started from inside another cargo run (a test) should
+    /// use its own: a single-package build unifies features differently, and
+    /// would otherwise replace the outer run's artifacts while it uses them.
+    pub target_dir: Option<PathBuf>,
 }
 
 impl PackageOptions {
@@ -47,6 +52,7 @@ impl PackageOptions {
             release: true,
             out: None,
             config: None,
+            target_dir: None,
         }
     }
 }
@@ -297,6 +303,13 @@ fn cargo_build(
     configurator_bin: Option<&str>,
 ) -> Result<Built, String> {
     let manifest_path = dir.join("Cargo.toml");
+    let cargo = || {
+        let mut command = cargo();
+        if let Some(target_dir) = &opts.target_dir {
+            command.env("CARGO_TARGET_DIR", target_dir);
+        }
+        command
+    };
     let output = cargo()
         .args([
             "metadata",

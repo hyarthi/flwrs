@@ -4,12 +4,13 @@ use super::config::PluginsConfig;
 use super::manifest::{self, Manifest};
 use super::node_rules::NodeRules;
 use super::package::{self, Limits, Package, PackageError};
+use crate::modules::changes::ChangeLock;
 use crate::modules::director::DirectorHandle;
+use crate::modules::scene::service::Store;
 use chrono::Local;
 use flwrs_core::db::{Database, DbError};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use tokio::sync::Mutex;
 use ulid::Ulid;
 
 /// A registered plugin (a row of `plugins`).
@@ -109,7 +110,7 @@ pub(crate) struct Service {
     /// Told to reload enabled scenes after a plugin upgrade.
     director: DirectorHandle,
     /// Serializes registry changes, so folder swaps and DB writes never interleave.
-    lock: Mutex<()>,
+    lock: ChangeLock,
     /// Where uploads are and a configurator's limits (set by the scene
     /// service at start-up): an upgrade runs the new package's configurator.
     configure_env: std::sync::OnceLock<crate::modules::configurator::Env>,
@@ -164,7 +165,7 @@ impl Service {
             config,
             platform,
             director,
-            lock: Mutex::new(()),
+            lock: ChangeLock::new(),
             configure_env: std::sync::OnceLock::new(),
         }
     }
@@ -226,6 +227,12 @@ impl Service {
     /// filesystem as the install folders, so moves are atomic renames).
     pub(crate) fn new_upload_path(&self) -> PathBuf {
         self.staging_dir().join(format!("{}.zip", Ulid::generate()))
+    }
+
+    /// Bumped after every install, upgrade or delete (for the live views:
+    /// scenes' checks depend on the plugins).
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.lock.subscribe()
     }
 
     pub(crate) async fn get(&self, id: &str) -> Result<Plugin, ServiceError> {
@@ -402,6 +409,7 @@ impl Service {
                 query_sqlite::set_node_config(&mut tx, &node.node_id, &node.config).await?;
                 crate::modules::configurator::store_files(
                     &mut tx,
+                    Store::Live,
                     &env.files_dir,
                     &node.node_id,
                     &node.configured,
@@ -575,9 +583,13 @@ impl Service {
                         "configurators can't run: no uploads folder set".into(),
                     ));
                 };
-                let uploads =
-                    crate::modules::configurator::uploads(&mut conn, &env.files_dir, &node_id)
-                        .await?;
+                let uploads = crate::modules::configurator::uploads(
+                    &mut conn,
+                    Store::Live,
+                    &env.files_dir,
+                    &node_id,
+                )
+                .await?;
                 let ran = match &endpoint {
                     None => {
                         crate::modules::configurator::run(

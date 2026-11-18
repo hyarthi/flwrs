@@ -11,7 +11,8 @@ pub(crate) struct PluginsConfig {
     /// Whether the mutating plugin endpoints (upload, upgrade, delete) are enabled.
     /// Uploading a plugin uploads code the server will run, so this is off by default.
     pub allow_upload: bool,
-    /// If set, mutating endpoints require `Authorization: Bearer <admin_token>`.
+    /// If set, mutating endpoints require `X-Flwrs-Admin-Token: <admin_token>`
+    /// (on top of the API's auth, `[http.auth]`).
     /// If not set, they only accept clients connecting from a loopback address.
     pub admin_token: Option<String>,
     /// Maximum size of an uploaded ZIP.

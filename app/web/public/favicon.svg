@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 1254 1254">
+  <title>Geometric black tulips</title>
+  <desc>Two tulips composed of twelve individually editable black shapes on one white rounded-square background.</desc>
+  <rect id="background" x="57" y="57" width="1134" height="1141" rx="224" fill="#fff"/>
+  <g fill="#000">
+    <path id="small-center-petal" d="M578 512 C557 538 537 568 523 595 C544 618 564 642 578 669 C593 642 611 618 632 595 C618 566 598 537 578 512 Z"/>
+    <path id="small-left-petal" d="M498 595 C488 622 474 655 473 677 C470 731 508 778 571 783 L570 705 C569 671 535 632 498 595 Z"/>
+    <path id="small-right-petal" d="M657 594 C668 625 682 659 682 681 C683 735 643 779 584 783 L586 705 C586 672 620 630 657 594 Z"/>
+    <path id="small-stem" d="M563 803 L595 803 L596 1096 L564 1096 Z"/>
+    <path id="small-left-leaf" d="M454 870 C482 888 510 905 529 921 C538 933 544 943 549 954 L550 1025 C527 1007 500 988 479 967 C467 936 459 903 454 870 Z"/>
+    <path id="small-right-leaf" d="M703 871 C677 887 648 904 627 922 C619 933 613 943 610 954 L609 1025 C633 1006 658 987 678 966 C689 934 697 902 703 871 Z"/>
+    <path id="large-center-petal" d="M882 252 C852 289 817 337 799 373 C830 406 862 442 882 479 C903 441 934 404 963 372 C946 335 910 286 882 252 Z"/>
+    <path id="large-left-petal" d="M763 365 C750 402 729 454 727 480 C724 559 784 628 873 632 L871 523 C871 474 818 416 763 365 Z"/>
+    <path id="large-right-petal" d="M999 364 C1013 402 1033 454 1035 480 C1040 559 977 627 888 633 L892 524 C892 475 944 417 999 364 Z"/>
+    <path id="large-stem" d="M862 656 L902 656 L903 1096 L863 1096 Z"/>
+    <path id="large-left-leaf" d="M730 767 C763 787 799 809 824 831 C834 845 843 860 847 873 L848 967 C818 943 784 918 760 892 C746 851 736 808 730 767 Z"/>
+    <path id="large-right-leaf" d="M1037 765 C1004 785 968 807 942 830 C931 845 923 860 918 873 L918 966 C948 941 982 916 1006 890 C1020 848 1030 806 1037 765 Z"/>
+  </g>
+</svg>

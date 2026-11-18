@@ -78,6 +78,12 @@ pub(crate) struct SceneSummary {
     pub running_nodes: usize,
     /// Why it couldn't start, if it failed.
     pub errors: usize,
+    /// Its nodes' counters added up (`NodeCounters`): events produced,
+    /// handed to plugins and dropped since each node started. Counters restart
+    /// with their node, so rates are computed from increases only.
+    pub emitted: u64,
+    pub received: u64,
+    pub dropped: u64,
 }
 
 #[derive(Debug)]

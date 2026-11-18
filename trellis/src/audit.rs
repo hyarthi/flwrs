@@ -267,6 +267,14 @@ async fn answers_ping(f: &mut Fixture) -> CaseResultInner {
     }
 }
 
+/// Credit given back for a source's first events (beyond the initial 3):
+/// then it has used it all.
+const MORE_CREDIT: u64 = 2;
+/// How long to watch a source with no credit left, for events beyond it.
+const OVERRUN_WATCH: Duration = Duration::from_millis(300);
+/// How long a stimulated source may be quiet after its first events.
+const STIMULUS_QUIET: Duration = Duration::from_millis(500);
+
 async fn data_events(
     f: &mut Fixture,
     stimulus: Option<&mut Box<dyn Stimulus>>,
@@ -279,6 +287,7 @@ async fn data_events(
         conn.writer.send(&Credit { events: 3 }).await?;
     }
     let mut problems = vec![];
+    let stimulated = stimulus.is_some();
     if let Some(stimulus) = stimulus {
         let ctx = StimulusCtx {
             iteration: 0,
@@ -306,15 +315,23 @@ async fn data_events(
             );
         }
     }
-    // Watch for a while: outputs (producers), acks (consumers with ACKS).
+    // Watch for up to 5 s: outputs (producers), acks (consumers with ACKS).
+    // It ends sooner once there's nothing left to see: every input answered
+    // (a transform's acks come after its outputs), or a source's credit used
+    // up and a short while more to catch it sending beyond it.
     let mut outputs = 0u64;
     let mut next_output_seq = 1u64;
     let mut answered: HashMap<u64, bool> = HashMap::new();
-    let watch = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut watch = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let left = watch.saturating_duration_since(tokio::time::Instant::now());
+        let mut left = watch.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
             break;
+        }
+        // A source driven by a stimulus emits what it causes, promptly: once
+        // it has, a quiet spell ends the watch.
+        if stimulated && !f.target.consumes() && outputs > 0 {
+            left = left.min(STIMULUS_QUIET);
         }
         let frame = match conn.reader.next(left).await {
             Err(_) => break,
@@ -337,7 +354,7 @@ async fn data_events(
                 if outputs > granted {
                     problems.push(format!("sent {outputs} events with {granted} credit"));
                 }
-                if negotiated.credits && outputs <= 20 {
+                if negotiated.credits && outputs <= MORE_CREDIT {
                     conn.writer.send(&Credit { events: 1 }).await?;
                     granted += 1;
                 }
@@ -372,12 +389,15 @@ async fn data_events(
             }
             other => problems.push(format!("unexpected {other:?}")),
         }
-        if f.target.consumes()
-            && negotiated.acks
-            && answered.len() == sent.len()
-            && !f.target.produces()
-        {
+        if f.target.consumes() && negotiated.acks && answered.len() == sent.len() {
             break;
+        }
+        if !f.target.consumes() {
+            if negotiated.credits && outputs >= granted && outputs > MORE_CREDIT {
+                watch = watch.min(tokio::time::Instant::now() + OVERRUN_WATCH);
+            } else if !negotiated.credits && outputs >= 5 {
+                break;
+            }
         }
     }
     if negotiated.acks && f.target.consumes() {
