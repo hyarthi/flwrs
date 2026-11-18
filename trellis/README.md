@@ -7,7 +7,7 @@ Developer toolkit for [flwrs](https://github.com/hyarthi/flwrs) plugins, a light
 - **`test`** runs behavioural end-to-end tests: send events, trigger sources, and check ACKs, NACKs and outputs, through redeliveries, disconnects and restarts.
 - **`bench`** measures the plugin's throughput, latency, startup time, CPU and memory.
 
-> **Status:** early development; expect breaking changes. 0.0.1 was the protocol audit alone (then the `flwrs-trellis <package>` command); 0.0.2 adds `package`, `test` and `bench`, and the audit is now `flwrs-trellis audit <package>` (in Rust, `Audit::new(target).run()` instead of `run(&target, &[])`). 0.0.3 reads manifest version 2 packages and runs plugins as the server now does: in a node folder (a link to each of the package's top-level entries, and `config/` with the files the server delivers), with launch args delivered as arguments, environment variables or files, the node's own payload schemas, and uploaded files (`[uploads]`, `uploads` in test files, `--upload`, `Target::with_upload`). It needs `flwrs-plugin` 0.0.6. 0.0.4 fixes two bugs: `package` now includes the files the launch-args schema names (a code field's `definitions`), and `test` no longer matches a new connection's events with the previous connection's answers and outputs (after a `disconnect` or `restart` step). It needs `flwrs-plugin` 0.0.7. It speaks plugin protocol version 2.
+> **Status:** early development; expect breaking changes. 0.0.1 was the protocol audit alone (then the `flwrs-trellis <package>` command); 0.0.2 adds `package`, `test` and `bench`, and the audit is now `flwrs-trellis audit <package>` (in Rust, `Audit::new(target).run()` instead of `run(&target, &[])`). 0.0.3 reads manifest version 2 packages and runs plugins as the server now does: in a node folder (a link to each of the package's top-level entries, and `config/` with the files the server delivers), with launch args delivered as arguments, environment variables or files, the node's own payload schemas, and uploaded files (`[uploads]`, `uploads` in test files, `--upload`, `Target::with_upload`). It needs `flwrs-plugin` 0.0.6. 0.0.4 fixes two bugs: `package` now includes the files the launch-args schema names (a code field's `definitions`), and `test` no longer matches a new connection's events with the previous connection's answers and outputs (after a `disconnect` or `restart` step). It needs `flwrs-plugin` 0.0.7. 0.0.5 adds `configure` and configurator tests (`*.configure.toml`; `Target::with_configurator_executable`, `Target::configure`, and `with_launch_args` running the configurator as the server does), quoted keys in output paths (`paths["/a/{b}"].x`), packaging a configurator binary, and paced open and step loops (a thread instead of tokio's timer, which woke about 1 ms late; the harness's own lateness is reported apart as `pacing_us`). It needs `flwrs-plugin` 0.0.8. It speaks plugin protocol version 2.
 
 ## Install
 
@@ -223,7 +223,7 @@ Everything above is available as a library, for example in a Rust plugin's own i
 
 ```toml
 [dev-dependencies]
-flwrs-trellis = "0.0.4"
+flwrs-trellis = "0.0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

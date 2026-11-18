@@ -37,7 +37,7 @@ repository = "https://github.com/hyarthi/flwrs"
 # internal crates
 flwrs-core = { path = "core" }
 # Without default features: crates opt into the SDK's TLS client (feature `tls`).
-flwrs-plugin = { path = "plugin", version = "0.0.7", default-features = false }
+flwrs-plugin = { path = "plugin", version = "0.0.8", default-features = false }
 # The value tree, dot paths and Lua sandbox (unpublished; server and in-repo plugins).
 flwrs-types = { path = "types" }
 # The script transform's state store and Lua host (the accumulator builds on them).
