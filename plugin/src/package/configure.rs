@@ -332,6 +332,10 @@ pub fn configure(inv: &Invocation) -> Result<Configured, Vec<String>> {
         Some(program) => program.to_path_buf(),
         None => inv.package_dir.join(&configurator.executable),
     };
+    // It runs in the temporary folder: a relative path (e.g. a server whose
+    // plugins folder is configured relative to its working directory) would
+    // be looked up there.
+    let executable = std::path::absolute(&executable).unwrap_or(executable);
     let mut command = Command::new(&executable);
     command
         .args(["--request", REQUEST_FILE, "--response", RESPONSE_FILE])

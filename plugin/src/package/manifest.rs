@@ -97,6 +97,88 @@ pub struct PayloadSchemas {
     pub output: Option<SchemaSource>,
 }
 
+/// How the plugin takes the number of cores to use (manifest versions 1 and 2): the
+/// server delivers a node's `runtime.threads` (`n` ≥ 1: 1 = single-threaded)
+/// this way, and nothing when it's unset or 0 (the plugin decides).
+/// Runtimes differ (`--threads`, `GOMAXPROCS`, the JVM's
+/// `-XX:ActiveProcessorCount`), so the plugin says which it reads.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Threads {
+    pub via: ThreadsVia,
+    /// The flag without `--` (`arg`), or the variable (`env`).
+    pub name: String,
+    /// The value, with `{n}` for the number (default `{n}`), e.g.
+    /// `-XX:ActiveProcessorCount={n}`.
+    #[serde(default = "default_threads_value")]
+    pub value: String,
+}
+
+fn default_threads_value() -> String {
+    "{n}".into()
+}
+
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadsVia {
+    Arg,
+    Env,
+}
+
+impl Threads {
+    /// The value for `n` cores.
+    pub fn value_for(&self, n: u32) -> String {
+        self.value.replace("{n}", &n.to_string())
+    }
+
+    fn validate(&self) -> Vec<String> {
+        let mut errors = vec![];
+        let ok = match self.via {
+            ThreadsVia::Arg => {
+                !self.name.is_empty()
+                    && self
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && !self.name.starts_with('-')
+            }
+            ThreadsVia::Env => {
+                self.name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && self
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            }
+        };
+        if !ok {
+            errors.push(format!(
+                "threads.name {:?} isn't a valid {}",
+                self.name,
+                match self.via {
+                    ThreadsVia::Arg => "flag name (lowercase letters, digits and dashes)",
+                    ThreadsVia::Env => "environment variable name",
+                }
+            ));
+        }
+        if self.via == ThreadsVia::Arg && RESERVED_ARGS.contains(&self.name.as_str()) {
+            errors.push(format!("threads.name: --{} is set by the hub", self.name));
+        }
+        if self.via == ThreadsVia::Env && self.name.to_ascii_uppercase().starts_with("FLWRS_") {
+            errors.push(format!(
+                "threads.name: FLWRS_* variables are the server's ({})",
+                self.name
+            ));
+        }
+        if !self.value.contains("{n}") {
+            errors.push("threads.value must contain {n}".into());
+        }
+        errors
+    }
+}
+
 /// A program in the package that fills some of a node's settings from its
 /// other settings (manifest version 2), e.g. an out schema derived from an
 /// OpenAPI document. The server runs it when a local node's settings change;
@@ -157,6 +239,9 @@ pub struct Manifest {
     pub ui: Option<Ui>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configurator: Option<Configurator>,
+    /// How the plugin takes the number of cores to use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<Threads>,
     /// Every other field. Only `x-*` ones are allowed (a warning); the rest
     /// are errors in [`Manifest::validate`].
     #[serde(flatten)]
@@ -288,6 +373,9 @@ impl Manifest {
             if configurator.executable == self.executable {
                 errors.push("configurator.executable must not be the plugin's executable".into());
             }
+        }
+        if let Some(threads) = &self.threads {
+            errors.extend(threads.validate());
         }
         if let Some(defaults) = &self.runtime_defaults
             && !defaults.is_object()
@@ -546,6 +634,7 @@ mod tests {
             runtime_defaults: None,
             ui: None,
             configurator: None,
+            threads: None,
             extensions: Default::default(),
         }
     }

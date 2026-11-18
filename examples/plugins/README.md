@@ -19,6 +19,8 @@ At run time the server's host needs the language's runtime: `python3` with `prot
 
 **Payload** (`schema/in.json`, the same in all four): `url`, `method` (default `POST`) and `body`, all strings. Use an edge mapping to fill them in from a source's events.
 
+**Manifests** are version 2 (the plugin specification, [`docs/plugin-spec.md`](../../docs/plugin-spec.md)), with `ui` categories, and say how each runtime takes a **core count** (`threads`), so a node's `runtime.threads` (or the server's `[director] plugin_threads`) reaches it: Go as `GOMAXPROCS`, Java as `JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=<n>`, Node.js as `UV_THREADPOOL_SIZE` (libuv's pool for file, DNS and crypto work; JavaScript itself runs on one thread). The Python one declares none: with the GIL, its asyncio code runs on one thread anyway.
+
 **What each example does** (the spec is [`docs/protocol.md`](../../docs/protocol.md), protocol version 2):
 
 - reads `--id`, `--host`, `--port` (and `--token`, else `FLWRS_TOKEN`), connects to the hub and sends `Initialize` (type SINK, protocol 2..2, capability `ACKS` with a window of 1) with the version from `manifest.json` and the schema from `schema/in.json`;

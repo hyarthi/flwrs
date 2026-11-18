@@ -1,0 +1,32 @@
+{
+  "manifest_version": 2,
+  "id": "http-source-edge",
+  "name": "HTTP source (edge)",
+  "version": "0.0.1",
+  "type": "SOURCE",
+  "description": "An HTTP server that turns requests into events, routed and validated by an OpenAPI 3.1 document. Edge build: without Swagger UI.",
+  "executable": "bin/flwrs-http-source",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "threads": { "via": "arg", "name": "threads" },
+  "payload_schemas": {
+    "out": {
+      "from_launch_args": "/out_schema"
+    }
+  },
+  "configurator": {
+    "executable": "bin/flwrs-http-source-config",
+    "fields": [
+      "out_schema"
+    ]
+  },
+  "ui": {
+    "icon": "ui/http-source.svg",
+    "categories": [
+      "Inputs",
+      "HTTP",
+      "OpenAPI"
+    ],
+    "docs": "README.md"
+  }
+}

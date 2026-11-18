@@ -77,12 +77,29 @@ pub struct Bootstrap {
     /// which is preferred: command-line arguments are visible in `ps`.
     #[arg(long)]
     pub token: Option<String>,
+
+    /// Cores to use (1: single-threaded; 0 or absent: one thread per core).
+    /// The server passes it when the manifest declares
+    /// `"threads": {"via": "arg", "name": "threads"}` and a node (or the
+    /// server) sets a number; see `rt::runtime`.
+    #[arg(long)]
+    pub threads: Option<usize>,
 }
 
 impl Bootstrap {
     /// The long names of these arguments (without `--`): what a plugin's
     /// launch-args schema must not contain.
-    pub const NAMES: [&'static str; 5] = BOOTSTRAP_ARGS;
+    /// The flags this struct takes: the hub's bootstrap arguments, and
+    /// `threads` (what this SDK's plugins declare in their manifest's
+    /// `threads`).
+    pub const NAMES: [&'static str; 6] = [
+        BOOTSTRAP_ARGS[0],
+        BOOTSTRAP_ARGS[1],
+        BOOTSTRAP_ARGS[2],
+        BOOTSTRAP_ARGS[3],
+        BOOTSTRAP_ARGS[4],
+        "threads",
+    ];
 
     /// `--log-level` as the protocol's level; unknown values are `Info`.
     pub fn log_level(&self) -> LogLevel {

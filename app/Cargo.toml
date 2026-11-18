@@ -21,7 +21,7 @@ tokio-util.workspace = true
 rust-embed.workspace = true
 axum.workspace = true
 utoipa.workspace = true
-utoipa-swagger-ui.workspace = true
+utoipa-swagger-ui = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
 sqlx.workspace = true
@@ -55,7 +55,17 @@ windows-sys.workspace = true # Ctrl-Break and Job Objects for plugin processes
 junction.workspace = true # node folders: links to the package's folders
 
 [features]
-default = ["mapping-lua", "otel", "telemetry-file", "remote"]
+# Build flavours: `full` (the default: everything), `edge` (mid-range edge
+# devices: everything but data-centre extras and heavy parts; today: no
+# Swagger UI), barebones = `--no-default-features` (low-end devices: no
+# optional feature).
+default = ["full"]
+full = ["edge", "swagger-ui"]
+edge = ["mapping-lua", "otel", "telemetry-file", "remote"]
+# Swagger UI for the management API (its assets are embedded). The OpenAPI
+# document is served either way; the UI is opt-in at run time too
+# (`[http] swagger_ui = true`).
+swagger-ui = ["dep:utoipa-swagger-ui"]
 # Lua edge mappings (lua rules, script, filter). On by default; build with
 # --no-default-features for targets without a working C toolchain or with very
 # little flash. Without it, scenes with Lua mappings can be imported but not run.

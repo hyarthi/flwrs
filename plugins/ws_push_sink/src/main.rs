@@ -15,9 +15,19 @@ fn fail(problems: Vec<String>) -> ExitCode {
     ExitCode::from(2)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args = Args::parse();
+    // `--threads` (optional, from the server) sizes the runtime.
+    match flwrs_plugin::rt::runtime(args.bootstrap.threads) {
+        Ok(runtime) => runtime.block_on(run(args)),
+        Err(e) => {
+            eprintln!("Failed to start the runtime: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(args: Args) -> ExitCode {
     let settings = match args.settings() {
         Ok(s) => s,
         Err(problems) => return fail(problems),

@@ -15,9 +15,19 @@ fn fail(problems: Vec<String>) -> ExitCode {
     ExitCode::from(2)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args = Args::parse();
+    // `--threads` (optional, from the server) sizes the runtime.
+    match flwrs_plugin::rt::runtime(args.bootstrap.threads) {
+        Ok(runtime) => runtime.block_on(run(args)),
+        Err(e) => {
+            eprintln!("Failed to start the runtime: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(args: Args) -> ExitCode {
     let settings = match args.settings() {
         Ok(s) => s,
         Err(problems) => return fail(problems),
@@ -221,6 +231,23 @@ mod package_tests {
             manifest["configurator"]["executable"],
             format!("bin/{}-config", env!("CARGO_PKG_NAME"))
         );
+    }
+
+    #[test]
+    fn flavour_manifests_match_the_main_one() {
+        let main = json("manifest.json");
+        for flavour in ["edge", "server"] {
+            let mut m = json(&format!("manifest.{flavour}.json"));
+            assert_eq!(m["id"], format!("http-source-{flavour}"));
+            // Everything else but the names is the main manifest's.
+            for key in ["id", "name", "description"] {
+                m[key] = main[key].clone();
+            }
+            assert_eq!(
+                m, main,
+                "manifest.{flavour}.json drifted from manifest.json"
+            );
+        }
     }
 
     #[test]

@@ -188,6 +188,7 @@
       "title": "Listen on",
       "type": "string",
       "x-flwrs-group": "HTTP server",
+      "x-flwrs-listen": true,
       "x-flwrs-order": 100
     },
     "max_message_bytes": {
@@ -252,6 +253,15 @@
       "type": "integer",
       "x-flwrs-advanced": true,
       "x-flwrs-order": 6
+    },
+    "read_buffer_bytes": {
+      "default": 16384,
+      "description": "Per connection, allocated up front (tungstenite's default is 128 KiB): smaller saves memory with many clients, and larger messages just take more reads.",
+      "minimum": 256,
+      "title": "Read buffer (bytes)",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 10
     },
     "ready_path": {
       "default": "/readyz",

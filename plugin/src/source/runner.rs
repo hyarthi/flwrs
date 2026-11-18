@@ -81,6 +81,7 @@ impl<T: Source> SourceRunner<T> {
             }
         };
 
+        self.plugin.drain().await;
         let shutdown = self.plugin.shutdown();
         finish(&self.client, &self.plugin_id, end, shutdown).await
     }

@@ -3,6 +3,7 @@ pub mod cli;
 #[cfg(feature = "package")]
 pub mod package;
 pub mod plugin;
+pub mod rt;
 pub mod schema;
 pub mod sink;
 pub mod source;

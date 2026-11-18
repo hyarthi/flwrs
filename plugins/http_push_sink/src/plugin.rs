@@ -38,13 +38,15 @@ impl Sink for PushSink {
         self.broadcaster.close();
     }
 
-    fn shutdown(&mut self) -> Result<(), ShutdownError> {
+    async fn drain(&mut self) {
         self.broadcaster.close();
         if let Some(server) = self.server.take() {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(server.shutdown(SHUTDOWN_GRACE))
-            });
+            server.shutdown(SHUTDOWN_GRACE).await;
         }
+    }
+
+    fn shutdown(&mut self) -> Result<(), ShutdownError> {
+        self.broadcaster.close();
         Ok(())
     }
 

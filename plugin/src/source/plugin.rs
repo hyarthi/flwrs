@@ -17,6 +17,14 @@ pub trait Source {
     /// Called after `run` has been stopped.
     fn shutdown(&mut self) -> Result<(), ShutdownError>;
 
+    /// Called once when the run ends (after the hub's `Shutdown`, or a
+    /// rejection), before `shutdown` and the `Exit`: finish asynchronous work
+    /// here, e.g. stop a server and let its requests end (what they send
+    /// still goes out). The default does nothing. Unlike blocking in
+    /// `shutdown`, this works on a single-threaded runtime too.
+    #[allow(async_fn_in_trait)]
+    async fn drain(&mut self) {}
+
     fn version(&self) -> String;
 
     /// Produces events. The future is dropped when the hub asks for shutdown.

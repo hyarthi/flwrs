@@ -440,7 +440,7 @@ pub fn schema_properties() -> serde_json::Value {
     serde_json::json!({
         "listen": group(100, false, serde_json::json!({
             "title": "Listen on", "description": "Address and port. Anything but loopback needs auth (or auth: none set explicitly).",
-            "type": "string", "default": "127.0.0.1:8080" })),
+            "type": "string", "default": "127.0.0.1:8080", "x-flwrs-listen": true })),
         "auth": group(101, false, serde_json::json!({
             "title": "Authentication", "description": "none, bearer (Authorization: Bearer <token>), api_key (a header or query parameter) or mtls (client certificates).",
             "enum": ["none", "bearer", "api_key", "mtls"] })),

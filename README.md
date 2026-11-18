@@ -34,7 +34,8 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 | `app/` | `flwrs-app` | The flwrs server. |
 | `plugin/` | `flwrs-plugin` | Plugin protocol definition (`schema/*.proto`) and the reference Rust SDK: wire framing, `Source`/`Transform`/`Sink` traits and runners. |
 | `types/` | `flwrs-types` | Types shared by the server and plugins: the typed value tree, dot paths and the Lua sandbox (unpublished). |
-| `plugins/` | — | Base plugin library. Currently `http_sink`, `ticker`, `script_transform`, `accumulator`, `mqtt_sink`, `mqtt_source`, `ws_sink` and `http_source` (Rust). Plugins in other languages can live here too. |
+| `plugins/` | — | Base plugin library. Currently `http_sink`, `ticker`, `script_transform`, `accumulator`, `mqtt_sink`, `mqtt_source`, `ws_sink`, `http_source`, `ws_source`, `http_push_sink` and `ws_push_sink` (Rust), and `kit` (code they share: the HTTP server core, the push sinks' broadcast core). Plugins in other languages can live here too. |
+| `e2e/` | `flwrs-e2e` | End-to-end tests: the real server and plugin packages built from the workspace, installed and wired through the REST API, with real clients (HTTP → MQTT → SSE). |
 | `examples/plugins/` | — | Minimal, unsupported demo plugins (HTTP sinks in Python, Go, TypeScript and Java). |
 | `trellis/` | `flwrs-trellis` | Developer toolkit for plugins (any language): `package`, `audit` (protocol conformance), `test`, `bench`. `cargo trellis <command>` in this repo. |
 | `docs/` | — | Specifications for plugin authors: the [plugin protocol](docs/protocol.md) and the [plugin specification](docs/plugin-spec.md) (packages, manifests, launching). |
@@ -57,9 +58,7 @@ cargo test --workspace             # all tests
 
 Binaries end up in `target/debug/` (or `target/release/`).
 
-**Optional features** of the server, all on by default: `mapping-lua` (Lua edge mappings), `otel` (exporting stats to OpenTelemetry) and `telemetry-file` (writing stats to local files). `--no-default-features` builds without any of them, for small edge devices; add back what you need, e.g. `--no-default-features --features telemetry-file`.
-
-**Cargo features** of the server, all on by default: `mapping-lua` (Lua edge mappings), `otel` (OpenTelemetry export), `telemetry-file` (telemetry files) and `remote` (remote plugins: tokens, `remote_id`, the TLS listener and client certificates). For a small edge device, or a target without a working C toolchain, leave out what you don't need, down to a bare server that only runs local plugins: `cargo build -p flwrs-app --no-default-features`. A server built without a feature can still import scenes that use it (Lua mappings, remote nodes), but lists them as problems and won't run them.
+**Build flavours** of the server, as cargo features: `full` (the default: everything), `edge` (for mid-range edge devices: `mapping-lua` for Lua edge mappings, `otel` for OpenTelemetry export, `telemetry-file` for telemetry files and `remote` for remote plugins with tokens, `remote_id`, the TLS listener and client certificates; no Swagger UI), and barebones, `--no-default-features` (low-end devices: none of them, a server that only runs local plugins), e.g. `cargo build -p flwrs-app --no-default-features --features edge`. Features can be added one by one too (`--no-default-features --features telemetry-file`). A server built without a feature can still import scenes that use it (Lua mappings, remote nodes), but lists them as problems and won't run them.
 
 ## Running the server
 
@@ -69,6 +68,11 @@ Create a `config.toml` (pass a different path with `--config`). Every section is
 [http]
 host = "0.0.0.0"
 port = 8080
+# enabled = true      # false: no management API (scenes still run; e.g. an edge box once configured)
+# swagger_ui = false  # opt-in: Swagger UI at /swagger-ui (builds with the swagger-ui feature); /api-docs/openapi.json is always served
+
+[runtime]
+# threads = 0        # cores the server uses: 1 = single-threaded, N = main + N - 1 workers; 0 / unset = one worker per core
 
 [logging]
 format = "PLAIN"
@@ -103,6 +107,7 @@ key = "hub.key"
 # spill_default = false      # spill for nodes that don't say
 # nodes_dir = "./nodes"      # local nodes' folders (their working directories)
 # files_dir = "./files"      # files uploaded to nodes
+# plugin_threads = 0         # cores each local plugin may use, for nodes that don't set runtime.threads (0 = the plugins decide)
 
 [scenes]
 # max_upload_bytes = 1073741824   # one file uploaded to a node
@@ -122,7 +127,7 @@ cargo run -p flwrs-app -- --config config.dev.toml   # serves on 127.0.0.1:8080
 It keeps everything the server writes at run time (database, installed plugins, node folders, uploaded files, spool files, telemetry files) under `./.data/`, which is gitignored, so runtime data never mixes with the source tree. To start over, stop the server and run `chmod -R u+w .data && rm -rf .data` (node folders' `config/` are read-only, so a plain `rm -rf` stops there).
 
 - REST API: `http://localhost:8080/api/scenes`
-- Swagger UI: `http://localhost:8080/swagger-ui`
+- Swagger UI: `http://localhost:8080/swagger-ui` (opt-in: `config.dev.toml` sets `[http] swagger_ui = true`); the OpenAPI document: `http://localhost:8080/api-docs/openapi.json`
 
 ## Plugin protocol
 
@@ -183,7 +188,7 @@ Invalid requests return **422** with every problem listed in `details`.
 - **`auth`** (remote nodes): `token` (a pre-shared secret of at least 16 characters, in `token`) or `mtls` (a client certificate on the TLS listener: one that chains to `[hub.tls] client_ca` and names the `remote_id` in its SAN or CN, or the one pinned in `tls.client_cert_sha256`). Default: the scene's `remote_auth`, else `token`. **`require_tls`** (token nodes): only accept the plugin over the TLS listener; default: the scene's, else true when the hub has a TLS listener. A remote plugin built on the Rust SDK takes its TLS settings from `FLWRS_TLS_CA`, `FLWRS_TLS_SERVER_NAME`, `FLWRS_TLS_CERT` and `FLWRS_TLS_KEY`.
 - **`token`:** never returned by the API (`has_token` instead). Omitting it on update keeps the stored one.
 - **`launch_args`:** the node's settings, checked against the plugin's launch-args schema and delivery rules ([plugin spec](docs/plugin-spec.md#3-node-settings-the-launch-args-schema)); for code settings, the code's syntax too. **Secrets** (the schema's `writeOnly` properties) are never returned: responses list them in `launch_args_secrets` (`{"/api_key": true}`: set or not), an update that leaves one out keeps it, and `null` clears it. Settings that name an uploaded file need it uploaded (`…/uploads/{name}`) before the scene can be enabled. Local nodes; a remote node only carries them for its payload schemas, when its plugin takes those from its settings.
-- **`runtime`:** timeouts, restarts, the event queue and redelivery (`delivery`: `max_attempts`, 5, and `retry_delay_ms`, 1 000). Unknown keys are rejected. A node on a cycle can't use `"when_full": "block"`, because blocking can deadlock there.
+- **`runtime`:** timeouts, restarts, the event queue, redelivery (`delivery`: `max_attempts`, 5, and `retry_delay_ms`, 1 000), and `threads`: the cores a local plugin may use (1 = single-threaded; 0 = the plugin decides; default: the plugin's `runtime_defaults.threads`, else `[director] plugin_threads`), passed as its manifest's `threads` says ([plugin spec](docs/plugin-spec.md#55-the-core-count)). Unknown keys are rejected. A node on a cycle can't use `"when_full": "block"`, because blocking can deadlock there.
 
 **Event queues.** Every node that receives events has an inbound queue. By default it holds up to 1 024 events or 64 MiB in memory; when it's full, `when_full` decides: `block` (the default: the producer waits, up to `block_timeout_ms`), `drop_newest` (the incoming event is dropped) or `drop_oldest` (as many of the oldest queued events as needed are evicted to fit it). `max_evictions` caps how many one incoming event may evict: if fitting it would take more, nothing is evicted and the incoming event is dropped instead, so one unexpectedly large event can't empty the queue (no limit by default). All queues share a hub-wide budget (`[hub] max_inflight_bytes`, 512 MiB); when it's used up, a `drop_oldest` queue evicts its own oldest events to make room (within `max_evictions`), never another queue's.
 
@@ -385,10 +390,22 @@ Plugins are packaged and run as described in the [plugin specification](docs/plu
 
 flwrs is in early development. The main things still missing, roughly in order:
 
-1. **A set of base plugins.** Common sources, transforms and sinks (timers, MQTT, HTTP in and out, files, databases, scripting, ML inference, …), so typical workflows need no custom plugin. Today there's the HTTP sink, the ticker ([plugins/ticker](plugins/ticker): interval or cron) the script transform ([plugins/script_transform](plugins/script_transform): Lua per event, keyed state kept exactly once) the accumulator ([plugins/accumulator](plugins/accumulator): per-key aggregates over tumbling, hopping or session windows) the MQTT sink ([plugins/mqtt_sink](plugins/mqtt_sink): MQTT 5 or 3.1.1, acknowledged once the broker has the message) the MQTT source ([plugins/mqtt_source](plugins/mqtt_source): messages acknowledged to the broker once the hub has their events; shared subscriptions) the WebSocket sink ([plugins/ws_sink](plugins/ws_sink): acknowledged when written, or when the server replies) and the HTTP source ([plugins/http_source](plugins/http_source): an OpenAPI 3.1 API whose requests become typed events).
-2. **Alternative storage back-ends**, such as PostgreSQL. Today scenes, nodes, edges and the plugin registry live in SQLite only (the `Database` enum in `flwrs-core` has a single variant); a shared database is also a step towards running several servers.
-3. **A web UI** for building and running scenes visually (nodes, edges, mappings, status), instead of through the REST API.
+1. **A set of base plugins.** Common sources, transforms and sinks (timers, MQTT, HTTP in and out, files, databases, scripting, ML inference, …), so typical workflows need no custom plugin. Today there are:
+   - the HTTP sink ([plugins/http_sink](plugins/http_sink): a request per event);
+   - the ticker ([plugins/ticker](plugins/ticker): interval or cron);
+   - the script transform ([plugins/script_transform](plugins/script_transform): Lua per event, keyed state kept exactly once);
+   - the accumulator ([plugins/accumulator](plugins/accumulator): per-key aggregates over tumbling, hopping or session windows);
+   - the MQTT sink ([plugins/mqtt_sink](plugins/mqtt_sink): MQTT 5 or 3.1.1, acknowledged once the broker has the message);
+   - the MQTT source ([plugins/mqtt_source](plugins/mqtt_source): messages acknowledged to the broker once the hub has their events; shared subscriptions);
+   - the WebSocket sink ([plugins/ws_sink](plugins/ws_sink): acknowledged when written, or when the server replies);
+   - the HTTP source ([plugins/http_source](plugins/http_source): an OpenAPI 3.1 API whose requests become typed events);
+   - the WebSocket source ([plugins/ws_source](plugins/ws_source): an AsyncAPI 3.x document's channels, messages typed by their payload schemas);
+   - the HTTP push sink ([plugins/http_push_sink](plugins/http_push_sink): events broadcast to subscribers over Server-Sent Events and long polling, with replay);
+   - the WebSocket push sink ([plugins/ws_push_sink](plugins/ws_push_sink): events broadcast to connected WebSocket clients, with replay).
+2. **A web UI** for building and running scenes visually (nodes, edges, mappings, status), instead of through the REST API.
+3. **Alternative storage back-ends**, such as PostgreSQL. Today scenes, nodes, edges and the plugin registry live in SQLite only (the `Database` enum in `flwrs-core` has a single variant); a shared database is also a step towards running several servers.
 4. **Running as a cluster.** The server currently runs in **single-node mode only**: one server runs every scene it has, and there's no swarming, no handover of scenes between servers, and no load balancing. Remote plugins can run on other machines, but they all connect to one hub. Running properly in a data-centre environment (in-cluster) needs scenes spread across servers, failover, and load balancing.
+5. **Profiling and optimisation.** Throughput, latency and memory are measured per plugin with `trellis bench` (each plugin's README has a *Footprint* section), so far on an Apple M2 (but needs a proper dedicated benchmark test - just playing around so far, no serious measurements yet); edge devices (an Intel NUC, a Raspberry Pi) are next. Done so far: credit handed to a source's waiting senders in order, longest-waiting first (up to 1.7× for sources whose clients outrun their credit); per-connection buffer settings for the WebSocket plugins (~130 → ~11 KiB per push-sink client); a small HTTP/2 send buffer for the server plugins (1 000 HTTP/2 SSE subscribers: ~3.7× the throughput at a fifth of the memory); trellis's own timer lateness kept out of its latency numbers. Open: batching writes to many WebSocket clients, durable queues' fixed 5 ms batching window, keyed parallelism in the script transforms, TLS handshake cost when connections churn, and the HTTP and WebSocket sources' binary sizes (18–22 MB). See `ideas/` for the designs.
 
 Smaller known gaps (no Windows CI, durable delivery only within one server) are listed in [AGENTS.md](AGENTS.md), *Current state / known gaps*.
 

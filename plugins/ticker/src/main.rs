@@ -10,9 +10,19 @@ use clap::Parser;
 use flwrs_plugin::source::runner::{SourceRunner, SourceRunnerConfig};
 use std::process::ExitCode;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args = Args::parse();
+    // `--threads` (optional, from the server) sizes the runtime.
+    match flwrs_plugin::rt::runtime(args.bootstrap.threads) {
+        Ok(runtime) => runtime.block_on(run(args)),
+        Err(e) => {
+            eprintln!("Failed to start the runtime: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(args: Args) -> ExitCode {
     let settings = match args.settings(jiff::Timestamp::now()) {
         Ok(settings) => settings,
         Err(problems) => {

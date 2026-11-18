@@ -13,9 +13,15 @@ pub async fn build_registry() -> ServiceRegistry {
         registry.register_service(telemetry);
     }
 
-    // HTTP
-    log::debug!("Registering HTTP service");
-    registry.register_service(http::server());
+    // HTTP: the management API (and Swagger UI), unless switched off.
+    if http::server().config().enabled() {
+        log::debug!("Registering HTTP service");
+        registry.register_service(http::server());
+    } else {
+        log::info!(
+            "HTTP API off ([http] enabled = false): scenes run, but can't be managed until it's switched on again"
+        );
+    }
 
     log::debug!("Registry build completed");
     registry

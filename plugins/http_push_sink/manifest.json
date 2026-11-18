@@ -8,6 +8,7 @@
   "executable": "bin/flwrs-http-push-sink",
   "launch_args_schema": "schema/launch_args.json",
   "launch_args_style": "flags",
+  "threads": { "via": "arg", "name": "threads" },
   "payload_schemas": {
     "in": "schema/in.json"
   },

@@ -221,6 +221,7 @@
       "title": "Listen on",
       "type": "string",
       "x-flwrs-group": "HTTP server",
+      "x-flwrs-listen": true,
       "x-flwrs-order": 100
     },
     "max_channels": {

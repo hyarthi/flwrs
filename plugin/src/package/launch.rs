@@ -12,6 +12,9 @@
 //!   "alias"?, "file_name"?, "source"?: "upload"}`.
 //! - `x-flwrs-code` on a string property: `{"language", "params", "definitions"?, "signature"?}`.
 //! - UI hints: `x-flwrs-group`, `x-flwrs-order`, `x-flwrs-advanced`, `x-flwrs-widget`.
+//! - `x-flwrs-listen: true` on a top-level string property: an address the
+//!   plugin listens on (`host:port`), so a server can warn when two nodes
+//!   would bind the same one.
 //!
 //! Version 1 manifests ignore them; their `launch_args` all go on the command
 //! line, as before.
@@ -131,10 +134,20 @@ pub struct LaunchSpec {
     style: LaunchArgsStyle,
     fields: BTreeMap<String, LaunchField>,
     code: Vec<CodeField>,
+    listen: Vec<ListenField>,
     input_pointer: Option<String>,
     output_pointer: Option<String>,
     /// The fields the plugin's configurator sets.
     configured: Vec<String>,
+}
+
+/// An address the plugin listens on (`x-flwrs-listen`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenField {
+    /// The top-level property.
+    pub name: String,
+    /// The schema's `default`: what the plugin binds when the node leaves it out.
+    pub default: Option<String>,
 }
 
 /// A file the server writes to (or links into) the node's `config/` folder.
@@ -182,6 +195,7 @@ impl LaunchSpec {
             style: manifest.launch_args_style,
             fields: BTreeMap::new(),
             code: vec![],
+            listen: Vec::new(),
             input_pointer: pointer(&manifest.payload_schemas.input),
             output_pointer: pointer(&manifest.payload_schemas.output),
             configured: manifest
@@ -194,6 +208,19 @@ impl LaunchSpec {
             return (spec, report);
         };
         walk(schema, "", Place::Root, &mut spec.code, &mut report);
+        if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+            for (name, prop) in props {
+                if prop.get("x-flwrs-listen") == Some(&Value::Bool(true)) {
+                    spec.listen.push(ListenField {
+                        name: name.clone(),
+                        default: prop
+                            .get("default")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    });
+                }
+            }
+        }
         if spec.style == LaunchArgsStyle::Positional {
             if !spec.configured.is_empty() {
                 report
@@ -219,6 +246,23 @@ impl LaunchSpec {
             }
         }
         check_unique(&spec.fields, &mut report.errors);
+        // The thread count's flag or variable must not be a launch arg's.
+        if let Some(threads) = &manifest.threads {
+            let clash = spec.fields.values().any(|f| match threads.via {
+                crate::package::ThreadsVia::Arg => f.via != Via::Env && f.target == threads.name,
+                crate::package::ThreadsVia::Env => f.via == Via::Env && f.target == threads.name,
+            });
+            if clash {
+                report.errors.push(format!(
+                    "threads.name {:?} is also a launch arg's {}",
+                    threads.name,
+                    match threads.via {
+                        crate::package::ThreadsVia::Arg => "flag",
+                        crate::package::ThreadsVia::Env => "environment variable",
+                    }
+                ));
+            }
+        }
         for name in &spec.configured {
             match spec.fields.get(name) {
                 None => report.errors.push(format!(
@@ -252,6 +296,7 @@ impl LaunchSpec {
             style: LaunchArgsStyle::Flags,
             fields: BTreeMap::new(),
             code: vec![],
+            listen: Vec::new(),
             input_pointer: None,
             output_pointer: None,
             configured: vec![],
@@ -289,6 +334,27 @@ impl LaunchSpec {
 
     pub fn code_fields(&self) -> &[CodeField] {
         &self.code
+    }
+
+    /// The properties holding addresses the plugin listens on.
+    pub fn listen_fields(&self) -> &[ListenField] {
+        &self.listen
+    }
+
+    /// The addresses a node's `launch_args` make the plugin listen on: each
+    /// listen field's value, or its default when the node leaves it out.
+    pub fn listen_addresses(&self, args: &Value) -> Vec<(String, String)> {
+        self.listen
+            .iter()
+            .filter_map(|f| {
+                let value = args
+                    .get(&f.name)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| f.default.clone())?;
+                Some((f.name.clone(), value))
+            })
+            .collect()
     }
 
     /// JSON pointers of the per-node payload schemas (`in`, `out`).
@@ -507,6 +573,18 @@ fn walk(
                         at(pointer)
                     )),
                     "x-flwrs-launch" => {} // read by `field`
+                    "x-flwrs-listen" if place != Place::Property(1) => report.errors.push(format!(
+                        "launch_args_schema at {}: x-flwrs-listen is only allowed on top-level properties",
+                        at(pointer)
+                    )),
+                    "x-flwrs-listen" => {
+                        if value != &Value::Bool(true) || map.get("type").and_then(Value::as_str) != Some("string") {
+                            report.errors.push(format!(
+                                "launch_args_schema at {}: x-flwrs-listen must be true, on a string property",
+                                at(pointer)
+                            ));
+                        }
+                    }
                     "x-flwrs-code" if !property => report.errors.push(format!(
                         "launch_args_schema at {}: x-flwrs-code is only allowed on properties",
                         at(pointer)
@@ -1004,6 +1082,7 @@ mod tests {
             runtime_defaults: None,
             ui: None,
             configurator: None,
+            threads: None,
             extensions: Default::default(),
         }
     }
@@ -1034,6 +1113,104 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
         spec
+    }
+
+    #[test]
+    fn the_thread_count_is_declared_and_checked() {
+        use crate::package::{Threads, ThreadsVia};
+        let schema = json!({"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+            "threads": {"type": "integer"},
+            "region": {"type": "string", "x-flwrs-launch": {"via": "env", "alias": "GOMAXPROCS"}}
+        }});
+        let with = |via, name: &str, value: &str| {
+            let mut m = manifest(2);
+            m.threads = Some(Threads {
+                via,
+                name: name.into(),
+                value: value.into(),
+            });
+            m
+        };
+        let errors = |m: &Manifest| {
+            let mut e = m.validate("any");
+            e.extend(LaunchSpec::new(m, Some(&schema)).1.errors);
+            e
+        };
+        // Fine: a flag of its own, an env variable, a template.
+        let jvm = with(
+            ThreadsVia::Env,
+            "JAVA_TOOL_OPTIONS",
+            "-XX:ActiveProcessorCount={n}",
+        );
+        assert!(errors(&jvm).is_empty(), "{:?}", errors(&jvm));
+        assert_eq!(
+            jvm.threads.as_ref().unwrap().value_for(4),
+            "-XX:ActiveProcessorCount=4"
+        );
+        assert!(errors(&with(ThreadsVia::Arg, "cores", "{n}")).is_empty());
+        // Refused: a launch arg's flag or variable, a hub flag, the server's variables, no {n}.
+        for (m, part) in [
+            (
+                with(ThreadsVia::Arg, "threads", "{n}"),
+                "also a launch arg's flag",
+            ),
+            (
+                with(ThreadsVia::Env, "GOMAXPROCS", "{n}"),
+                "also a launch arg's environment variable",
+            ),
+            (with(ThreadsVia::Arg, "port", "{n}"), "set by the hub"),
+            (
+                with(ThreadsVia::Env, "FLWRS_THREADS", "{n}"),
+                "the server's",
+            ),
+            (with(ThreadsVia::Env, "N", "4"), "{n}"),
+            (with(ThreadsVia::Arg, "--x", "{n}"), "flag name"),
+        ] {
+            let e = errors(&m).join(" | ");
+            assert!(e.contains(part), "{part}: {e}");
+        }
+        // Version 1 manifests may declare it too (their other v2-only
+        // features aside, nothing about `threads` is refused).
+        let mut v1 = with(ThreadsVia::Arg, "cores", "{n}");
+        v1.manifest_version = 1;
+        let errors = v1.validate("any");
+        assert!(!errors.iter().any(|e| e.contains("threads")), "{errors:?}");
+    }
+
+    #[test]
+    fn listen_addresses_take_the_default() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+                "listen": {"type": "string", "default": "127.0.0.1:8080", "x-flwrs-listen": true},
+                "admin": {"type": "string", "x-flwrs-listen": true}
+            }
+        });
+        let (spec, report) = LaunchSpec::new(&manifest(2), Some(&schema));
+        assert!(
+            report.errors.is_empty() && report.warnings.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(spec.listen_fields().len(), 2);
+        let mut found = spec.listen_addresses(&json!({"admin": "0.0.0.0:9000"}));
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("admin".to_string(), "0.0.0.0:9000".to_string()),
+                ("listen".into(), "127.0.0.1:8080".into())
+            ]
+        );
+        // Only `true`, on a top-level string property.
+        let bad = json!({"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+            "listen_port": {"type": "integer", "x-flwrs-listen": true},
+            "nested": {"type": "object", "properties": {"at": {"type": "string", "x-flwrs-listen": true}}}
+        }});
+        let (_, report) = LaunchSpec::new(&manifest(2), Some(&bad));
+        assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
     }
 
     #[test]

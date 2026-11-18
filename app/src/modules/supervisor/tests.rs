@@ -128,7 +128,7 @@ impl Env {
             plugin_version: "1.0.0".into(),
             in_schema,
             out_schema,
-            launch: Launch::Local(LocalLaunch {
+            launch: Launch::Local(Box::new(LocalLaunch {
                 workdir: super::workdir::Workdir {
                     dir: self.dir.path().join("nodes/scene/node"),
                     install_dir: {
@@ -142,9 +142,10 @@ impl Env {
                 program,
                 hub_addr: self.hub.local_addr(),
                 log_level: "info".into(),
+                threads: None,
                 args: vec![],
                 env: vec![],
-            }),
+            })),
             timings,
             queue: super::spec::QueueSpec::resolve(
                 &RuntimeConfig::default(),
@@ -696,6 +697,7 @@ async fn spec_from_an_installed_plugin() {
             nodes_dir: Path::new("nodes"),
             files_dir: Path::new("files"),
             uploads: &[],
+            plugin_threads: None,
         },
     )
     .unwrap();
@@ -737,6 +739,7 @@ async fn spec_from_an_installed_plugin() {
             nodes_dir: Path::new("nodes"),
             files_dir: Path::new("files"),
             uploads: &[],
+            plugin_threads: None,
         },
     )
     .unwrap();
@@ -761,6 +764,7 @@ async fn spec_from_an_installed_plugin() {
             nodes_dir: Path::new("nodes"),
             files_dir: Path::new("files"),
             uploads: &[],
+            plugin_threads: None,
         },
     )
     .unwrap_err();
@@ -819,6 +823,7 @@ fn local_nodes_get_their_uploads_and_files() {
                 nodes_dir: Path::new("/data/nodes"),
                 files_dir: Path::new("/data/files"),
                 uploads,
+                plugin_threads: None,
             },
         )
     };
@@ -859,5 +864,70 @@ fn local_nodes_get_their_uploads_and_files() {
     assert!(
         errors[0].contains("no uploaded file named \"resnet.onnx\""),
         "{errors:?}"
+    );
+}
+
+#[test]
+fn the_core_count_goes_as_the_manifest_says() {
+    use super::spec::{ThreadsDelivery, threads_delivery};
+    let manifest = |threads: serde_json::Value| -> flwrs_plugin::package::Manifest {
+        let mut m = serde_json::json!({"manifest_version": 2, "id": "p", "name": "P", "version": "1.0.0",
+            "type": "SINK", "executable": "run", "payload_schemas": {"in": "i.json"}});
+        if !threads.is_null() {
+            m["threads"] = threads;
+        }
+        serde_json::from_value(m).unwrap()
+    };
+    let arg = manifest(serde_json::json!({"via": "arg", "name": "threads"}));
+    let go = manifest(serde_json::json!({"via": "env", "name": "GOMAXPROCS"}));
+    let jvm = manifest(
+        serde_json::json!({"via": "env", "name": "JAVA_TOOL_OPTIONS", "value": "-XX:ActiveProcessorCount={n}"}),
+    );
+    assert_eq!(
+        threads_delivery(&arg, Some(2)),
+        Some(ThreadsDelivery::Arg("threads".into(), "2".into()))
+    );
+    assert_eq!(
+        threads_delivery(&go, Some(1)),
+        Some(ThreadsDelivery::Env("GOMAXPROCS".into(), "1".into()))
+    );
+    assert_eq!(
+        threads_delivery(&jvm, Some(4)),
+        Some(ThreadsDelivery::Env(
+            "JAVA_TOOL_OPTIONS".into(),
+            "-XX:ActiveProcessorCount=4".into()
+        ))
+    );
+    // 0 or nothing: the plugin decides; a plugin without the declaration gets nothing.
+    assert_eq!(threads_delivery(&arg, Some(0)), None);
+    assert_eq!(threads_delivery(&arg, None), None);
+    assert_eq!(
+        threads_delivery(&manifest(serde_json::Value::Null), Some(2)),
+        None
+    );
+
+    // In the argument list (after the bootstrap arguments) or the environment.
+    let launch = |threads| LocalLaunch {
+        program: "run".into(),
+        workdir: super::workdir::Workdir {
+            dir: "d".into(),
+            install_dir: "i".into(),
+            files: vec![],
+            uploads: vec![],
+        },
+        hub_addr: "127.0.0.1:1".parse().unwrap(),
+        log_level: "info".into(),
+        threads,
+        args: vec!["--own".into(), "x".into()],
+        env: vec![("OWN".into(), "y".into())],
+    };
+    let l = launch(threads_delivery(&arg, Some(3)));
+    assert_eq!(l.argv("n")[8..], ["--threads", "3", "--own", "x"]);
+    assert_eq!(l.environment(), [("OWN".to_string(), "y".to_string())]);
+    let l = launch(threads_delivery(&go, Some(3)));
+    assert_eq!(l.argv("n")[8..], ["--own", "x"]);
+    assert_eq!(
+        l.environment()[1],
+        ("GOMAXPROCS".to_string(), "3".to_string())
     );
 }

@@ -28,6 +28,10 @@ pub(crate) struct DirectorConfig {
     /// Files uploaded to nodes: `<files_dir>/<stem>_<sha256><.ext>`, stored
     /// once per name and content; removed once no node has them.
     pub files_dir: PathBuf,
+    /// Cores each plugin may use, for nodes that don't say (`runtime.threads`)
+    /// and plugins whose manifest has no `runtime_defaults.threads`; `None` or
+    /// 0: the plugins decide. Keeps cores free for other work on the machine.
+    pub plugin_threads: Option<u32>,
 }
 
 impl Default for DirectorConfig {
@@ -41,6 +45,7 @@ impl Default for DirectorConfig {
             spill_min_free_bytes: 1024 * 1024 * 1024,
             nodes_dir: PathBuf::from("./nodes"),
             files_dir: PathBuf::from("./files"),
+            plugin_threads: None,
         }
     }
 }

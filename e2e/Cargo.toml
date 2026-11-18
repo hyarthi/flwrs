@@ -1,0 +1,20 @@
+[package]
+name = "flwrs-e2e"
+description = "End-to-end tests: the real server, real plugin packages, real clients."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+flwrs-trellis.workspace = true
+rumqttd.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tempfile.workspace = true

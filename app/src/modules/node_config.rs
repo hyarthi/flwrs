@@ -253,6 +253,10 @@ pub(crate) struct RuntimeConfig {
     pub queue: Option<QueueConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryConfig>,
+    /// Cores the plugin may use (1 = single-threaded; 0 = the plugin
+    /// decides), delivered as its manifest's `threads` says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u32>,
 }
 
 /// Redelivery of events to a plugin that acknowledges them (capability ACKS).
@@ -368,6 +372,9 @@ impl SceneDefaults {
 /// Upper bound for `runtime.delivery.max_attempts`.
 pub(crate) const MAX_DELIVERY_ATTEMPTS: u64 = 1000;
 
+/// Upper bound for `runtime.threads`.
+pub(crate) const MAX_THREADS: u32 = 4096;
+
 impl RuntimeConfig {
     fn is_empty(&self) -> bool {
         *self == RuntimeConfig::default()
@@ -416,6 +423,11 @@ impl RuntimeConfig {
                 positive("queue.spill.disk_max_bytes", spill.disk_max_bytes);
                 positive("queue.spill.write_batch", spill.write_batch);
             }
+        }
+        if let Some(n) = self.threads
+            && n > MAX_THREADS
+        {
+            errors.push(format!("{prefix}.threads can't exceed {MAX_THREADS}"));
         }
         if let Some(n) = self.delivery.as_ref().and_then(|d| d.max_attempts)
             && n > MAX_DELIVERY_ATTEMPTS

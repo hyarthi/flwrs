@@ -1,10 +1,11 @@
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "id": "http-sink-python-example",
   "name": "HTTP sink (Python example)",
   "version": "0.0.1",
   "type": "SINK",
   "description": "Demo only: sends an HTTP request for each event.",
   "executable": "plugin.py",
-  "payload_schemas": { "in": "schema/in.json" }
+  "payload_schemas": { "in": "schema/in.json" },
+  "ui": { "categories": ["Outputs", "HTTP", "Examples", "Python"] }
 }

@@ -20,15 +20,22 @@ use tower_service::Service;
 #[derive(Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
+    /// Off: no HTTP server at all (e.g. an edge box configured, then run
+    /// without its management API to save resources).
+    enabled: bool,
     host: String,
     port: u16,
+    /// Serve the API's Swagger UI (where the binary has it): opt-in.
+    swagger_ui: bool,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             host: "0.0.0.0".to_string(),
             port: 80,
+            swagger_ui: false,
         }
     }
 }
@@ -36,6 +43,14 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub fn read() -> Self {
         config::read_struct(main_config(), &["http".to_string()]).unwrap_or_default()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn swagger_ui(&self) -> bool {
+        self.swagger_ui
     }
 }
 
@@ -56,6 +71,11 @@ impl Default for HttpServer {
 }
 
 impl HttpServer {
+    /// Its `[http]` settings.
+    pub fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
     pub fn new(apis: Vec<Router>, swagger_ui: Option<Router>) -> Self {
         let mut server = HttpServer::default();
 

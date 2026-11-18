@@ -6,6 +6,7 @@
 [http]
 host = "127.0.0.1"
 port = 8080
+swagger_ui = true   # opt-in (off by default): http://127.0.0.1:8080/swagger-ui
 
 [logging]
 format = "PLAIN"

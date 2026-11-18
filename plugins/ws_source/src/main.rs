@@ -16,9 +16,19 @@ fn fail(problems: Vec<String>) -> ExitCode {
     ExitCode::from(2)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args = Args::parse();
+    // `--threads` (optional, from the server) sizes the runtime.
+    match flwrs_plugin::rt::runtime(args.bootstrap.threads) {
+        Ok(runtime) => runtime.block_on(run(args)),
+        Err(e) => {
+            eprintln!("Failed to start the runtime: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(args: Args) -> ExitCode {
     let settings = match args.settings() {
         Ok(s) => s,
         Err(problems) => return fail(problems),
@@ -60,6 +70,7 @@ async fn main() -> ExitCode {
         subprotocols: settings.subprotocols.clone(),
         allowed_origins: settings.allowed_origins.clone(),
         max_message_bytes: settings.max_message_bytes,
+        read_buffer_bytes: settings.read_buffer_bytes,
         ping_interval: settings.ping_interval,
         enqueue_timeout: settings.enqueue_timeout,
         invalid_messages: settings.invalid_messages,
@@ -157,6 +168,10 @@ mod package_tests {
                 "title": "Largest message (bytes)", "x-flwrs-order": 5,
                 "description": "A larger message (or frame) closes the connection (1009).",
                 "type": "integer", "minimum": 16, "default": 1048576 },
+            "read_buffer_bytes": {
+                "title": "Read buffer (bytes)", "x-flwrs-order": 10, "x-flwrs-advanced": true,
+                "description": "Per connection, allocated up front (tungstenite's default is 128 KiB): smaller saves memory with many clients, and larger messages just take more reads.",
+                "type": "integer", "minimum": 256, "default": 16384 },
             "ping_interval_s": {
                 "title": "Ping interval (s)", "x-flwrs-order": 6, "x-flwrs-advanced": true,
                 "description": "The server pings each client this often; a client that has sent nothing since the last ping is closed.",

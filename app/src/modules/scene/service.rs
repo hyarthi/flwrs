@@ -400,6 +400,36 @@ impl Service {
         self.check_nodes(&mut conn, id).await
     }
 
+    /// Where a scene's local nodes listen: (label, setting, address), from
+    /// their plugins' `x-flwrs-listen` settings (or those settings' defaults).
+    async fn listeners(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        scene_id: &str,
+    ) -> Result<Vec<(String, String, String)>, ServiceError> {
+        let mut out = vec![];
+        for row in query_sqlite::list_nodes(conn, scene_id).await? {
+            let node = Node::try_from(row)?;
+            if node.config.launch != crate::modules::node_config::LaunchMode::Local {
+                continue;
+            }
+            let Ok(plugin) = self.plugins.get(&node.plugin_id).await else {
+                continue;
+            };
+            let Ok(rules) = NodeRules::of(&plugin) else {
+                continue;
+            };
+            let label = match &node.name {
+                Some(name) => format!("node {} ({name})", node.id),
+                None => format!("node {}", node.id),
+            };
+            for (field, address) in rules.spec.listen_addresses(&node.config.launch_args) {
+                out.push((label.clone(), field, address));
+            }
+        }
+        Ok(out)
+    }
+
     async fn check_nodes(
         &self,
         conn: &mut sqlx::SqliteConnection,
@@ -509,6 +539,22 @@ impl Service {
                     ));
                 }
             }
+            // A core count the plugin wouldn't get.
+            if node.config.runtime.threads.is_some_and(|n| n > 0) {
+                if node.config.launch != crate::modules::node_config::LaunchMode::Local {
+                    check.warnings.push(format!(
+                        "{label}: config.runtime.threads only applies to local nodes (a remote plugin is started by whoever runs it)"
+                    ));
+                } else if plugin
+                    .parsed_manifest()
+                    .is_some_and(|m| m.threads.is_none())
+                {
+                    check.warnings.push(format!(
+                        "{label}: config.runtime.threads is ignored: plugin {} doesn't say how it takes a core count (manifest threads)",
+                        plugin.id
+                    ));
+                }
+            }
             if !rules.spec.code_fields().is_empty()
                 && rules.code_problems(&node.config.launch_args).is_none()
             {
@@ -526,6 +572,30 @@ impl Service {
                             node.id
                         ));
                     }
+                }
+            }
+        }
+        // Two local nodes listening on the same address: only one can bind it.
+        let mine = self.listeners(conn, scene_id).await?;
+        for (i, (a_label, a_field, a)) in mine.iter().enumerate() {
+            for (b_label, b_field, b) in &mine[i + 1..] {
+                if listen_clash(a, b) {
+                    check.warnings.push(format!(
+                        "{a_label} ({a_field} {a}) and {b_label} ({b_field} {b}) listen on the same address: only one of them can bind it"
+                    ));
+                }
+            }
+        }
+        for other in query_sqlite::enabled_scene_ids(conn).await? {
+            if other == scene_id {
+                continue;
+            }
+            let theirs = self.listeners(conn, &other).await?;
+            for (a_label, a_field, a) in &mine {
+                for (b_label, _, b) in theirs.iter().filter(|(_, _, b)| listen_clash(a, b)) {
+                    check.warnings.push(format!(
+                        "{a_label} ({a_field} {a}) listens on the same address as {b_label} ({b}) of enabled scene {other}: only one of them can bind it"
+                    ));
                 }
             }
         }
@@ -1477,6 +1547,23 @@ fn optional_name(name: Option<String>, errors: &mut Vec<String>) -> Option<Strin
     name
 }
 
+/// Whether two listen addresses (`host:port`) can't both be bound: the same
+/// port (not 0) on the same address, or on a wildcard one (`0.0.0.0`, `::`).
+/// Addresses that aren't IP:port (host names) clash when they're equal.
+fn listen_clash(a: &str, b: &str) -> bool {
+    match (
+        a.parse::<std::net::SocketAddr>(),
+        b.parse::<std::net::SocketAddr>(),
+    ) {
+        (Ok(a), Ok(b)) => {
+            a.port() != 0
+                && a.port() == b.port()
+                && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+        }
+        _ => a == b,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2026,6 +2113,128 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(scene.max_hops, None);
+    }
+
+    #[test]
+    fn listen_clashes() {
+        assert!(listen_clash("127.0.0.1:8080", "127.0.0.1:8080"));
+        assert!(listen_clash("0.0.0.0:8080", "127.0.0.1:8080"));
+        assert!(listen_clash("[::]:8080", "127.0.0.1:8080"));
+        assert!(!listen_clash("127.0.0.1:8080", "127.0.0.2:8080"));
+        assert!(!listen_clash("127.0.0.1:8080", "127.0.0.1:8081"));
+        assert!(!listen_clash("127.0.0.1:0", "127.0.0.1:0"));
+        assert!(listen_clash("host:1", "host:1") && !listen_clash("host:1", "other:1"));
+    }
+
+    #[tokio::test]
+    async fn a_core_count_the_plugin_wont_get_is_warned_about() {
+        let f = fixture().await;
+        let scene = f.scene().await;
+        // test-sink's manifest has no `threads`.
+        f.node(
+            &scene.id,
+            "test-sink",
+            json!({"launch": "local", "runtime": {"threads": 2}}),
+        )
+        .await;
+        f.node(
+            &scene.id,
+            "test-sink",
+            json!({"launch": "local", "runtime": {"threads": 0}}),
+        )
+        .await;
+        let check = f.service.check(&scene.id).await.unwrap();
+        let found: Vec<_> = check
+            .warnings
+            .iter()
+            .filter(|w| w.contains("runtime.threads"))
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("doesn't say how it takes a core count"),
+            "{found:?}"
+        );
+        // Out of range: refused when saved.
+        let refused = f
+            .service
+            .create_node(
+                &scene.id,
+                node_input(
+                    "test-sink",
+                    json!({"launch": "local", "runtime": {"threads": 100000}}),
+                ),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(ServiceError::Invalid(e)) if e.join(" ").contains("threads can't exceed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn nodes_listening_on_the_same_address_are_warned_about() {
+        let f = fixture().await;
+        {
+            let Database::SQLite(db) = f.service.plugins.db();
+            let mut conn = db.get_connection().await.unwrap();
+            sqlx::query("INSERT INTO plugins (id, name, version, \"type\", manifest, launch_args_schema, in_schema, install_path, archive_sha256) VALUES ('test-listener', 'L', '1.0.0', 'SINK', $1, $2, $3, '/nonexistent/test-listener', 'x')")
+                .bind(r#"{"manifest_version":2,"id":"test-listener","name":"L","version":"1.0.0","type":"SINK","executable":"run","launch_args_schema":"l.json","payload_schemas":{"in":"i.json"}}"#)
+                .bind(r#"{"type":"object","additionalProperties":false,"properties":{
+                    "listen":{"type":"string","default":"127.0.0.1:8080","x-flwrs-listen":true}}}"#)
+                .bind(r#"{"fields":[{"key":"text","type":"STRING"}]}"#)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        let listen = |at: Option<&str>| match at {
+            Some(at) => json!({"launch": "local", "launch_args": {"listen": at}}),
+            None => json!({"launch": "local", "launch_args": {}}),
+        };
+        let warnings = |c: SceneCheck| {
+            c.warnings
+                .into_iter()
+                .filter(|w| w.contains("same address"))
+                .collect::<Vec<_>>()
+        };
+        let scene = f.scene().await;
+        // Both on the default: a clash; port 0 and another port don't.
+        let a = f.node(&scene.id, "test-listener", listen(None)).await;
+        let b = f.node(&scene.id, "test-listener", listen(None)).await;
+        f.node(&scene.id, "test-listener", listen(Some("127.0.0.1:0")))
+            .await;
+        f.node(&scene.id, "test-listener", listen(Some("127.0.0.1:9000")))
+            .await;
+        let found = warnings(f.service.check(&scene.id).await.unwrap());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains(&a.id)
+                && found[0].contains(&b.id)
+                && found[0].contains("127.0.0.1:8080"),
+            "{found:?}"
+        );
+        // Another scene: a wildcard on 9000 clashes with this one's 127.0.0.1:9000, once it's enabled.
+        let other = f
+            .service
+            .create_scene(&SceneInput::named("other"))
+            .await
+            .unwrap();
+        f.node(&other.id, "test-listener", listen(Some("0.0.0.0:9000")))
+            .await;
+        assert_eq!(warnings(f.service.check(&scene.id).await.unwrap()).len(), 1);
+        {
+            let Database::SQLite(db) = f.service.plugins.db();
+            let mut conn = db.get_connection().await.unwrap();
+            sqlx::query("UPDATE scenes SET enabled = TRUE WHERE id = $1")
+                .bind(&other.id)
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        let found = warnings(f.service.check(&scene.id).await.unwrap());
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found[1].contains(&other.id) && found[1].contains("0.0.0.0:9000"),
+            "{found:?}"
+        );
     }
 
     #[tokio::test]

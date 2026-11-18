@@ -52,7 +52,7 @@ pub(crate) struct NodeSpec {
 #[derive(Debug, Clone)]
 pub(crate) enum Launch {
     /// The supervisor starts the plugin as a child process.
-    Local(LocalLaunch),
+    Local(Box<LocalLaunch>),
     /// The plugin runs elsewhere and connects with these credentials.
     Remote { auth: NodeAuth },
 }
@@ -67,6 +67,8 @@ pub(crate) struct LocalLaunch {
     pub hub_addr: SocketAddr,
     /// `--log-level` value.
     pub log_level: String,
+    /// The cores the plugin may use, as its manifest's `threads` takes them.
+    pub threads: Option<ThreadsDelivery>,
     /// The node's `launch_args` delivered as arguments (file settings as
     /// paths into `config/`); appended after the bootstrap args.
     pub args: Vec<String>,
@@ -87,9 +89,48 @@ impl LocalLaunch {
             "--log-level".to_string(),
             self.log_level.clone(),
         ];
+        if let Some(ThreadsDelivery::Arg(flag, value)) = &self.threads {
+            argv.extend([format!("--{flag}"), value.clone()]);
+        }
         argv.extend(self.args.iter().cloned());
         argv
     }
+}
+
+/// How the supervisor gives a local plugin its core count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThreadsDelivery {
+    /// `--<flag> <value>`, after the bootstrap arguments.
+    Arg(String, String),
+    /// An environment variable.
+    Env(String, String),
+}
+
+impl LocalLaunch {
+    /// The environment the plugin gets: its launch args' variables, and the
+    /// core count if it takes it as one.
+    pub(crate) fn environment(&self) -> Vec<(String, String)> {
+        let mut env = self.env.clone();
+        if let Some(ThreadsDelivery::Env(name, value)) = &self.threads {
+            env.push((name.clone(), value.clone()));
+        }
+        env
+    }
+}
+
+/// The core count `n` (0: the plugin decides) as the manifest's `threads`
+/// takes it; nothing for a plugin that doesn't declare it.
+pub(crate) fn threads_delivery(
+    manifest: &flwrs_plugin::package::Manifest,
+    n: Option<u32>,
+) -> Option<ThreadsDelivery> {
+    let n = n.filter(|n| *n > 0)?;
+    let threads = manifest.threads.as_ref()?;
+    let value = threads.value_for(n);
+    Some(match threads.via {
+        flwrs_plugin::package::ThreadsVia::Arg => ThreadsDelivery::Arg(threads.name.clone(), value),
+        flwrs_plugin::package::ThreadsVia::Env => ThreadsDelivery::Env(threads.name.clone(), value),
+    })
 }
 
 pub(crate) const DEFAULT_QUEUE_CAPACITY: usize = 1024;
@@ -329,6 +370,8 @@ pub(crate) struct Surroundings<'a> {
     pub files_dir: &'a Path,
     /// The files uploaded to this node.
     pub uploads: &'a [NodeUpload],
+    /// `[director] plugin_threads`: cores for plugins whose nodes don't say.
+    pub plugin_threads: Option<u32>,
 }
 
 impl NodeSpec {
@@ -349,6 +392,7 @@ impl NodeSpec {
             nodes_dir,
             files_dir,
             uploads,
+            plugin_threads,
         } = *at;
         let mut errors = vec![];
         let manifest = plugin
@@ -436,7 +480,7 @@ impl NodeSpec {
                 }
                 let install_dir = std::path::absolute(Path::new(&plugin.install_path))
                     .unwrap_or_else(|_| PathBuf::from(&plugin.install_path));
-                Launch::Local(LocalLaunch {
+                Launch::Local(Box::new(LocalLaunch {
                     program: install_dir.join(&manifest.executable),
                     workdir: Workdir {
                         dir,
@@ -446,9 +490,17 @@ impl NodeSpec {
                     },
                     hub_addr: local_hub_addr(hub_addr),
                     log_level: log_level.to_string(),
+                    threads: threads_delivery(
+                        &manifest,
+                        config
+                            .runtime
+                            .threads
+                            .or(defaults.threads)
+                            .or(plugin_threads),
+                    ),
                     args: plan.argv,
                     env: plan.env,
-                })
+                }))
             }
         };
         if !errors.is_empty() {

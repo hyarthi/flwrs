@@ -15,11 +15,11 @@ pub mod manifest;
 pub use archive::{ExtraCheck, Limits, Package, PackageError, extract_and_validate, validate};
 pub use launch::{
     CONFIG_DIR, CodeField, ConfigContent, ConfigFile, LaunchField, LaunchPlan, LaunchSpec,
-    SchemaReport, Via, validate_launch_args,
+    ListenField, SchemaReport, Via, validate_launch_args,
 };
 pub use manifest::{
     Configurator, FromLaunchArgs, LaunchArgsStyle, MANIFEST_FILE, MANIFEST_VERSION, Manifest,
-    PayloadSchemas, PluginType, RESERVED_ARGS, RESERVED_ENTRY, SchemaSource, Ui,
-    check_relative_path, current_platform, is_semver, is_valid_id, launch_args_to_argv,
+    PayloadSchemas, PluginType, RESERVED_ARGS, RESERVED_ENTRY, SchemaSource, Threads, ThreadsVia,
+    Ui, check_relative_path, current_platform, is_semver, is_valid_id, launch_args_to_argv,
     parse_pointer,
 };

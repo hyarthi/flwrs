@@ -58,6 +58,7 @@ impl registry::Service for Service {
             log_level: server_log_level(),
             nodes_dir: config.nodes_dir.clone(),
             files_dir: config.files_dir.clone(),
+            plugin_threads: config.plugin_threads,
         };
         Engine::new(ctx, crate::modules::scene::service())
             .run(commands, shutdown_token)

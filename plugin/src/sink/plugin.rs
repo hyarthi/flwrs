@@ -14,6 +14,14 @@ pub trait Sink {
 
     fn shutdown(&mut self) -> Result<(), ShutdownError>;
 
+    /// Called once when the run ends (after the hub's `Shutdown`, or a
+    /// rejection), before `shutdown` and the `Exit`: finish asynchronous work
+    /// here, e.g. stop a server and let its requests end (what they send
+    /// still goes out). The default does nothing. Unlike blocking in
+    /// `shutdown`, this works on a single-threaded runtime too.
+    #[allow(async_fn_in_trait)]
+    async fn drain(&mut self) {}
+
     /// Called once when the hub's `Shutdown` arrives, before the runner
     /// finishes the events it has (then [`Sink::shutdown`] follows). A sink
     /// whose `consume_event` can wait a long time (e.g. for a subscriber to

@@ -1265,6 +1265,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flwrs-e2e"
+version = "0.0.1"
+dependencies = [
+ "flwrs-trellis",
+ "reqwest",
+ "rumqttd",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "flwrs-http-push-sink"
 version = "0.0.1"
 dependencies = [
@@ -1375,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "flwrs-plugin"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1467,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "flwrs-trellis"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "clap",
  "flwrs-plugin",

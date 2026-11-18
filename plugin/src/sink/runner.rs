@@ -114,6 +114,7 @@ impl<T: Sink> SinkRunner<T> {
             }
         };
 
+        self.plugin.drain().await;
         let shutdown = self.plugin.shutdown();
         finish(&self.client, &self.plugin_id, end, shutdown).await
     }

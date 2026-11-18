@@ -6,8 +6,25 @@ mod registry;
 use crate::registry::build_registry;
 use std::env;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// `[runtime]`: the server's own threads.
+#[derive(serde::Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RuntimeSection {
+    /// Cores to use: 1 = single-threaded, N = the main thread + N - 1
+    /// workers; unset or 0 = a worker per core.
+    threads: Option<usize>,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let section: RuntimeSection = flwrs_core::config::read_struct(
+        flwrs_core::config::main_config(),
+        &["runtime".to_string()],
+    )
+    .unwrap_or_default();
+    flwrs_plugin::rt::runtime(section.threads)?.block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     flwrs_core::logging::init_main_logger()?;
     log::info!("Application is starting up...");
     log::debug!("Working directory: {}", env::current_dir()?.display());

@@ -8,6 +8,7 @@
   "executable": "bin/flwrs-mqtt-source",
   "launch_args_schema": "schema/launch_args.json",
   "launch_args_style": "flags",
+  "threads": { "via": "arg", "name": "threads" },
   "payload_schemas": {
     "out": "schema/out.json"
   },

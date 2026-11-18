@@ -1,10 +1,12 @@
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "id": "http-sink-node-example",
   "name": "HTTP sink (Node.js / TypeScript example)",
   "version": "0.0.1",
   "type": "SINK",
   "description": "Demo only: sends an HTTP request for each event.",
   "executable": "plugin.ts",
-  "payload_schemas": { "in": "schema/in.json" }
+  "threads": { "via": "env", "name": "UV_THREADPOOL_SIZE" },
+  "payload_schemas": { "in": "schema/in.json" },
+  "ui": { "categories": ["Outputs", "HTTP", "Examples", "TypeScript"] }
 }

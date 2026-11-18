@@ -58,6 +58,8 @@ pub(crate) struct Context {
     pub nodes_dir: PathBuf,
     /// `[director] files_dir`: files uploaded to nodes.
     pub files_dir: PathBuf,
+    /// `[director] plugin_threads`.
+    pub plugin_threads: Option<u32>,
 }
 
 /// A node's run-time report, for status.
@@ -163,6 +165,7 @@ impl Plan {
                 nodes_dir: &ctx.nodes_dir,
                 files_dir: &ctx.files_dir,
                 uploads: &node.uploads,
+                plugin_threads: ctx.plugin_threads,
             };
             match NodeSpec::resolve(scene_id, &node.id, &node.config, plugin, &at) {
                 Ok(spec) if spec.plugin_type.as_str() != node.node_type => errors.push(format!(

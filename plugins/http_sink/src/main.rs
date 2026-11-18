@@ -37,11 +37,20 @@ pub(crate) struct Args {
     max_concurrent_requests: u32,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     println!("Starting plugin...");
     let args = Args::parse();
+    // `--threads` (optional, from the server) sizes the runtime.
+    match flwrs_plugin::rt::runtime(args.bootstrap.threads) {
+        Ok(runtime) => runtime.block_on(run(args)),
+        Err(e) => {
+            eprintln!("Failed to start the runtime: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
+async fn run(args: Args) -> ExitCode {
     let settings = PluginSettings {
         connect_timeout: Duration::from_secs(args.http_connect_timeout_seconds),
         read_timeout: Duration::from_secs(args.http_read_timeout_seconds),

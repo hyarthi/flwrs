@@ -207,7 +207,12 @@ pub fn package(opts: &PackageOptions) -> Result<Packaged, String> {
     let out_dir = opts.out.clone().unwrap_or(default_out);
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
     let mut name = format!("{}-{}", manifest.id, manifest.version);
-    if let Some(flavor) = &opts.flavor {
+    // The flavor, unless the id already names it (`http-source-edge`).
+    if let Some(flavor) = opts
+        .flavor
+        .as_ref()
+        .filter(|f| !manifest.id.ends_with(&format!("-{f}")))
+    {
         name.push_str(&format!("-{flavor}"));
     }
     if let Some(platform) = &platform {

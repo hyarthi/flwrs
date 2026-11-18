@@ -461,6 +461,7 @@ impl Setup {
             log_level: "info".into(),
             nodes_dir: self.dir.path().join("nodes"),
             files_dir: self.dir.path().join("files"),
+            plugin_threads: None,
         };
         let (handle, commands): (DirectorHandle, mpsc::Receiver<DirectorCommand>) =
             DirectorHandle::channel();

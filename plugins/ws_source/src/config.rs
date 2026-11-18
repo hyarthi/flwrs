@@ -42,6 +42,10 @@ pub struct Args {
     #[arg(long, default_value_t = 1024 * 1024)]
     pub max_message_bytes: u32,
 
+    /// Per connection: the read buffer, allocated up front (larger messages take more reads)
+    #[arg(long, default_value_t = 16 * 1024)]
+    pub read_buffer_bytes: usize,
+
     /// Seconds between pings; a ping unanswered by the next one closes the connection
     #[arg(long, default_value_t = 30)]
     pub ping_interval_s: u32,
@@ -72,6 +76,7 @@ pub struct Settings {
     pub subprotocols: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub max_message_bytes: usize,
+    pub read_buffer_bytes: usize,
     pub ping_interval: Duration,
     pub enqueue_timeout: Duration,
     pub invalid_messages: InvalidMessages,
@@ -113,6 +118,9 @@ impl Args {
                 problems.push(format!("paths: {p:?} must be a plain path starting with /"));
             }
         }
+        if self.read_buffer_bytes < 256 {
+            problems.push("read_buffer_bytes must be at least 256".into());
+        }
         if self.max_message_bytes < 16 {
             problems.push("max_message_bytes must be at least 16".into());
         }
@@ -128,6 +136,7 @@ impl Args {
                 subprotocols,
                 allowed_origins,
                 max_message_bytes: self.max_message_bytes as usize,
+                read_buffer_bytes: self.read_buffer_bytes,
                 ping_interval: Duration::from_secs(self.ping_interval_s.into()),
                 enqueue_timeout: Duration::from_millis(self.enqueue_timeout_ms),
                 invalid_messages: self.invalid_messages,

@@ -11,6 +11,7 @@ A WebSocket server that turns messages into events. Its paths and messages come 
 | `subprotocols` | | The subprotocols the server speaks (`Sec-WebSocket-Protocol`), in order of preference. A client offering none of them still connects, without one. |
 | `allowed_origins` | any | The `Origin`s browsers may connect from (403 otherwise). Clients that send no `Origin` (not browsers) aren't affected. |
 | `max_message_bytes` | `1048576` | A larger message or frame closes the connection (1009). |
+| `read_buffer_bytes` | `16384` | Per connection, allocated up front (tungstenite's own default is 128 KiB): less memory with many clients; larger messages just take more reads. |
 | `ping_interval_s` | `30` | The server pings each client this often; a client that has sent nothing (not even a pong) since the last ping is closed. |
 | `enqueue_timeout_ms` | `5000` | How long a message waits for the workflow to take it; then the connection closes with 1013 (try again later). |
 | `invalid_messages` | `"drop"` | A message no definition of its channel takes: `drop` (a WARN once a minute with the count) or `close` (1008). |

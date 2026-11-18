@@ -59,7 +59,7 @@ impl PluginProcess {
         command
             .args(launch.argv(node_id))
             .current_dir(&launch.workdir.dir)
-            .envs(launch.env.iter().map(|(k, v)| (k, v)))
+            .envs(launch.environment())
             .env(TOKEN_ENV, token)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

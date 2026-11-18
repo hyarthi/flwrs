@@ -70,6 +70,7 @@ The executable is made executable when the package is unpacked; other permission
 | `launch_args_style` | no | `flags` (default; a node's settings are a JSON object) or `positional` (a list of strings, passed as they are; no annotations). |
 | `payload_schemas` | by type | `in` for a SINK, `out` for a SOURCE, both for a TRANSFORM. Each is either a path to a `SchemaDefinition` in proto3 JSON (`{"fields": [{"key": "url", "type": "STRING"}]}`), or `{"from_launch_args": "<JSON pointer>", "default": "<path>"?}`: the node's own schema, from its settings ([section 3.5](#35-per-node-payload-schemas)). The plugin MUST declare exactly the schemas in effect in `Initialize`. |
 | `runtime_defaults` | no | Defaults for the node's runtime settings (timeouts, restarts, queue, delivery); same keys as a node's `config.runtime`. |
+| `threads` | no | How the plugin takes a **core count**: `{"via": "arg" \| "env", "name", "value"?}`, e.g. `{"via": "arg", "name": "threads"}` (the Rust SDK's `--threads`), `{"via": "env", "name": "GOMAXPROCS"}`, or `{"via": "env", "name": "JAVA_TOOL_OPTIONS", "value": "-XX:ActiveProcessorCount={n}"}` (`value` is a template, default `{n}`). See [section 5.5](#55-the-core-count). A name a launch arg also uses, a bootstrap argument, or an `FLWRS_*` variable is refused. |
 | `configurator` | no | `{"executable", "fields"}`: a program in the package that sets some of a node's settings from its others, e.g. an out schema derived from an OpenAPI document ([section 3.6](#36-configured-settings-the-configurator)). Version 2 only. |
 | `ui` | no | How a UI presents the plugin: `icon` (an `.svg` or `.png` in the package), `categories` (free tags, 1 to 64 characters, no duplicates), `color` (`#RRGGBB`), `docs` (a Markdown file in the package). |
 | `x-…` | no | Top-level fields starting with `x-` are ignored, with a warning at upload. Any other unknown field is an error. |
@@ -127,6 +128,8 @@ On a string property: `{"language": "lua", "params": [names], "definitions"?: "<
 ### 3.4 Presentation hints
 
 On any property, all optional: `x-flwrs-group` (a section name), `x-flwrs-order` (an integer), `x-flwrs-advanced` (collapsed by default), `x-flwrs-widget` (`duration`, `cron`, `file-path` or `code`). Standard keywords (`title`, `description`, `default`, `enum`, `minimum`, `format`, …) are used as they are. An unknown `x-flwrs-*` keyword is a warning at upload, and ignored.
+
+**Listen addresses:** `x-flwrs-listen: true` on a top-level string property says its value is an address the plugin listens on, as `host:port` (its `default` is what the plugin binds when a node leaves it out). The server's scene check then warns when two local nodes would bind the same address (the same port, on the same address or a wildcard one: `0.0.0.0`, `::`; port 0 never clashes), within a scene or with the server's other enabled scenes. Only one of them could start listening. A server that doesn't know the keyword warns about it at upload, and ignores it.
 
 ### 3.5 Per-node payload schemas
 
@@ -249,6 +252,12 @@ The working directory is the node's own folder, `<nodes dir>/<scene id>/<node id
 ### 5.4 Stopping
 
 To stop a local plugin the hub sends `Shutdown` and waits for the process to exit (10 s by default). Then it asks the OS to stop the process and everything it started (SIGTERM to its process group on Unix, Ctrl-Break to its console group on Windows), waits again (2 s by default), and kills it. A plugin SHOULD exit on `Shutdown`, and SHOULD treat SIGTERM or Ctrl-Break as a last request to stop. An exit the hub didn't ask for makes it relaunch the plugin after a delay.
+
+### 5.5 The thread count
+
+A node can say how many threads its plugin may use: `runtime.threads` in its config, else the manifest's `runtime_defaults.threads`, else the server's `[director] plugin_threads`. The number `n` means threads: `1` single-threaded, `2` two, and so on; `0` or nothing means the plugin decides (typically one thread per core). It lets a device or server keep cores reserved for other work.
+
+The server delivers it only to a plugin whose manifest declares `threads`, the way it declares: as `--<name> <value>` after the bootstrap arguments (`arg`), or as the environment variable `<name>=<value>` (`env`), with `{n}` in `value` replaced by the number. Without the declaration, or for `0`, nothing is passed (the server's check warns about a node that sets a count its plugin wouldn't get). A plugin SHOULD honour it, but MAY treat it as a hint: what a "thread" is depends on the runtime (e.g., the Rust SDK maps `n` to tokio's main thread plus `n - 1` workers, and `1` to a single-threaded runtime; Go's `GOMAXPROCS` caps the threads running Go code; the JVM's `-XX:ActiveProcessorCount` sizes its pools).
 
 ## 6. Guidance
 

@@ -38,6 +38,7 @@ pub struct App {
     pub subprotocols: Vec<String>,
     pub allowed_origins: Vec<String>,
     pub max_message_bytes: usize,
+    pub read_buffer_bytes: usize,
     pub ping_interval: Duration,
     pub enqueue_timeout: Duration,
     pub invalid_messages: InvalidMessages,
@@ -280,6 +281,7 @@ async fn upgrade(
     let ws = ws
         .max_message_size(app.max_message_bytes)
         .max_frame_size(app.max_message_bytes)
+        .read_buffer_size(app.read_buffer_bytes)
         .protocols(app.subprotocols.clone());
     ws.on_upgrade(move |socket| async move {
         log::debug!("connection {} on {}", ctx.connection_id, ep.address);

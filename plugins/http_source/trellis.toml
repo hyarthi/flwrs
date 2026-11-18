@@ -4,3 +4,12 @@
 
 [audit]
 launch_args = "tests/trellis/audit.json"
+
+# Build flavours: `http-source-edge` (no Swagger UI) and `http-source-server`
+# (everything). `trellis package plugins/http_source --flavor edge`.
+[flavors.edge]
+no_default_features = true
+manifest = "manifest.edge.json"
+
+[flavors.server]
+manifest = "manifest.server.json"
