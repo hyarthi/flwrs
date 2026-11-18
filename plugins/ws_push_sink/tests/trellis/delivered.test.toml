@@ -1,0 +1,33 @@
+# ack_mode delivered (delivery_timeout_ms 500). Subscribers are opened by the
+# stimulus in tests/trellis.rs; it checks what they received at the end.
+name = "delivered: acked once a subscriber took it"
+launch_args = "delivered.json"
+
+[[steps]]
+wait_ms = 500
+
+# Nobody subscribed: held, then refused (retryable) after the timeout.
+[[steps]]
+send = "payloads/nobody-lost.json"
+expect_ack = { nack = { retryable = true } }
+within_ms = 3000
+
+# A client on news: the event is acked once its message is written.
+[[steps]]
+stimulus = true
+
+[[steps]]
+send = "payloads/news-hello.json"
+expect_ack = "ack"
+
+# A subscriber that comes 300 ms later still gets the held event.
+[[steps]]
+stimulus = true
+
+[[steps]]
+send = "payloads/later-held.json"
+expect_ack = "ack"
+within_ms = 3000
+
+[[steps]]
+wait_ms = 1500

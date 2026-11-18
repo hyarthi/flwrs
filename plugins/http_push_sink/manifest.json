@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "id": "http-push-sink",
+  "name": "HTTP push sink",
+  "version": "0.0.1",
+  "type": "SINK",
+  "description": "An HTTP server broadcasting events to subscribers over Server-Sent Events and long polling, with replay.",
+  "executable": "bin/flwrs-http-push-sink",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": {
+    "in": "schema/in.json"
+  },
+  "ui": {
+    "icon": "ui/http-push-sink.svg",
+    "categories": ["Outputs", "HTTP", "Streaming"],
+    "docs": "README.md"
+  }
+}

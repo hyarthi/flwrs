@@ -8,6 +8,8 @@ Status: idea, not scheduled. **Compression is contentious:** it's unclear whethe
 
 **Step 1, no protocol change: write coalescing.** A connection's writer drains every frame that's ready and writes them together (one vectored write, or a buffer flushed when the outgoing queue is empty: "corking"). Frames stay individual on the wire; the receiver doesn't notice. This alone may capture most of the gain, in the SDK and in the hub. Try it first.
 
+**The same applies to plugins' own fan-out writes.** The WebSocket push sink writes and flushes each message to each client on its own: with 1 000 clients it reaches ~460 events/s (≈ 460k messages/s) against the SSE push sink's ~1 300 (≈ 1.3M writes/s, its stream body batched by hyper). Coalescing there: `feed` the messages that are already in the ring, flush once nothing more is ready (never waiting to fill a batch). The per-connection read buffer is a separate cost and already configurable (`read_buffer_bytes`, Nov 18, 2026).
+
 **Step 2, if needed: batch frames.** Several events in one frame, negotiated (a capability, plus a `flags` bit on the frame). Each event keeps what it has in the header today: `seq`, `input_seq`, metadata, `attempt`. So a batch body would be a list of (per-event header, body) pairs, or a contiguous `seq` range with the per-event fields repeated. Things to settle:
 - Acks stay per event (by `seq`), so delivery semantics don't change.
 - Credit and windows count events inside batches, as today.

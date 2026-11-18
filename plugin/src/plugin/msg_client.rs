@@ -18,6 +18,7 @@
 //! sees acceptance, `Shutdown` and incoming data events.
 
 use crate::plugin::core::{InboundEvent, InputRef};
+use crate::plugin::credits::{Acquire, Credits, Grant};
 use crate::plugin::frame::{
     Frame, FrameError, SeqCounter, WireMessage, encode_frame, encode_message, read_frame,
 };
@@ -34,7 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 pub(crate) type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
@@ -66,8 +67,6 @@ struct Conn {
     writer: BoxedWriter,
     /// Seqs for outgoing EVENTs.
     seqs: SeqCounter,
-    /// Remaining credit, if the hub enabled CREDITS on this connection.
-    credit: Option<u64>,
     /// The hub enabled ACKS on this connection.
     acks: bool,
     /// Emitted events waiting for the hub's ACK / NACK.
@@ -90,8 +89,8 @@ pub(crate) struct HubClient {
     // before its `Initialize`.
     conn: Mutex<Option<Conn>>,
     stage: watch::Sender<Stage>,
-    /// Credit arrived (or the connection changed).
-    credit: Notify,
+    /// Credit for sending events, handed out in order (see `credits`).
+    credits: Credits,
     next_id: AtomicU64,
     next_nonce: AtomicU64,
 }
@@ -112,7 +111,7 @@ impl HubClient {
             connector,
             conn: Mutex::new(None),
             stage: watch::Sender::new(Stage::Down),
-            credit: Notify::new(),
+            credits: Credits::default(),
             next_id: AtomicU64::new(1),
             next_nonce: AtomicU64::new(1),
         })
@@ -152,12 +151,11 @@ impl HubClient {
             id,
             writer,
             seqs: SeqCounter::new(),
-            credit: None,
             acks: false,
             confirms: HashMap::new(),
         });
         self.stage.send_replace(Stage::Down);
-        self.credit.notify_waiters();
+        self.credits.reset(id, false);
         Ok((id, reader))
     }
 
@@ -214,13 +212,6 @@ impl HubClient {
         result
     }
 
-    /// Sends a data event: waits for credit if the hub uses credits, and
-    /// returns its seq. With `confirm`, also returns a receiver for the hub's
-    /// ACK / NACK (resolved at once if the hub doesn't use acks).
-    /// Waits until an event could be sent without waiting for credit: the
-    /// connection is ready and has credit (or the hub didn't enable
-    /// `CREDITS`). Sends nothing, so it's cancel-safe. Fails while not
-    /// connected, like [`HubClient::send_event`].
     /// Accepted by the hub, on the current connection.
     pub(crate) fn is_connected(&self) -> bool {
         self.stage() >= Stage::Ready
@@ -234,34 +225,58 @@ impl HubClient {
             return false;
         }
         match self.conn.try_lock() {
-            Ok(guard) => guard.as_ref().is_some_and(|c| c.credit != Some(0)),
+            Ok(guard) => guard
+                .as_ref()
+                .is_some_and(|c| self.credits.would_send(c.id)),
             Err(_) => true,
         }
     }
 
+    /// Waits until an event could be sent without waiting for credit: the
+    /// connection is ready and has credit (or the hub didn't enable
+    /// `CREDITS`), and nobody is ahead in the queue. Sends nothing, so it's
+    /// cancel-safe. Fails while not connected, like [`HubClient::send_event`].
     pub(crate) async fn ready(&self) -> io::Result<()> {
+        // Credit taken and given straight back: to the next in line, if any.
+        drop(self.acquire().await?);
+        Ok(())
+    }
+
+    /// The current connection's id, if it's ready for events.
+    async fn ready_conn(&self) -> io::Result<u64> {
+        let guard = self.conn.lock().await;
+        if self.stage() < Stage::Ready {
+            return Err(not_connected());
+        }
+        guard.as_ref().map(|c| c.id).ok_or_else(not_connected)
+    }
+
+    /// Credit to send one event on the current connection: at once, or in
+    /// turn (longest-waiting first).
+    async fn acquire(&self) -> io::Result<Grant> {
         loop {
-            let credit = self.credit.notified();
-            tokio::pin!(credit);
-            credit.as_mut().enable();
-            {
-                let guard = self.conn.lock().await;
-                if self.stage() < Stage::Ready {
-                    return Err(not_connected());
+            let conn = self.ready_conn().await?;
+            match self.credits.try_acquire(conn) {
+                Acquire::Granted(grant) => return Ok(grant),
+                Acquire::Wait(rx) => {
+                    let mut stage = self.stage.subscribe();
+                    tokio::select! {
+                        grant = rx => match grant {
+                            Ok(grant) => return Ok(grant),
+                            // The connection changed: look again.
+                            Err(_) => continue,
+                        },
+                        _ = stage.wait_for(|s| *s < Stage::Ready) => return Err(not_connected()),
+                    }
                 }
-                let conn = guard.as_ref().ok_or_else(not_connected)?;
-                if conn.credit != Some(0) {
-                    return Ok(());
-                }
-            }
-            let mut stage = self.stage.subscribe();
-            tokio::select! {
-                _ = &mut credit => {}
-                _ = stage.wait_for(|s| *s < Stage::Ready) => return Err(not_connected()),
             }
         }
     }
 
+    /// Sends a data event: waits for credit if the hub uses credits (in
+    /// turn, longest-waiting first), and returns its seq. With `confirm`,
+    /// also returns a receiver for the hub's ACK / NACK (resolved at once if
+    /// the hub doesn't use acks).
     pub(crate) async fn send_event(
         &self,
         payload: PluginPayload,
@@ -273,59 +288,49 @@ impl HubClient {
         }
         .encode_to_vec();
         loop {
-            let credit = self.credit.notified();
-            tokio::pin!(credit);
-            credit.as_mut().enable();
-            {
-                let mut guard = self.conn.lock().await;
-                if self.stage() < Stage::Ready {
-                    return Err(not_connected());
-                }
-                let conn = guard.as_mut().ok_or_else(not_connected)?;
-                if conn.credit != Some(0) {
-                    let Some(seq) = conn.seqs.peek() else {
-                        // Used every seq this connection has: reconnect
-                        // (numbering starts at 1 again), as on a write error.
-                        log::warn!("Used up the event seqs of this connection; reconnecting");
-                        self.drop_conn(&mut guard);
-                        return Err(not_connected());
-                    };
-                    // seq numbers are per connection: an input from an
-                    // earlier connection can't be referred to any more.
-                    let input_seq = input.filter(|i| i.conn_id == conn.id).map_or(0, |i| i.seq);
-                    let header = FrameHeader {
-                        code: MsgCode::Event as i32,
-                        seq,
-                        input_seq,
-                        ..Default::default()
-                    };
-                    let result = conn.write(&encode_frame(&header, &body)).await;
-                    if let Err(err) = result {
-                        self.drop_conn(&mut guard);
-                        return Err(err);
-                    }
-                    conn.seqs.advance();
-                    if let Some(credit) = conn.credit.as_mut() {
-                        *credit -= 1;
-                    }
-                    let receiver = confirm.then(|| {
-                        let (tx, rx) = oneshot::channel();
-                        if conn.acks {
-                            conn.confirms.insert(seq, tx);
-                        } else {
-                            let _ = tx.send(Ok(()));
-                        }
-                        rx
-                    });
-                    return Ok((seq, receiver));
-                }
+            let grant = self.acquire().await?;
+            let mut guard = self.conn.lock().await;
+            if self.stage() < Stage::Ready {
+                return Err(not_connected());
             }
-            // Out of credit: wait for a grant (or a new connection).
-            let mut stage = self.stage.subscribe();
-            tokio::select! {
-                _ = &mut credit => {}
-                _ = stage.wait_for(|s| *s < Stage::Ready) => return Err(not_connected()),
+            let conn = guard.as_mut().ok_or_else(not_connected)?;
+            if conn.id != grant.conn {
+                // Credit of an earlier connection: ask again.
+                continue;
             }
+            let Some(seq) = conn.seqs.peek() else {
+                // Used every seq this connection has: reconnect
+                // (numbering starts at 1 again), as on a write error.
+                log::warn!("Used up the event seqs of this connection; reconnecting");
+                self.drop_conn(&mut guard);
+                return Err(not_connected());
+            };
+            // seq numbers are per connection: an input from an
+            // earlier connection can't be referred to any more.
+            let input_seq = input.filter(|i| i.conn_id == conn.id).map_or(0, |i| i.seq);
+            let header = FrameHeader {
+                code: MsgCode::Event as i32,
+                seq,
+                input_seq,
+                ..Default::default()
+            };
+            let result = conn.write(&encode_frame(&header, &body)).await;
+            if let Err(err) = result {
+                self.drop_conn(&mut guard);
+                return Err(err);
+            }
+            conn.seqs.advance();
+            grant.spend();
+            let receiver = confirm.then(|| {
+                let (tx, rx) = oneshot::channel();
+                if conn.acks {
+                    conn.confirms.insert(seq, tx);
+                } else {
+                    let _ = tx.send(Ok(()));
+                }
+                rx
+            });
+            return Ok((seq, receiver));
         }
     }
 
@@ -361,21 +366,14 @@ impl HubClient {
             && self.stage() == Stage::Initializing
         {
             let has = |cap: Capability| response.capabilities.contains(&(cap as i32));
-            conn.credit = has(Capability::Credits).then_some(0);
+            self.credits.reset(id, has(Capability::Credits));
             conn.acks = has(Capability::Acks);
             self.stage.send_replace(Stage::Ready);
         }
     }
 
     async fn add_credit(&self, id: u64, events: u32) {
-        let mut guard = self.conn.lock().await;
-        if let Some(conn) = guard.as_mut().filter(|c| c.id == id)
-            && let Some(credit) = conn.credit.as_mut()
-        {
-            *credit = credit.saturating_add(u64::from(events));
-            drop(guard);
-            self.credit.notify_waiters();
-        }
+        self.credits.add(id, events);
     }
 
     /// The hub's ACK / NACK of emitted events.
@@ -421,7 +419,7 @@ impl HubClient {
             fail_confirms(conn.confirms);
         }
         self.stage.send_replace(Stage::Down);
-        self.credit.notify_waiters();
+        self.credits.reset(0, false);
     }
 
     /// Waits until the stage is at least `min`.

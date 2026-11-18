@@ -18,6 +18,8 @@ members = [
     "plugins/kit",
     "plugins/http_source",
     "plugins/ws_source",
+    "plugins/http_push_sink",
+    "plugins/ws_push_sink",
     "trellis",
 ]
 

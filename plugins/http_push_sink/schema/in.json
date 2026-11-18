@@ -1,0 +1,8 @@
+{
+  "fields": [
+    { "key": "channel", "description": "The channel to broadcast on (allowed_channels); empty: default_channel", "type": "STRING" },
+    { "key": "event", "description": "The event type (SSE event:, the WebSocket envelope's event)", "type": "STRING" },
+    { "key": "data", "description": "The event's data", "type": "BYTES" },
+    { "key": "content_type", "description": "The data's media type (e.g. application/json)", "type": "STRING" }
+  ]
+}

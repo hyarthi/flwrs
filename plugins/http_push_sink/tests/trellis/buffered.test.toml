@@ -1,0 +1,40 @@
+# ack_mode buffered, a 3-event ring, bearer auth, CORS for one origin. The
+# stimulus in tests/trellis.rs sends the requests and checks the answers.
+name = "buffered: replay, long polling, gaps, CORS"
+launch_args = "buffered.json"
+
+[[steps]]
+wait_ms = 500
+
+[[steps]]
+send = "payloads/feed-one.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/feed-two.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/feed-three.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/feed-four.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/bin.json"
+expect_ack = "ack"
+
+# Not an allowed channel: refused for good.
+[[steps]]
+send = "payloads/elsewhere.json"
+expect_ack = { nack = { retryable = false } }
+
+# Requests: no token (401), a stale cursor (gap + the ring), resuming by
+# cursor, SSE with Last-Event-ID, binary data, a preflight and CORS headers.
+[[steps]]
+stimulus = true
+
+[[steps]]
+wait_ms = 1500

@@ -1,4 +1,5 @@
 pub mod core;
+pub(crate) mod credits;
 pub mod error;
 pub mod frame;
 pub(crate) mod logger;

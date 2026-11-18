@@ -204,7 +204,7 @@ After `INITIALIZE_RESPONSE`, data flows ([sections 7 to 9](#7-data-events)), and
 
 ### 6.4 Shutdown
 
-The hub sends `SHUTDOWN` to end a run. After that it sends no more events. The plugin SHOULD finish what it has in hand: a transform sends its remaining outputs, and a consumer with `ACKS` acks what it has finished. It SHOULD take no more than a few seconds for that: the hub waits 10 s by default (configurable per node) before it stops the process. Unacked events are delivered again later anyway, so it's better to stop than to overrun. Then it sends `EXIT` with a code (`OK`, `INTERRUPTED` or `ERROR`) and exits. The hub keeps reading the connection until the plugin closes it or its grace period runs out, and events that arrive meanwhile are still routed.
+The hub sends `SHUTDOWN` to end a run. After that it sends no more events. The plugin SHOULD finish what it has in hand: a transform sends its remaining outputs, and a consumer with `ACKS` acks what it has finished. It SHOULD take no more than a few seconds for that: the hub waits 10 s by default (configurable per node) before it stops the process. Unacked events are delivered again later anyway, so it's better to stop than to overrun: a consumer holding an event it can't finish soon (e.g. waiting for something outside to take it) SHOULD `NACK` it with `retry` instead of waiting. Then it sends `EXIT` with a code (`OK`, `INTERRUPTED` or `ERROR`) and exits. The hub keeps reading the connection until the plugin closes it or its grace period runs out, and events that arrive meanwhile are still routed.
 
 An `EXIT` the hub didn't ask for means the plugin is stopping on its own. The hub relaunches a local plugin after a delay, and waits for a remote one to reconnect.
 

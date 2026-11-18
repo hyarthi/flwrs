@@ -1,0 +1,406 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "ack_mode": {
+      "default": "delivered",
+      "description": "delivered: an event is acked once a subscriber's connection took it; while nobody does, it waits (unacked, so the rest wait in the node's queue, durable if it is). buffered: once it's in the channel's replay ring (faster; with nobody subscribed it's only kept for replay).",
+      "enum": [
+        "delivered",
+        "buffered"
+      ],
+      "title": "Ack",
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-order": 50
+    },
+    "allowed_channels": {
+      "description": "The channel names events and subscribers may use, as patterns (* within a /-separated segment, ** across). Empty: any name.",
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Allowed channels",
+      "type": "array",
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-launch": {
+        "via": "file"
+      },
+      "x-flwrs-order": 55
+    },
+    "allowed_origins": {
+      "description": "The Origins browsers may subscribe from (e.g. https://app.example.com), or [\"*\"] for any. Empty: no CORS headers (same-origin pages and non-browser clients only).",
+      "items": {
+        "type": "string"
+      },
+      "title": "Allowed origins (CORS)",
+      "type": "array",
+      "x-flwrs-launch": {
+        "via": "file"
+      },
+      "x-flwrs-order": 7
+    },
+    "api_key_in": {
+      "default": "header",
+      "enum": [
+        "header",
+        "query"
+      ],
+      "title": "API key in",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 104
+    },
+    "api_key_name": {
+      "default": "x-api-key",
+      "minLength": 1,
+      "title": "API key name",
+      "type": "string",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 103
+    },
+    "auth": {
+      "description": "none, bearer (Authorization: Bearer <token>), api_key (a header or query parameter) or mtls (client certificates).",
+      "enum": [
+        "none",
+        "bearer",
+        "api_key",
+        "mtls"
+      ],
+      "title": "Authentication",
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 101
+    },
+    "auth_secrets": {
+      "additionalProperties": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "description": "bearer and api_key: {\"label\": \"secret\"}. The label of the one a request used becomes its event's principal.",
+      "title": "Tokens / keys",
+      "type": "object",
+      "writeOnly": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-launch": {
+        "via": "file"
+      },
+      "x-flwrs-order": 102
+    },
+    "base_path": {
+      "default": "",
+      "description": "A prefix for the routes: <base>/subscribe/{channel} (SSE) and <base>/poll/{channel} (long polling).",
+      "title": "Base path",
+      "type": "string",
+      "x-flwrs-order": 1
+    },
+    "default_channel": {
+      "default": "default",
+      "description": "The channel of events without one.",
+      "minLength": 1,
+      "title": "Default channel",
+      "type": "string",
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-order": 56
+    },
+    "delivery_timeout_ms": {
+      "default": 0,
+      "description": "delivered: how long an event waits for a subscriber before it's refused (retryable: the hub delivers it again, up to the node's delivery.max_attempts). 0: as long as it takes.",
+      "minimum": 0,
+      "title": "Delivery timeout (ms)",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-order": 51
+    },
+    "h2c": {
+      "default": false,
+      "description": "Without TLS: accept HTTP/2 with prior knowledge besides HTTP/1.1.",
+      "title": "Cleartext HTTP/2",
+      "type": "boolean",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 114
+    },
+    "header_allowlist": {
+      "description": "The only request headers events carry (wins over the denylist).",
+      "items": {
+        "type": "string"
+      },
+      "title": "Header allowlist",
+      "type": "array",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 123
+    },
+    "header_denylist": {
+      "description": "Request headers events never carry. Default: authorization, proxy-authorization, cookie, set-cookie, x-api-key (and the API key's header).",
+      "items": {
+        "type": "string"
+      },
+      "title": "Header denylist",
+      "type": "array",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 124
+    },
+    "health_path": {
+      "default": "/healthz",
+      "title": "Liveness path",
+      "type": "string",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 121
+    },
+    "heartbeat_s": {
+      "default": 15,
+      "description": "A comment line this often keeps proxies from closing idle streams.",
+      "minimum": 1,
+      "title": "SSE keep-alive (s)",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 3
+    },
+    "limits": {
+      "additionalProperties": false,
+      "properties": {
+        "h2_max_send_buf_bytes": {
+          "default": 4096,
+          "description": "HTTP/2: what one stream may have waiting to be sent before its writer waits. Memory per stream with slow readers (e.g. SSE subscribers): with 1 000 HTTP/2 SSE subscribers, 4 KiB gave ~3x the throughput and a fifth of the memory of 64 KiB, at ~10 % less for a single fast stream.",
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "h2_max_streams": {
+          "default": 128,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "header_read_timeout_ms": {
+          "default": 10000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_body_bytes": {
+          "default": 1048576,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_concurrent_requests": {
+          "default": 256,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_connections": {
+          "default": 1024,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_header_bytes": {
+          "default": 16384,
+          "minimum": 8192,
+          "type": "integer"
+        },
+        "request_timeout_ms": {
+          "default": 30000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "title": "Limits",
+      "type": "object",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 120
+    },
+    "listen": {
+      "default": "127.0.0.1:8080",
+      "description": "Address and port. Anything but loopback needs auth (or auth: none set explicitly).",
+      "title": "Listen on",
+      "type": "string",
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 100
+    },
+    "max_channels": {
+      "default": 256,
+      "minimum": 1,
+      "title": "Max channels",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-order": 57
+    },
+    "max_in_flight": {
+      "default": 64,
+      "description": "Events handled at once (with ack_mode delivered: waiting for a subscriber at once); the hub holds the rest.",
+      "minimum": 1,
+      "title": "Events in flight",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 8
+    },
+    "max_subscribers": {
+      "default": 10000,
+      "description": "In all (waiting long polls included); more are refused with 503.",
+      "minimum": 1,
+      "title": "Max subscribers",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-order": 58
+    },
+    "max_subscribers_per_channel": {
+      "default": 1000,
+      "minimum": 1,
+      "title": "Max subscribers per channel",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-order": 59
+    },
+    "mtls_allow": {
+      "additionalProperties": false,
+      "description": "mtls: SHA-256 fingerprints or names (SAN DNS / URI, or CN). Empty: any certificate the client CA signed.",
+      "properties": {
+        "fingerprints": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "names": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "title": "Allowed client certificates",
+      "type": "object",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 105
+    },
+    "poll_max_events": {
+      "default": 100,
+      "description": "Most events in one answer (a request's max is capped by it).",
+      "minimum": 1,
+      "title": "Long poll: most events",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 5
+    },
+    "poll_max_wait_s": {
+      "default": 25,
+      "description": "Longest a poll waits for an event (a request's wait_s is capped by it); shorter than limits.request_timeout_ms.",
+      "minimum": 1,
+      "title": "Long poll: longest wait (s)",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 6
+    },
+    "ready_path": {
+      "default": "/readyz",
+      "title": "Readiness path",
+      "type": "string",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 122
+    },
+    "replay_bytes": {
+      "default": 8388608,
+      "description": "Bytes of data kept per channel; a larger event is refused.",
+      "minimum": 1,
+      "title": "Replay bytes",
+      "type": "integer",
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-order": 53
+    },
+    "replay_events": {
+      "default": 1000,
+      "description": "Events kept per channel, for subscribers resuming from an id and for slow readers.",
+      "minimum": 1,
+      "title": "Replay events",
+      "type": "integer",
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-order": 52
+    },
+    "retry_ms": {
+      "default": 3000,
+      "description": "How long clients (EventSource) wait before reconnecting.",
+      "minimum": 0,
+      "title": "SSE retry hint (ms)",
+      "type": "integer",
+      "x-flwrs-advanced": true,
+      "x-flwrs-order": 4
+    },
+    "slow_policy": {
+      "default": "disconnect",
+      "description": "A subscriber that falls behind the replay ring: disconnect it, or skip it ahead to the oldest kept event after a gap marker.",
+      "enum": [
+        "disconnect",
+        "skip"
+      ],
+      "title": "Slow subscribers",
+      "x-flwrs-group": "Broadcast",
+      "x-flwrs-order": 54
+    },
+    "sse_format": {
+      "default": "raw",
+      "description": "raw: the data as data: lines (non-UTF-8 data as base64, with an encoding: base64 line). json: one line with a JSON envelope {id, event, content_type, data, encoding?}, as long polls answer.",
+      "enum": [
+        "raw",
+        "json"
+      ],
+      "title": "SSE data",
+      "x-flwrs-order": 2
+    },
+    "tls_cert": {
+      "description": "Uploaded PEM file: the server's certificate chain. Turns TLS on (HTTP/2 and HTTP/1.1 by ALPN).",
+      "title": "TLS certificate",
+      "type": "string",
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-launch": {
+        "source": "upload",
+        "via": "file"
+      },
+      "x-flwrs-order": 110
+    },
+    "tls_client_auth": {
+      "description": "With a client CA: optional or required (required for auth: mtls).",
+      "enum": [
+        "optional",
+        "required"
+      ],
+      "title": "Client certificates",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-order": 113
+    },
+    "tls_client_ca": {
+      "description": "Uploaded PEM file: the CA(s) of client certificates (mTLS).",
+      "title": "Client CA",
+      "type": "string",
+      "x-flwrs-advanced": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-launch": {
+        "source": "upload",
+        "via": "file"
+      },
+      "x-flwrs-order": 112
+    },
+    "tls_key": {
+      "description": "Uploaded PEM file: the server's private key.",
+      "title": "TLS key",
+      "type": "string",
+      "writeOnly": true,
+      "x-flwrs-group": "HTTP server",
+      "x-flwrs-launch": {
+        "source": "upload",
+        "via": "file"
+      },
+      "x-flwrs-order": 111
+    }
+  },
+  "title": "HTTP push sink settings",
+  "type": "object"
+}

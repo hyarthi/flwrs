@@ -1,0 +1,11 @@
+# TLS (rustls, ring): 32 keep-alive HTTP/1.1 connections POST typed JSON bodies back to back (tests/bench.rs); compare with 1_confirmed_max for the encryption overhead.
+name = "confirmed, HTTP/1.1 + TLS, max load"
+launch_args = "confirmed_tls.json"
+credit_window = 64
+calibrate = false
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"

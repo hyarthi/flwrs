@@ -1,6 +1,6 @@
 [package]
 name = "flwrs-plugin-kit"
-description = "Shared code for flwrs' own plugins: the HTTP server core (TLS / mTLS, HTTP/1.1 and HTTP/2, limits, health, inbound auth, header policy)."
+description = "Shared code for flwrs' own plugins: the HTTP server core (TLS / mTLS, HTTP/1.1 and HTTP/2, limits, health, inbound auth, header policy), JSON Schema in API documents, and the push sinks' broadcast core."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -27,6 +27,8 @@ serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
 jsonschema.workspace = true # validators inside OpenAPI / AsyncAPI documents
+flwrs-types.workspace = true # payloads → broadcast messages
+base64.workspace = true # binary data in JSON envelopes
 
 [dev-dependencies]
 axum = { workspace = true, features = ["ws"] } # a WebSocket route through the core

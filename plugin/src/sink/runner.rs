@@ -149,6 +149,7 @@ async fn serve<T: Sink>(
                 Some(Incoming::Event(event)) => waiting.push_back(event),
                 Some(Incoming::Shutdown(shutdown)) => {
                     log::debug!("Received shutdown message");
+                    plugin.shutdown_started();
                     // Finish what was received before the shutdown.
                     loop {
                         while running.len() < max_concurrent

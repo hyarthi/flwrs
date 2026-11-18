@@ -14,6 +14,15 @@ pub trait Sink {
 
     fn shutdown(&mut self) -> Result<(), ShutdownError>;
 
+    /// Called once when the hub's `Shutdown` arrives, before the runner
+    /// finishes the events it has (then [`Sink::shutdown`] follows). A sink
+    /// whose `consume_event` can wait a long time (e.g. for a subscriber to
+    /// take the event) should make those calls return soon, e.g. with a
+    /// retryable error: the hub delivers the events again on the next run,
+    /// and the stop isn't held up until the hub's grace period runs out.
+    /// The default does nothing.
+    fn shutdown_started(&self) {}
+
     fn version(&self) -> String;
 
     /// Handles one event. The event is acknowledged to the hub when the

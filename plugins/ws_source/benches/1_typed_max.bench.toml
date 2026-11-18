@@ -1,0 +1,11 @@
+# 32 connections send JSON readings back to back (tests/bench.rs); each is matched against the channel's messages and typed. Events/s against a credit window of 64.
+name = "typed (AsyncAPI), max load"
+launch_args = "typed.json"
+credit_window = 64
+calibrate = false
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"

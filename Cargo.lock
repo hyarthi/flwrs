@@ -1265,6 +1265,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "flwrs-http-push-sink"
+version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "bytes",
+ "clap",
+ "flwrs-plugin",
+ "flwrs-plugin-kit",
+ "flwrs-trellis",
+ "futures-util",
+ "http-body-util",
+ "hyper 1.12.0",
+ "hyper-util",
+ "log",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "flwrs-http-sink"
 version = "0.0.1"
 dependencies = [
@@ -1283,20 +1307,27 @@ name = "flwrs-http-source"
 version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
+ "bytes",
  "clap",
  "flwrs-plugin",
  "flwrs-plugin-kit",
  "flwrs-trellis",
  "flwrs-types",
+ "http-body-util",
+ "hyper 1.12.0",
+ "hyper-util",
  "jsonschema",
  "log",
  "oas3",
  "pbjson-types",
+ "rcgen",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "utoipa-swagger-ui",
  "yaml_serde",
 ]
@@ -1376,8 +1407,10 @@ name = "flwrs-plugin-kit"
 version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
+ "base64 0.22.1",
  "clap",
  "flwrs-plugin",
+ "flwrs-types",
  "futures-util",
  "hyper 1.12.0",
  "hyper-util",
@@ -1466,6 +1499,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "flwrs-ws-push-sink"
+version = "0.0.1"
+dependencies = [
+ "axum 0.8.9",
+ "bytes",
+ "clap",
+ "flwrs-plugin",
+ "flwrs-plugin-kit",
+ "flwrs-trellis",
+ "futures-util",
+ "log",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.30.0",
+]
+
+[[package]]
 name = "flwrs-ws-sink"
 version = "0.0.1"
 dependencies = [
@@ -1500,11 +1555,14 @@ dependencies = [
  "jsonschema",
  "log",
  "pbjson-types",
+ "rcgen",
  "roas-asyncapi",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "ulid",
  "yaml_serde",

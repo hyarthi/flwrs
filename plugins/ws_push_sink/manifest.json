@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "id": "ws-push-sink",
+  "name": "WebSocket push sink",
+  "version": "0.0.1",
+  "type": "SINK",
+  "description": "A WebSocket server broadcasting events to connected clients, with replay.",
+  "executable": "bin/flwrs-ws-push-sink",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "payload_schemas": {
+    "in": "schema/in.json"
+  },
+  "ui": {
+    "icon": "ui/ws-push-sink.svg",
+    "categories": ["Outputs", "WebSocket", "Streaming"],
+    "docs": "README.md"
+  }
+}

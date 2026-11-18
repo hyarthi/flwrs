@@ -211,8 +211,23 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A CORS preflight (`OPTIONS` with `Origin` and
+/// `Access-Control-Request-Method`): browsers send it without credentials.
+pub fn is_preflight(request: &Request) -> bool {
+    request.method() == axum::http::Method::OPTIONS
+        && request.headers().contains_key(header::ORIGIN)
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD)
+}
+
 /// The middleware: refuses with 401 / 403, or adds the [`Principal`].
+/// CORS preflights pass without auth (they never carry credentials); a
+/// plugin that doesn't answer them gives 405.
 pub async fn layer(auth: Arc<Auth>, mut request: Request, next: Next) -> Response {
+    if is_preflight(&request) {
+        return next.run(request).await;
+    }
     let authorization = request
         .headers()
         .get(header::AUTHORIZATION)

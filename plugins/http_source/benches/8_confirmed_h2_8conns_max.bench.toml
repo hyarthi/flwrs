@@ -1,0 +1,11 @@
+# HTTP/2 (h2c) over 8 connections × 4 streams: the same 32 requests in flight as 1_confirmed_max (32 HTTP/1.1 connections), spread like them over the server's connection tasks.
+name = "confirmed, HTTP/2 (8 connections × 4 streams), max load"
+launch_args = "confirmed_h2.json"
+credit_window = 64
+calibrate = false
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"

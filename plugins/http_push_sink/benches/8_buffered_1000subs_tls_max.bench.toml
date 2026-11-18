@@ -1,0 +1,11 @@
+# TLS: 1000 SSE subscribers read every event (slow_policy skip); compare with 3_buffered_1000subs_max.
+name = "buffered, 1000 subscribers, TLS, max load"
+launch_args = "fanout_tls.json"
+payloads = ["payloads/small.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"
+in_flight = 64

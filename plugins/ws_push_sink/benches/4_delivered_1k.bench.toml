@@ -1,0 +1,11 @@
+# A steady 1000 events/s, each acked once the WebSocket client took it.
+name = "delivered, 1 subscriber, steady 1000/s"
+launch_args = "delivered.json"
+payloads = ["payloads/small.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "open"
+rate = 1000

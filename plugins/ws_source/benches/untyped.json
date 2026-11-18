@@ -1,0 +1,7 @@
+{
+  "listen": "127.0.0.1:${ws}",
+  "paths": [
+    "/devices/d1"
+  ],
+  "enqueue_timeout_ms": 30000
+}

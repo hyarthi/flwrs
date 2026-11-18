@@ -133,6 +133,13 @@
     "limits": {
       "additionalProperties": false,
       "properties": {
+        "h2_max_send_buf_bytes": {
+          "default": 4096,
+          "description": "HTTP/2: what one stream may have waiting to be sent before its writer waits. Memory per stream with slow readers (e.g. SSE subscribers): with 1 000 HTTP/2 SSE subscribers, 4 KiB gave ~3x the throughput and a fifth of the memory of 64 KiB, at ~10 % less for a single fast stream.",
+          "maximum": 4294967295,
+          "minimum": 1,
+          "type": "integer"
+        },
         "h2_max_streams": {
           "default": 128,
           "minimum": 1,

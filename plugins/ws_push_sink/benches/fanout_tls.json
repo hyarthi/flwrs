@@ -1,0 +1,11 @@
+{
+  "listen": "127.0.0.1:${http}",
+  "limits": {
+    "max_connections": 4096,
+    "max_concurrent_requests": 4096
+  },
+  "ack_mode": "buffered",
+  "slow_policy": "skip",
+  "tls_cert": "server.pem",
+  "tls_key": "server.key"
+}

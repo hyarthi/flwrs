@@ -22,6 +22,8 @@ struct Counters {
     shut_down: AtomicUsize,
     /// "slow" events wait for this.
     gate: tokio::sync::Notify,
+    /// "held" events wait for the shutdown hint.
+    stopping: tokio::sync::Notify,
 }
 
 /// Accepts events whose `text` field is "ok"; "bad" fails for good, "later"
@@ -46,6 +48,9 @@ impl Sink for TestSink {
     fn version(&self) -> String {
         "1".into()
     }
+    fn shutdown_started(&self) {
+        self.0.stopping.notify_one();
+    }
     async fn consume_event(&self, event: InboundEvent) -> Result<(), SinkError> {
         let text = match event.payload.fields.first().and_then(|f| f.value.clone()) {
             Some(value) => match value.value {
@@ -57,6 +62,10 @@ impl Sink for TestSink {
         match text.as_str() {
             "bad" => Err(SinkError::new("bad event")),
             "later" => Err(SinkError::retryable("try again later")),
+            "held" => {
+                self.0.stopping.notified().await;
+                Err(SinkError::retryable("stopping"))
+            }
             "slow" => {
                 self.0.gate.notified().await;
                 self.0.seen.lock().unwrap().push(event);
@@ -206,6 +215,27 @@ async fn concurrent_events_are_acked_as_they_finish_and_drained_on_shutdown() {
     expect_exit_ok(&mut hub).await;
     common::finished(runner).await.unwrap();
     assert_eq!(counters.seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn the_shutdown_hint_lets_a_waiting_sink_give_up() {
+    let _serial = SERIAL.lock().await;
+    let (listener, port) = listen().await;
+    let counters = Arc::new(Counters::default());
+    let runner = start(port, counters.clone());
+
+    let (mut hub, _) = FakeHub::handshake(&listener).await;
+    hub.accept_plugin(&[Capability::Acks], 0).await;
+    hub.send_event(payload(vec![text("text", "held")]), None)
+        .await;
+    hub.expect_quiet(Duration::from_millis(200)).await;
+    // The hint ends the wait: a retryable NACK, then the Exit.
+    hub.shutdown("").await;
+    let nack: Nack = hub.expect().await;
+    assert!(nack.retry);
+    expect_exit_ok(&mut hub).await;
+    common::finished(runner).await.unwrap();
+    assert_eq!(counters.shut_down.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

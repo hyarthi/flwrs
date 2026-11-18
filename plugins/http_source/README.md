@@ -22,7 +22,7 @@ From `flwrs-plugin-kit`'s server core:
 - `listen` (`127.0.0.1:8080`). **A listener on anything but loopback refuses to start without `auth`**, unless `auth: none` is set explicitly (then it starts with a WARN).
 - `auth`: `none`, `bearer` (`Authorization: Bearer <token>`), `api_key` (`api_key_name` in a header or the query, `api_key_in`) or `mtls` (client certificates from `tls_client_ca`, optionally limited by `mtls_allow` fingerprints or names). Tokens and keys are `auth_secrets` (a secret): `{"label": "secret"}`; a request's event gets the label as its `principal`, never the secret.
 - TLS: `tls_cert`, `tls_key` (a secret), `tls_client_ca`, `tls_client_auth` (uploaded PEM files). HTTP/2 and HTTP/1.1 by ALPN; `h2c` for cleartext HTTP/2.
-- `limits`: `max_body_bytes` (1 MiB, 413), `max_header_bytes`, `request_timeout_ms` (30 s), `header_read_timeout_ms` (10 s), `max_connections`, `max_concurrent_requests` (503), `h2_max_streams`.
+- `limits`: `max_body_bytes` (1 MiB, 413), `max_header_bytes`, `request_timeout_ms` (30 s), `header_read_timeout_ms` (10 s), `max_connections`, `max_concurrent_requests` (503), `h2_max_streams`, `h2_max_send_buf_bytes` (4 KiB: what one HTTP/2 stream may have queued before its writer waits; hyper's own default, ~400 KiB, is per slow SSE subscriber).
 - `/healthz` (200 while it runs) and `/readyz` (200 while it's connected to the hub with credit to send, else 503), without auth; `health_path` / `ready_path` move them.
 - `header_allowlist` / `header_denylist`: which request headers events carry (by default everything but credentials and hop-by-hop headers).
 
@@ -74,6 +74,27 @@ Ignored, with a warning: webhooks and callbacks (requests the API would send), s
 - `confirmed` (default): 2xx after the hub took the event (for a durable queue: committed). A client that retries 5xx and timeouts gets at-least-once delivery; duplicates are possible (a retry after a lost answer).
 - Backpressure is HTTP: when the workflow is slow, requests wait up to `enqueue_timeout_ms`, then get 503 with `Retry-After`; `/readyz` turns 503 too, so a load balancer can steer away.
 - Shutdown: the server stops accepting, requests in progress get 5 s to finish (their events still go out).
+
+## Footprint
+
+Measured with `cargo test --release -p flwrs-http-source --test bench -- --ignored --nocapture` (`benches/`, `tests/bench.rs`: keep-alive HTTP/1.1 and hyper HTTP/2 clients in the test process; CPU and memory are the plugin's alone) on an Apple M2 (macOS), median of three 5-second runs. At a steady rate, latency counts from when the harness woke for each send (its own timer lateness, ~0.22 ms, is reported apart). CPU per event = CPU time ÷ events. Max load: 32 requests in flight (typed JSON bodies on `/devices/{id}`, validated), counted against a credit window of 64. TLS is rustls with ring (TLS 1.3, AES-GCM), with a self-signed certificate uploaded as the node's `tls_cert` / `tls_key`; connections stay open, so handshakes aren't in these numbers (each new connection costs one).
+
+| Scenario | Events/s | CPU | CPU per event | RSS |
+|---|---|---|---|---|
+| `confirmed`, HTTP/1.1 (32 connections), max load | ~41 900 | ~158 % | ~38 µs | ~18 MiB |
+| `accepted`, HTTP/1.1, max load | ~35 400 | ~132 % | ~37 µs | ~18 MiB |
+| `confirmed`, HTTP/1.1 + TLS, max load | ~44 500 | ~166 % | ~37 µs | ~20 MiB |
+| `confirmed`, HTTP/2 h2c (1 connection, 32 streams) | ~29 100 | ~131 % | ~45 µs | ~19 MiB |
+| `accepted`, HTTP/2 h2c (1 connection, 32 streams) | ~30 900 | ~135 % | ~44 µs | ~19 MiB |
+| `confirmed`, HTTP/2 h2c (8 connections × 4 streams) | ~32 600 | ~150 % | ~46 µs | ~19 MiB |
+| `confirmed`, HTTP/2 + TLS (1 connection, 32 streams) | ~31 000 | ~146 % | ~47 µs | ~20 MiB |
+| `confirmed`, steady 1 000/s (request → event): p50 / p99 0.15 / 0.23 ms | 1 000 | ~5 % | | ~15 MiB |
+
+- **TLS** costs no measurable CPU per event at these sizes (hardware AES; rustls also gathers small writes into records, saving syscalls), ~2 MiB more memory.
+- **HTTP/2** does more work per request than HTTP/1.1 (frames, HPACK, flow control, stream state: ~45 vs ~38 µs), and one connection's requests go through one connection task on each side. Its gain is fewer connections, not speed per request: keep-alive HTTP/1.1 already avoids reconnects.
+- `accepted` is below `confirmed`: its clients outrun the credit window and take turns at it (since flwrs-plugin 0.0.8 in order, longest-waiting first; before, every grant woke every waiting request: ~20 100/s).
+
+Binary 22 MB (jsonschema, the OpenAPI parser and Swagger UI's assets), package 8.3 MB (with the configurator).
 
 ## Tests
 

@@ -1,0 +1,11 @@
+{
+  "listen": "127.0.0.1:${http}",
+  "ack_mode": "buffered",
+  "frame": "envelope",
+  "replay_events": 3,
+  "allowed_channels": ["feed", "bin"],
+  "default_channel": "feed",
+  "allowed_origins": ["https://app.example.com"],
+  "auth": "bearer",
+  "auth_secrets": { "test": "s3cret-token" }
+}

@@ -1,0 +1,40 @@
+# ack_mode buffered, envelope frames, a 3-event ring, bearer auth, one Origin. The
+# stimulus in tests/trellis.rs connects and checks what it gets.
+name = "buffered: envelopes, replay, gaps, refusals"
+launch_args = "buffered.json"
+
+[[steps]]
+wait_ms = 500
+
+[[steps]]
+send = "payloads/feed-one.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/feed-two.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/feed-three.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/feed-four.json"
+expect_ack = "ack"
+
+[[steps]]
+send = "payloads/bin.json"
+expect_ack = "ack"
+
+# Not an allowed channel: refused for good.
+[[steps]]
+send = "payloads/elsewhere.json"
+expect_ack = { nack = { retryable = false } }
+
+# Connections: no token (401), a stale id (gap + the ring), resuming,
+# binary data, a channel not allowed (404), an Origin not allowed (403).
+[[steps]]
+stimulus = true
+
+[[steps]]
+wait_ms = 1500

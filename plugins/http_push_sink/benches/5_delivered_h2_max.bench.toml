@@ -1,0 +1,11 @@
+# HTTP/2 (h2c): one SSE subscriber on its own stream takes each event, and its write acks it.
+name = "delivered, 1 subscriber, HTTP/2, max load"
+launch_args = "delivered_h2.json"
+payloads = ["payloads/small.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"
+in_flight = 64

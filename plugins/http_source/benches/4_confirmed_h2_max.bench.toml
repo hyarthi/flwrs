@@ -1,0 +1,11 @@
+# HTTP/2 (h2c): 32 concurrent streams over one connection POST typed JSON bodies back to back (tests/bench.rs). Events/s against a credit window of 64.
+name = "confirmed, HTTP/2 (1 connection, 32 streams), max load"
+launch_args = "confirmed_h2.json"
+credit_window = 64
+calibrate = false
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"

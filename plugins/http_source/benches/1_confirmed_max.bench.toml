@@ -1,0 +1,11 @@
+# 32 keep-alive connections POST typed JSON bodies as fast as they're answered (tests/bench.rs); each answered once the hub confirmed its event. Events/s against a credit window of 64.
+name = "confirmed, max load"
+launch_args = "confirmed.json"
+credit_window = 64
+calibrate = false
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"

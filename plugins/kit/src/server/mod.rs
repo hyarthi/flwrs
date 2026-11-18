@@ -25,7 +25,7 @@ mod tests;
 pub mod tls;
 
 pub use args::{Limits, ServerArgs, ServerSettings, schema_properties};
-pub use auth::{Auth, Principal, query_pairs};
+pub use auth::{Auth, Principal, is_preflight, query_pairs};
 pub use headers::{Filtered, HeaderPolicy};
 pub use tls::ClientCert;
 
@@ -208,6 +208,7 @@ fn protocols(settings: &ServerSettings) -> Protocols {
         .http2()
         .timer(TokioTimer::new())
         .max_concurrent_streams(settings.limits.h2_max_streams)
+        .max_send_buf_size(settings.limits.h2_max_send_buf_bytes)
         .max_header_list_size(settings.limits.max_header_bytes as u32)
         .keep_alive_interval(Some(Duration::from_secs(30)))
         .keep_alive_timeout(Duration::from_secs(20))

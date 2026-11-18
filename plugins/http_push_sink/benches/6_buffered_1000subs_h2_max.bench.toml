@@ -1,0 +1,11 @@
+# HTTP/2 (h2c): 1000 SSE streams multiplexed over 8 connections (125 each) read every event (slow_policy skip).
+name = "buffered, 1000 subscribers on 8 HTTP/2 connections, max load"
+launch_args = "fanout_h2.json"
+payloads = ["payloads/small.json"]
+warmup_ms = 1000
+duration_ms = 5000
+repetitions = 3
+
+[load]
+model = "closed"
+in_flight = 64

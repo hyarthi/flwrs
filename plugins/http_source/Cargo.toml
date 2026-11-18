@@ -40,6 +40,13 @@ pbjson-types.workspace = true
 utoipa-swagger-ui = { workspace = true, features = ["vendored"], optional = true }
 
 [dev-dependencies]
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+bytes.workspace = true
+hyper = { workspace = true, features = ["client", "http2"] } # benches: HTTP/2 clients
+hyper-util.workspace = true
+http-body-util.workspace = true
 flwrs-plugin = { workspace = true, features = ["cli", "tls", "package"] }
 flwrs-trellis.workspace = true
 reqwest.workspace = true
