@@ -4,9 +4,9 @@
   import { SvelteFlowProvider } from '@xyflow/svelte';
   import ArrowLeft from '@lucide/svelte/icons/arrow-left';
   import Page from '../components/Page.svelte';
-  import Placeholder from '../components/Placeholder.svelte';
+  import SceneStats from '../components/scene/SceneStats.svelte';
   import Tabs from '../components/Tabs.svelte';
-  import Modal from '../components/Modal.svelte';
+  import NodeModal from '../components/node/NodeModal.svelte';
   import Switch from '../components/Switch.svelte';
   import LayoutView from '../components/scene/LayoutView.svelte';
   import { ApiError } from '../lib/api';
@@ -18,7 +18,6 @@
   let { id, tab, nodeId }: { id: string; tab: 'layout' | 'stats'; nodeId?: string } = $props();
 
   const base = $derived(`/scenes/by-id/${encodeURIComponent(id)}`);
-  let nodeTab = $state('stats');
 
   // ---- live data ----
 
@@ -136,27 +135,13 @@
         <LayoutView {view} {status} />
       </SvelteFlowProvider>
     {:else}
-      <Placeholder
-        title="Stats"
-        items={['Per node: state, counters, queues, redeliveries, dead letters, link health', 'Live through the scene’s stream']}
-      />
+      <SceneStats {view} {status} />
     {/if}
   {/if}
 </Page>
 
-{#if nodeId}
-  <Modal title="Node" onclose={() => navigate(base)}>
-    <Tabs
-      tabs={[
-        { id: 'stats', label: 'Stats' },
-        { id: 'settings', label: 'Settings' },
-        { id: 'uploads', label: 'Uploads' },
-      ]}
-      active={nodeTab}
-      onselect={(t) => (nodeTab = t)}
-    />
-    <p class="muted">Node <code>{nodeId}</code>: {nodeTab} come here.</p>
-  </Modal>
+{#if nodeId && view}
+  <NodeModal {view} {status} {nodeId} onclose={() => navigate(base)} />
 {/if}
 
 <style>

@@ -81,4 +81,7 @@ message Edge {
   string target_key = 3;
   // The edge mapping as JSON text; unset = events pass through unchanged.
   optional string mapping_json = 4;
+  // The point the edge passes through in the editor's canvas (where its box
+  // sits); unset = the editor routes it.
+  optional Position via = 5;
 }

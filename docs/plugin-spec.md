@@ -64,14 +64,15 @@ The executable is made executable when the package is unpacked; other permission
 | `name`, `version` | yes | A display name, and a semantic version (`1.2.3`, optionally `-pre` / `+build`). The plugin MUST report this version in `Initialize`. |
 | `type` | yes | `SOURCE`, `SINK` or `TRANSFORM`. |
 | `description` | no | Free text. |
-| `executable` | yes | A path in the package: a native binary, or a script with a shebang. |
+| `launch` | no | `remote`: a **remote plugin definition** ([section 4.2](#42-remote-plugin-definitions)), a plugin that runs elsewhere and that the server only describes. Absent: the package has an executable, and its nodes may be local or remote. Version 2 only. |
+| `executable` | yes, unless `launch` is `remote` | A path in the package: a native binary, or a script with a shebang. A remote plugin definition has none. |
 | `platforms` | no | `<os>-<arch>` targets (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `windows-x86_64`, …). The upload fails on another platform. Omit it for packages that run anywhere. |
 | `launch_args_schema` | no | A JSON Schema (draft 2020-12) of a node's settings. External `$ref`s aren't resolved. |
 | `launch_args_style` | no | `flags` (default; a node's settings are a JSON object) or `positional` (a list of strings, passed as they are; no annotations). |
 | `payload_schemas` | by type | `in` for a SINK, `out` for a SOURCE, both for a TRANSFORM. Each is either a path to a `SchemaDefinition` in proto3 JSON (`{"fields": [{"key": "url", "type": "STRING"}]}`), or `{"from_launch_args": "<JSON pointer>", "default": "<path>"?}`: the node's own schema, from its settings ([section 3.5](#35-per-node-payload-schemas)). The plugin MUST declare exactly the schemas in effect in `Initialize`. |
 | `runtime_defaults` | no | Defaults for the node's runtime settings (timeouts, restarts, queue, delivery); same keys as a node's `config.runtime`. |
 | `threads` | no | How the plugin takes a **core count**: `{"via": "arg" \| "env", "name", "value"?}`, e.g. `{"via": "arg", "name": "threads"}` (the Rust SDK's `--threads`), `{"via": "env", "name": "GOMAXPROCS"}`, or `{"via": "env", "name": "JAVA_TOOL_OPTIONS", "value": "-XX:ActiveProcessorCount={n}"}` (`value` is a template, default `{n}`). See [section 5.5](#55-the-core-count). A name a launch arg also uses, a bootstrap argument, or an `FLWRS_*` variable is refused. |
-| `configurator` | no | `{"executable", "fields"}`: a program in the package that sets some of a node's settings from its others, e.g. an out schema derived from an OpenAPI document ([section 3.6](#36-configured-settings-the-configurator)). Version 2 only. |
+| `configurator` | no | `{"executable", "fields"}`: a program in the package that sets some of a node's settings from its others, e.g. an out schema derived from an OpenAPI document ([section 3.6](#36-configured-settings-the-configurator)). A remote plugin definition gives only `fields` (its nodes' endpoints run it, [section 4.1](#41-configuring-a-remote-node)). Version 2 only. |
 | `ui` | no | How a UI presents the plugin: `icon` (an `.svg` or `.png` in the package), `categories` (free tags, 1 to 64 characters, no duplicates), `color` (`#RRGGBB`), `docs` (a Markdown file in the package). |
 | `x-…` | no | Top-level fields starting with `x-` are ignored, with a warning at upload. Any other unknown field is an error. |
 
@@ -213,6 +214,14 @@ A remote node whose plugin has a configurator can name an **endpoint** on the re
 Any other status, `errors`, or a file that can't be downloaded refuses the change; the user sees the errors (or the status and the start of the body). The server sends nothing else to the endpoint and follows no redirects; the request has `[plugins] configure_timeout_ms` to finish, the answer may hold at most `configure_max_response_bytes`, each file `[scenes] max_upload_bytes`, and every URL (the endpoint's and the files') must be within `remote_configurator_urls`.
 
 **When it runs:** as for a local node: when the node's settings, its endpoint (`url`, `send_secrets`) or the plugin's version change (a changed password or token alone doesn't), when a file its settings name is replaced, on a plugin upgrade, and on `POST …/configure`. While a file it needs is missing (a named upload, or the endpoint's CA, certificate or key: a new node has no uploads yet), it waits, and the server's check lists the node. An endpoint that can't be reached refuses the change like any other failure: it likely means the remote node can't be reached either. The plugin is started with the bootstrap arguments of [section 5.1](#51-the-command-line) pointing at the hub's reachable address, and authenticates with the node's pre-shared token or a client certificate ([protocol section 14](protocol.md#14-security)).
+
+### 4.2 Remote plugin definitions
+
+A plugin that only ever runs elsewhere doesn't need its program on the server: a **remote plugin definition** describes it, so its nodes can be placed, wired, mapped and checked, and the hub can check its `Initialize`. It's a package whose manifest says `"launch": "remote"` and has no `executable`, `platforms`, `threads` or configurator program (a `configurator` gives only its `fields`); everything else (type, payload schemas, the launch-args schema, `runtime_defaults`, `ui`) is as for any package, with the files it references. Nothing in it runs on the server, and nothing is deployed to the remote side.
+
+- Its nodes must be remote (`launch = "remote"`): a local one is refused when saved and listed by the server's check.
+- It's registered like a package (`POST /api/plugins` with a ZIP, which needs `[plugins] allow_upload` as any upload does; `flwrs-trellis package` builds one without a build step) or from JSON, the manifest and its files without a ZIP (`POST /api/plugins/remote`, which the web UI's remote plugin wizard uses). Upgrades and deletes are as for packages; `GET /api/plugins/by-id/{id}/export` gives a registered definition back as a package ZIP, to install on another server.
+- `flwrs-trellis audit`, `test` and `bench` check the plugin that will connect: `[remote]` in `trellis.toml` gives the commands that make it start or connect to trellis's hub, and its configurator endpoint ([trellis](../trellis/README.md#remote-plugins)).
 
 ## 5. Launching a local plugin
 

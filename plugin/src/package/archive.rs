@@ -104,6 +104,7 @@ pub fn extract_and_validate(
     if let Some(c) = &package.manifest.configurator {
         executables.push(c.executable.as_str());
     }
+    executables.retain(|e| !e.is_empty()); // a remote plugin definition
     extract(&mut archive, &entries, dest, limits, &executables)?;
     Ok(package)
 }

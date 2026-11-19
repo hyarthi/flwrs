@@ -31,6 +31,7 @@ How the plugin is built depends on what its folder contains:
 - **A Rust crate** (`Cargo.toml`): `cargo build` (release unless `--debug`). The crate's version must equal `manifest.json`'s, and the manifest's `platforms` becomes the build's platform.
 - **A `[build]` section in `trellis.toml`**: its command runs, and its `executable` goes into the package. The command gets `TRELLIS_PROFILE`, `TRELLIS_FLAVOR` and `TRELLIS_TARGET` in its environment.
 - **Neither**: the manifest's executable goes in as it is, e.g. a script.
+- **A remote plugin definition** (`"launch": "remote"` in the manifest: a plugin that runs elsewhere, which the server only describes): nothing is built. The package holds the manifest and its files, without an executable or a platform (`<id>-<version>.zip`), and the server takes it like any package.
 
 The package holds the manifest, the executable (mode 0755), the files the manifest references, and the `[package] include` patterns. It's reproducible: the same input gives the same bytes.
 
@@ -60,6 +61,35 @@ The cases:
 | `stops-when-rejected` | `SHUTDOWN` instead of `InitializeResponse`: exits, no reconnect |
 | `reconnects` | after a dropped connection: reconnects with the same `Initialize` |
 | `closes-on-violation` | a frame with an unknown framing version closes the connection |
+
+### Remote plugins
+
+A plugin that runs elsewhere (a remote plugin definition, or any plugin checked as a remote node) isn't started by trellis. `[remote]` in `trellis.toml` says how it's made to connect, and where its configurator endpoint is ([plugin spec §4.1](../docs/plugin-spec.md#41-configuring-a-remote-node)):
+
+```toml
+[remote]
+start = ["ssh", "edge-1", "systemctl start my-plugin@${hub_host}:${hub_port}"]   # starts it, or makes it connect
+stop = ["ssh", "edge-1", "systemctl stop my-plugin@${hub_host}:${hub_port}"]     # optional: after each case, before a restart
+host = "0.0.0.0"          # where trellis's hub listens (default 127.0.0.1)
+port = 7401               # its port (default: a free one)
+advertise = "10.0.0.5"    # the hub address the plugin is given (default: host; loopback for 0.0.0.0)
+id = "edge-1-sensor"      # the instance id it declares (its remote_id), if fixed
+token = "${env:EDGE_TOKEN}"  # its pre-shared token, if fixed (default: a fresh one per start)
+
+[remote.configurator]
+url = "https://edge-1:9443/configure"
+auth = { type = "bearer", token = "${env:CONFIG_TOKEN}" }   # or basic (username, password), or mtls (cert, key: PEM files)
+ca = "certs/edge-ca.pem"  # default: the bundled Mozilla roots
+send_secrets = false
+```
+
+- `start` and `stop` get `${hub_host}`, `${hub_port}`, `${id}`, `${token}` and `${log_level}`, and the token in `FLWRS_TOKEN`. `start` may keep running (a wrapper running the plugin, stopped when the case ends) or exit once the plugin is on its way. `${env:NAME}` anywhere in the section is an environment variable, to keep secrets out of the file.
+- Its **launch args** aren't delivered (the server never delivers a remote node's): they only set the node's own payload schemas, and are checked only for those.
+- Its **configurator** runs at the endpoint, called as the server calls it: the request with `config/`'s files inline, the answer checked like a local configurator's, returned files downloaded with the same credentials. `configure`, `*.configure.toml` files and `--launch-args` all go through it.
+- The process can't be watched from here, so `shuts-down` checks that the connection closes after `EXIT`, and `stops-when-rejected` that it closes and doesn't come back. `restart` steps in test files run `stop`, then `start`. Bench reports the start command's CPU and memory, not the plugin's (with a warning).
+- `--executable <program>` runs a local stand-in instead (with the bootstrap arguments, in an empty folder; `[remote] start` doesn't apply). In a definition's folder without `[remote] start`, a `[build]` section or a `Cargo.toml` builds one for the checks (it isn't packaged).
+
+In Rust: `Target::with_remote(RemoteLaunch { … })`.
 
 A source that only emits when something outside happens (an HTTP request, an MQTT message) needs a **stimulus**, otherwise `data-events` is skipped. Set one in `trellis.toml` (`[audit] stimulus`) or, in Rust, pass one to `Audit::stimulus`.
 

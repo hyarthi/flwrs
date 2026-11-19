@@ -4,11 +4,13 @@
 pub(crate) mod api;
 pub(crate) mod api_draft;
 pub(crate) mod api_graph;
+pub(crate) mod api_mapping;
 pub(crate) mod api_scene_stream;
 pub(crate) mod api_status;
 pub(crate) mod api_stream;
 pub(crate) mod api_transfer;
 pub(crate) mod api_uploads;
+pub(crate) mod api_usage;
 pub(crate) mod archive;
 pub(crate) mod config;
 pub(crate) mod graph;

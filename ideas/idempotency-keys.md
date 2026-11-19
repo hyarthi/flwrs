@@ -1,6 +1,6 @@
 # Idea: idempotency keys for inbound requests
 
-Status: idea, not scheduled (plugins plan §4.2).
+Status: idea, not scheduled.
 
 ## Problem
 

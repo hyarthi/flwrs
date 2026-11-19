@@ -312,6 +312,13 @@ impl Supervisor {
                         self.spec.plugin_id,
                         process.pid().map_or("?".into(), |p| p.to_string())
                     );
+                    self.note(
+                        log::Level::Info,
+                        format!(
+                            "started (pid {})",
+                            process.pid().map_or("?".into(), |p| p.to_string())
+                        ),
+                    );
                     self.update(|s| s.pid = process.pid());
                     (self.until_running(&mut process).await, Some(process))
                 }
@@ -338,6 +345,7 @@ impl Supervisor {
                         }
                         Ending::Exited(reason) => {
                             log::warn!("{} {reason}; relaunching", self.tag);
+                            self.note(log::Level::Warn, format!("{reason}; relaunching"));
                             self.update(|s| s.last_error = Some(reason));
                             if let Some(process) = process.as_mut()
                                 && process.wait_for(timings.kill_grace).await.is_none()
@@ -347,6 +355,7 @@ impl Supervisor {
                         }
                         Ending::Lost(reason) => {
                             log::warn!("{} {reason}; relaunching", self.tag);
+                            self.note(log::Level::Warn, format!("{reason}; relaunching"));
                             self.update(|s| s.last_error = Some(reason));
                             if let Some(process) = process.as_mut() {
                                 process.terminate(timings.kill_grace).await;
@@ -363,6 +372,13 @@ impl Supervisor {
                         "{} unhealthy after {} ms: {reason}",
                         self.tag,
                         started.elapsed().as_millis()
+                    );
+                    self.note(
+                        log::Level::Warn,
+                        format!(
+                            "unhealthy after {} ms: {reason}",
+                            started.elapsed().as_millis()
+                        ),
                     );
                     if let Some(process) = process.as_mut() {
                         process.terminate(timings.kill_grace).await;
@@ -510,15 +526,31 @@ impl Supervisor {
             }
         }
         log::info!("{} stopped", self.tag);
+        self.note(log::Level::Info, "stopped".into());
         self.update(|s| {
             s.state = NodeState::Stopped;
             s.pid = None;
         });
     }
 
+    /// A note in the node's log book (`node_logs`), beside the server log.
+    fn note(&self, level: log::Level, message: String) {
+        crate::modules::node_logs::push(
+            &self.spec.node_id,
+            level,
+            crate::modules::node_logs::Source::Supervisor,
+            message,
+            Default::default(),
+        );
+    }
+
     /// Marks the node `Failed` (no more launches) and waits to be stopped.
     async fn fail_local(&mut self, mut process: Option<PluginProcess>, reason: String) {
         log::error!("{} failed, not relaunching: {reason}", self.tag);
+        self.note(
+            log::Level::Error,
+            format!("failed, not relaunching: {reason}"),
+        );
         if let Some(process) = process.as_mut() {
             process.terminate(self.spec.timings.kill_grace).await;
         }
@@ -536,9 +568,13 @@ impl Supervisor {
     async fn run_remote(&mut self) {
         loop {
             match self.recv(true).await {
-                Signal::Connected => self.set_state(NodeState::Running),
+                Signal::Connected => {
+                    self.note(log::Level::Info, "connected".into());
+                    self.set_state(NodeState::Running);
+                }
                 Signal::Disconnected(reason) => {
                     log::warn!("{} remote plugin disconnected: {reason}", self.tag);
+                    self.note(log::Level::Warn, format!("disconnected: {reason}"));
                     self.update(|s| {
                         s.state = NodeState::Disconnected;
                         s.last_error = Some(reason);
@@ -550,6 +586,7 @@ impl Supervisor {
                         exit.code().as_str_name()
                     );
                     log::warn!("{} {reason}", self.tag);
+                    self.note(log::Level::Warn, reason.clone());
                     self.update(|s| {
                         s.state = NodeState::Disconnected;
                         s.last_error = Some(reason);
@@ -575,6 +612,7 @@ impl Supervisor {
             .await;
         }
         log::info!("{} stopped", self.tag);
+        self.note(log::Level::Info, "stopped".into());
         self.set_state(NodeState::Stopped);
     }
 }

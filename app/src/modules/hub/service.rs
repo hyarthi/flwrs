@@ -1108,6 +1108,7 @@ async fn serve_connection(
         });
     let mut session = Running {
         tag: tag.clone(),
+        node_id: expected.node_id.clone(),
         plugin_type: expected.plugin_type,
         conn: conn.clone(),
         events: events.clone(),
@@ -1185,6 +1186,8 @@ async fn serve_connection(
 /// A connection after the handshake.
 struct Running {
     tag: String,
+    /// For the node's log book (`node_logs`).
+    node_id: String,
     plugin_type: PluginType,
     conn: ConnHandle,
     events: mpsc::Sender<HubEvent>,
@@ -1264,11 +1267,11 @@ impl Running {
                 }
             }
             MsgCode::Log => {
-                log_plugin_record(&self.tag, decode(&frame)?);
+                log_plugin_record(&self.tag, &self.node_id, decode(&frame)?);
                 return Ok(true);
             }
             MsgCode::Error => {
-                log_plugin_error(&self.tag, decode(&frame)?);
+                log_plugin_error(&self.tag, &self.node_id, decode(&frame)?);
                 return Ok(true);
             }
             MsgCode::Ping => {
@@ -1469,7 +1472,7 @@ async fn write_frames(
     let _ = writer.shutdown().await;
 }
 
-fn log_plugin_record(tag: &str, event: LogEvent) {
+fn log_plugin_record(tag: &str, node_id: &str, event: LogEvent) {
     let details = format_details(&event.details);
     let level = match event.level() {
         LogLevel::Trace => log::Level::Trace,
@@ -1479,18 +1482,49 @@ fn log_plugin_record(tag: &str, event: LogEvent) {
         LogLevel::Error => log::Level::Error,
         LogLevel::Undefined => {
             log::warn!("{tag} (log level missing) {}{details}", event.message);
-            return;
+            log::Level::Warn
         }
     };
-    log::log!(level, "{tag} {}{details}", event.message);
+    if event.level() != LogLevel::Undefined {
+        log::log!(level, "{tag} {}{details}", event.message);
+    }
+    crate::modules::node_logs::push(
+        node_id,
+        level,
+        crate::modules::node_logs::Source::Plugin,
+        event.message,
+        details_map(&event.details),
+    );
 }
 
-fn log_plugin_error(tag: &str, event: ErrorEvent) {
+fn log_plugin_error(tag: &str, node_id: &str, event: ErrorEvent) {
     log::error!(
         "{tag} plugin error: {}{}",
         event.message,
         format_details(&event.details)
     );
+    crate::modules::node_logs::push(
+        node_id,
+        log::Level::Error,
+        crate::modules::node_logs::Source::Error,
+        event.message,
+        details_map(&event.details),
+    );
+}
+
+/// The details as text, for the node's log book.
+fn details_map(fields: &[Field]) -> std::collections::BTreeMap<String, String> {
+    fields
+        .iter()
+        .map(|f| {
+            let text = match f.value.as_ref().and_then(|v| v.value.as_ref()) {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => format!("{other:?}"),
+                None => "null".into(),
+            };
+            (f.key.clone(), text)
+        })
+        .collect()
 }
 
 /// ` {k=v, …}`, or nothing without details.

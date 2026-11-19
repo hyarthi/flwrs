@@ -28,6 +28,8 @@ sqlx.workspace = true
 async-trait.workspace = true
 ulid.workspace = true
 serde_json.workspace = true
+toml.workspace = true # the server page: checking config sections
+toml_edit.workspace = true # the server page: editing the config file, comments kept
 jsonschema.workspace = true
 zip.workspace = true
 sha256.workspace = true
@@ -97,7 +99,6 @@ protoc-bin-vendored.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-toml.workspace = true # parsing config snippets in tests
 tower.workspace = true
 http-body-util.workspace = true
 rcgen.workspace = true # test certificates (TLS / mTLS tests)

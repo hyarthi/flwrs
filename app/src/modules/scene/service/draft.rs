@@ -17,6 +17,7 @@
 //!   the row is marked with a conflict, and submit waits until each is
 //!   resolved (`resolve`: keep the draft's, or take live's).
 
+pub(crate) mod history;
 pub(crate) mod query;
 
 use super::apply::{TargetEdge, TargetGraph, TargetNode};
@@ -107,6 +108,9 @@ pub(crate) struct Draft {
     pub settings_conflict: Option<Conflict>,
     pub nodes: Vec<DraftNode>,
     pub edges: Vec<DraftEdge>,
+    /// The step undo would take back, and the one redo would make again.
+    pub undo: Option<String>,
+    pub redo: Option<String>,
 }
 
 impl Draft {
@@ -384,6 +388,8 @@ impl Service {
             };
             query::put_edge(&mut tx, &edge, &meta).await?;
         }
+        // The first state undo can go back to.
+        history::record_start(&mut tx, &scene.id).await?;
         tx.commit().await?;
         log::debug!(
             "Scene service: started a draft of scene [{}] at revision {}",
@@ -391,6 +397,35 @@ impl Service {
             scene.revision
         );
         Ok(row)
+    }
+
+    /// Undoes (`back`) or redoes the draft's last change: puts its state
+    /// before (or after) in place. Conflict when there's nothing to.
+    pub(crate) async fn step_draft(
+        &self,
+        scene_id: &str,
+        back: bool,
+    ) -> Result<(Draft, String), ServiceError> {
+        let label = {
+            let _guard = self.lock.lock().await;
+            let mut conn = self.conn().await?;
+            self.scene_row(&mut conn, scene_id).await?;
+            query::get(&mut conn, scene_id)
+                .await?
+                .ok_or_else(no_draft)?;
+            let mut tx = conn.begin_with(WRITE_TX).await?;
+            let label = history::step(&mut tx, scene_id, back)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::Conflict(
+                        format!("nothing to {}", if back { "undo" } else { "redo" }),
+                        vec![],
+                    )
+                })?;
+            tx.commit().await?;
+            label
+        };
+        Ok((self.get_draft(scene_id).await?, label))
     }
 
     /// Starts the scene's draft from live (or returns the one it has, and
@@ -492,6 +527,7 @@ impl Service {
             } else {
                 Change::Changed
             };
+        let (undo, redo) = history::steps(conn, &row.scene_id).await?;
         Ok(Draft {
             settings_conflict: Conflict::parse(row.conflict.as_deref()),
             live_revision: scene.revision,
@@ -499,6 +535,8 @@ impl Service {
             settings_change,
             nodes,
             edges,
+            undo,
+            redo,
         })
     }
 
@@ -526,7 +564,10 @@ impl Service {
             let mut conn = self.conn().await?;
             let scene = self.scene_row(&mut conn, scene_id).await?;
             self.ensure_draft(&mut conn, &scene).await?;
-            query::set_settings(&mut conn, scene_id, &name, max_hops, &input.defaults).await?;
+            let mut tx = conn.begin_with(WRITE_TX).await?;
+            query::set_settings(&mut tx, scene_id, &name, max_hops, &input.defaults).await?;
+            history::record(&mut tx, scene_id).await?;
+            tx.commit().await?;
         }
         self.get_draft(scene_id).await
     }

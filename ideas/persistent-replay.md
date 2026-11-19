@@ -1,6 +1,6 @@
 # Idea: persistent replay rings in the push sinks
 
-Status: idea, not scheduled (phase 8, Nov 2026: rings are in memory; after a restart a client resuming with an old id gets a gap).
+Status: idea, not scheduled (Nov 2026: rings are in memory; after a restart a client resuming with an old id gets a gap).
 
 ## Problem
 

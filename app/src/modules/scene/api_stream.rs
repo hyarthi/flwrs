@@ -8,9 +8,14 @@
 //!   stream goes on.
 //!
 //! The stream ends when the HTTP server starts shutting down.
+//!
+//! `GET /api/status/stream` (the overview page's) is the same feed, with
+//! `overview` events (the director's whole `Overview`: hub connections,
+//! memory and disk use, every scene's summary) in place of `status`.
 
 use crate::modules::api_error::ErrorBody;
-use crate::modules::director::handle::{SceneState, SceneSummary};
+use crate::modules::director::handle::{Overview, SceneState, SceneSummary, Usage};
+use crate::modules::hub::HubConnections;
 use crate::modules::scene::api::Svc;
 use crate::modules::scene::service::SceneRow;
 use axum::Router;
@@ -35,6 +40,8 @@ pub(crate) struct StreamState {
     /// Ends the streams (the HTTP server is stopping).
     pub stopping: CancellationToken,
     pub interval: Duration,
+    /// `[director] spill_default` (the scene view's queue kinds).
+    pub spill_default: bool,
 }
 
 /// A scene in the live list.
@@ -86,6 +93,40 @@ pub(crate) struct StatusEvent {
     pub scenes: Vec<SceneSummary>,
 }
 
+/// The `overview` event (`GET /api/status/stream`).
+#[derive(Serialize, ToSchema)]
+pub(crate) struct OverviewEvent {
+    /// When it was taken (Unix milliseconds), for rates.
+    pub time: i64,
+    #[serde(flatten)]
+    pub overview: Overview,
+}
+
+/// Which periodic event a feed sends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Periodic {
+    /// `status`: the scenes' summaries (the scenes list).
+    Status,
+    /// `overview`: everything (the overview page).
+    Overview,
+}
+
+#[utoipa::path(
+    get,
+    path = "/stream",
+    operation_id = "status-stream",
+    summary = "The server at a glance, live (Server-Sent Events)",
+    description = "Events: `scenes` (`ScenesEvent`, as in `GET /api/scenes/stream`: every scene with its check; first, and after each change to scenes or plugins), `overview` (`OverviewEvent`: `GET /api/status` with the time it was taken, every `[scenes] stream_interval_ms`), `stream_error`. Keep-alive comments every 15 s. No history: a client keeps its own samples.",
+    responses(
+        (status = 200, description = "An event stream", content_type = "text/event-stream", body = String),
+    )
+)]
+async fn status_stream(
+    State(state): State<StreamState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(feed(state, Periodic::Overview)).keep_alive(KeepAlive::default())
+}
+
 #[utoipa::path(
     get,
     path = "/stream",
@@ -99,10 +140,11 @@ pub(crate) struct StatusEvent {
 async fn stream(
     State(state): State<StreamState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    Sse::new(feed(state)).keep_alive(KeepAlive::default())
+    Sse::new(feed(state, Periodic::Status)).keep_alive(KeepAlive::default())
 }
 
 struct Feed {
+    periodic: Periodic,
     state: StreamState,
     scene_changes: watch::Receiver<u64>,
     plugin_changes: watch::Receiver<u64>,
@@ -110,10 +152,11 @@ struct Feed {
     first: bool,
 }
 
-fn feed(state: StreamState) -> impl Stream<Item = Result<Event, Infallible>> {
+fn feed(state: StreamState, periodic: Periodic) -> impl Stream<Item = Result<Event, Infallible>> {
     let mut ticker = tokio::time::interval(state.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let feed = Feed {
+        periodic,
         scene_changes: state.scenes.changes(),
         plugin_changes: state.scenes.plugin_changes(),
         state,
@@ -200,13 +243,17 @@ impl Feed {
                 .await
                 .ok()?
                 .ok()?;
-        Some(json_event(
-            "status",
-            &StatusEvent {
-                time: chrono::Utc::now().timestamp_millis(),
-                scenes: overview.scenes,
-            },
-        ))
+        let time = chrono::Utc::now().timestamp_millis();
+        Some(match self.periodic {
+            Periodic::Status => json_event(
+                "status",
+                &StatusEvent {
+                    time,
+                    scenes: overview.scenes,
+                },
+            ),
+            Periodic::Overview => json_event("overview", &OverviewEvent { time, overview }),
+        })
     }
 }
 
@@ -214,6 +261,21 @@ pub(super) fn json_event(name: &str, data: &impl Serialize) -> Event {
     let data = serde_json::to_string(data).unwrap_or_else(|_| "{}".into());
     Event::default().event(name).data(data)
 }
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(status_stream),
+    components(schemas(
+        OverviewEvent,
+        Overview,
+        Usage,
+        HubConnections,
+        ScenesEvent,
+        SceneListRow,
+        ErrorBody
+    ))
+)]
+pub(crate) struct StatusApi;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -234,6 +296,7 @@ pub(crate) struct Api;
 pub(crate) fn router(state: StreamState) -> Router {
     Router::new()
         .route("/scenes/stream", get(stream))
+        .route("/status/stream", get(status_stream))
         .with_state(state)
 }
 
@@ -337,6 +400,7 @@ pub(super) mod tests {
             scenes: f.service,
             stopping: stopping.clone(),
             interval: Duration::from_millis(100),
+            spill_default: false,
         });
         let response = app
             .oneshot(Request::get("/scenes/stream").body(Body::empty()).unwrap())
@@ -431,5 +495,62 @@ pub(super) mod tests {
             reader.ended().await,
             "the stream ends when the server stops"
         );
+    }
+
+    #[tokio::test]
+    async fn the_status_stream_sends_scenes_and_the_whole_overview() {
+        let f = fixture().await;
+        let s = f.scene().await;
+        let app = router(StreamState {
+            scenes: f.service,
+            stopping: CancellationToken::new(),
+            interval: Duration::from_millis(100),
+            spill_default: false,
+        });
+        let response = app
+            .oneshot(Request::get("/status/stream").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut reader = Reader::new(response);
+        assert_eq!(
+            reader.next("scenes").await["scenes"][0]["id"],
+            s.id.as_str()
+        );
+        let mut commands = f.director.lock().await;
+        let answer = async {
+            loop {
+                if let Some(DirectorCommand::Overview { reply }) = commands.recv().await {
+                    let _ = reply.send(Overview {
+                        hub_address: "127.0.0.1:7400".into(),
+                        hub_connections: Default::default(),
+                        queued_memory: Usage {
+                            used_bytes: 5,
+                            limit_bytes: 10,
+                        },
+                        spill_memory: Usage {
+                            used_bytes: 0,
+                            limit_bytes: 1,
+                        },
+                        spill_disk: Usage {
+                            used_bytes: 0,
+                            limit_bytes: 1,
+                        },
+                        scenes: vec![],
+                    });
+                }
+            }
+        };
+        let overview = tokio::select! {
+            o = reader.next("overview") => o,
+            () = answer => unreachable!(),
+        };
+        assert!(overview["time"].as_i64().unwrap() > 0);
+        assert_eq!(overview["hub_address"], "127.0.0.1:7400");
+        assert_eq!(
+            overview["queued_memory"],
+            json!({"used_bytes": 5, "limit_bytes": 10})
+        );
+        assert_eq!(overview["hub_connections"]["connected"], 0);
     }
 }

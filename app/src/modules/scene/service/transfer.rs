@@ -132,6 +132,7 @@ impl Service {
             .await?
             .into_iter()
             .map(|e| pb::Edge {
+                via: Position::from_json(e.ui.as_deref()).map(|p| pb::Position { x: p.x, y: p.y }),
                 name: e.name,
                 source_key: e.source_node_id,
                 target_key: e.target_node_id,
@@ -340,7 +341,8 @@ impl Service {
                 target_node_id: &ids[edge.target_key.as_str()],
                 mapping: edge.mapping_json.as_deref(),
             };
-            query_sqlite::insert_edge(&mut tx, Store::Live, &scene_id, &next_id(), &values)
+            let edge_id = next_id();
+            query_sqlite::insert_edge(&mut tx, Store::Live, &scene_id, &edge_id, &values)
                 .await
                 .map_err(|e| match e.as_database_error().map(|d| d.kind()) {
                     Some(ErrorKind::UniqueViolation) => ServiceError::Invalid(vec![format!(
@@ -349,6 +351,16 @@ impl Service {
                     )]),
                     _ => e.into(),
                 })?;
+            if edge.ui.is_some() {
+                query_sqlite::set_edge_ui(
+                    &mut tx,
+                    Store::Live,
+                    &scene_id,
+                    &edge_id,
+                    edge.ui.as_deref(),
+                )
+                .await?;
+            }
         }
         // Edge direction by node type, no `block` on a cycle.
         check_graph(&mut tx, Store::Live, &scene_id).await?;
@@ -399,6 +411,15 @@ fn scopeguard_file(path: &Path) -> RemoveFile {
     RemoveFile(path.to_path_buf())
 }
 
+/// A file's position as the `ui` column holds it. A bad one is layout, not
+/// content: dropped, not refused.
+fn layout_of(position: Option<pb::Position>) -> Option<String> {
+    position
+        .map(|p| Position { x: p.x, y: p.y })
+        .filter(|p| p.check().is_ok())
+        .map(Position::to_json)
+}
+
 fn scopeguard_dir(path: &Path) -> RemoveDir {
     RemoveDir(path.to_path_buf())
 }
@@ -421,6 +442,8 @@ struct PlannedEdge {
     source_key: String,
     target_key: String,
     mapping_json: Option<String>,
+    /// Layout (the `ui` column), if the file places the edge.
+    ui: Option<String>,
 }
 
 struct Plan {
@@ -530,12 +553,7 @@ fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
             config_json,
             omitted_secrets: node.omitted_secrets,
             files: node.files,
-            // A bad position is layout, not content: dropped, not refused.
-            ui: node
-                .position
-                .map(|p| Position { x: p.x, y: p.y })
-                .filter(|p| p.check().is_ok())
-                .map(Position::to_json),
+            ui: layout_of(node.position),
         });
     }
 
@@ -576,6 +594,7 @@ fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
             source_key: edge.source_key,
             target_key: edge.target_key,
             mapping_json,
+            ui: layout_of(edge.via),
         });
     }
 

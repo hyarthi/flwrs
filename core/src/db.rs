@@ -6,6 +6,8 @@ use thiserror::Error;
 pub mod migrations;
 mod sqlite;
 
+pub use sqlite::DbConfig;
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("SQLite db error: {0}")]

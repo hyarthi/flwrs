@@ -13,6 +13,8 @@
     conflict: Conflict | null;
     parts: string[];
     state: NodeState | null;
+    /** The glow of an active scene's node: connected, reconnecting / starting, down. `null` = none. */
+    health: 'ok' | 'warn' | 'bad' | null;
     problems: string[];
     warnings: string[];
     onopen: (id: string) => void;
@@ -74,6 +76,9 @@
   class:changed={data.change === 'changed'}
   class:removed
   class:conflict={data.conflict}
+  class:glow-ok={data.health === 'ok'}
+  class:glow-warn={data.health === 'warn'}
+  class:glow-bad={data.health === 'bad'}
   style:--node-color={data.color ?? undefined}
   role="button"
   tabindex="-1"
@@ -160,9 +165,33 @@
     background: var(--node-color);
   }
 
+  .node.glow-ok {
+    box-shadow: 0 0 14px 3px var(--glow-ok);
+  }
+
+  .node.glow-warn {
+    box-shadow: 0 0 14px 3px var(--glow-warn);
+  }
+
+  .node.glow-bad {
+    box-shadow: 0 0 14px 3px var(--glow-bad);
+  }
+
   .node.selected {
     border-color: var(--accent);
     box-shadow: 0 0 0 2px var(--focus-ring);
+  }
+
+  .node.selected.glow-ok {
+    box-shadow: 0 0 0 2px var(--focus-ring), 0 0 14px 3px var(--glow-ok);
+  }
+
+  .node.selected.glow-warn {
+    box-shadow: 0 0 0 2px var(--focus-ring), 0 0 14px 3px var(--glow-warn);
+  }
+
+  .node.selected.glow-bad {
+    box-shadow: 0 0 0 2px var(--focus-ring), 0 0 14px 3px var(--glow-bad);
   }
 
   .node.added {

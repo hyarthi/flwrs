@@ -28,5 +28,5 @@ Launch plugins as a different, unprivileged OS user (one shared plugin user, or 
 
 ## Related
 
-- The node folder and `config/` design: manifest v2, plugin plan phase 2.
+- The node folder and `config/` design: manifest v2 (`docs/plugin-spec.md`, section 5.3).
 - Sandboxing beyond users (containers, seccomp, macOS sandbox profiles) would build on the same launch path.

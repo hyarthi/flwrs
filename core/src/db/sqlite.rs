@@ -4,14 +4,17 @@ use crate::db::DbError;
 use crate::db::migrations::{MigrationDef, Version};
 use chrono::{DateTime, Local};
 use rust_embed::Embed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{AssertSqlSafe, Connection, Executor, FromRow, Sqlite, SqlitePool, Type};
 use std::str;
 
-#[derive(Deserialize, Default)]
+/// `[db.<name>]`: a database (only `main` so far).
+#[derive(Deserialize, Serialize, Default, Clone, Debug, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DbConfig {
+    /// The SQLite file (default `<name>.db`); parent folders are created.
     filename: Option<String>,
 }
 

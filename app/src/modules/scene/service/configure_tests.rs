@@ -307,6 +307,36 @@ async fn check_reports_a_stale_configuration_and_configure_fixes_it() {
 }
 
 #[tokio::test]
+async fn a_draft_node_is_configured_again_in_the_draft_only() {
+    let (f, scene) = setup().await;
+    let node = f
+        .node(&scene.id, PLUGIN, json!({"launch_args": {"spec": "a"}}))
+        .await;
+    let revision = f.service.get_scene(&scene.id).await.unwrap().revision;
+    let draft = f
+        .service
+        .reconfigure_node_in(Store::Draft, &scene.id, &node.id)
+        .await
+        .unwrap();
+    assert_ne!(marker(&draft), marker(&node), "the configurator ran again");
+    // Live is as it was; the draft has the new configuration.
+    assert_eq!(
+        f.service.get_scene(&scene.id).await.unwrap().revision,
+        revision
+    );
+    assert_eq!(
+        marker(&f.service.get_node(&scene.id, &node.id).await.unwrap()),
+        marker(&node)
+    );
+    let in_draft = f
+        .service
+        .get_node_in(Store::Draft, &scene.id, &node.id)
+        .await
+        .unwrap();
+    assert_eq!(marker(&in_draft), marker(&draft));
+}
+
+#[tokio::test]
 async fn an_upgrade_runs_the_new_configurator() {
     let (f, scene) = setup().await;
     let node = f

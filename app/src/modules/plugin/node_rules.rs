@@ -16,6 +16,10 @@ pub(crate) struct NodeRules {
     pub spec: LaunchSpec,
     in_schema: Option<SchemaDefinition>,
     out_schema: Option<SchemaDefinition>,
+    /// A remote plugin definition (manifest `launch: "remote"`): its nodes
+    /// must be remote.
+    pub remote_only: bool,
+    plugin_id: String,
 }
 
 /// A payload direction.
@@ -71,6 +75,8 @@ impl NodeRules {
                 .map_err(|e| format!("plugin {} {side} schema: {e}", plugin.id))
         };
         Ok(Self {
+            remote_only: manifest.is_remote_only(),
+            plugin_id: manifest.id.clone(),
             in_schema: parse(in_schema, "in")?,
             out_schema: parse(out_schema, "out")?,
             validator,
@@ -81,6 +87,20 @@ impl NodeRules {
     /// JSON Schema, conversion rules and limits of a local node's `launch_args`.
     pub(crate) fn validate_launch_args(&self, args: &Value) -> Vec<String> {
         validate_launch_args(self.validator.as_ref(), &self.spec, args)
+    }
+
+    /// A node launched as `launch` can't use this plugin: a remote plugin
+    /// definition has nothing to run here.
+    pub(crate) fn launch_problem(
+        &self,
+        launch: crate::modules::node_config::LaunchMode,
+    ) -> Option<String> {
+        (self.remote_only && launch == crate::modules::node_config::LaunchMode::Local).then(|| {
+            format!(
+                "config.launch: plugin {} is a remote plugin definition (nothing runs on this server); its nodes must be remote (launch = \"remote\")",
+                self.plugin_id
+            )
+        })
     }
 
     /// For `NodeConfig::validate`.

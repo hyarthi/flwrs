@@ -1,6 +1,6 @@
 # Idea: distributing trellis beyond crates.io
 
-Status: idea, not scheduled (deferred from the plugins plan, Nov 2026). Today trellis is `cargo install flwrs-trellis --locked`, or a pinned dev-dependency with a one-line `examples/trellis.rs` for Rust plugin repos.
+Status: idea, not scheduled (deferred, Nov 2026). Today trellis is `cargo install flwrs-trellis --locked`, or a pinned dev-dependency with a one-line `examples/trellis.rs` for Rust plugin repos.
 
 ## Problem
 

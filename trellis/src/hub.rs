@@ -34,10 +34,18 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub async fn start(target: &Target) -> Result<Self, String> {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let (host, port) = match &target.remote {
+            Some(r) => (r.bind_host().trim_matches(['[', ']']).to_string(), r.port),
+            None => ("127.0.0.1".to_string(), 0),
+        };
+        let listener = TcpListener::bind((host.as_str(), port))
             .await
-            .map_err(|e| format!("fake hub: {e}"))?;
-        let token = random_token();
+            .map_err(|e| format!("fake hub on {host}:{port}: {e}"))?;
+        let token = target
+            .remote
+            .as_ref()
+            .and_then(|r| r.token.clone())
+            .unwrap_or_else(random_token);
         let child = spawn(target, &listener, &token)?;
         Ok(Self {
             target: target.clone(),
@@ -66,12 +74,14 @@ impl Fixture {
         self.listener.local_addr().map(|a| a.port()).unwrap_or(0)
     }
 
-    /// Kills the plugin and starts it again (same hub, same token).
+    /// Kills the plugin and starts it again (same hub, same token). A
+    /// remote one: its `stop` command, then `start` again.
     pub async fn restart(&mut self) -> Result<(), String> {
         if let Some(child) = &mut self.child {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
+        self.remote_stop().await?;
         self.child = Some(spawn(&self.target, &self.listener, &self.token)?);
         self.spawned = Instant::now();
         Ok(())
@@ -156,7 +166,12 @@ impl Fixture {
         Ok((conn, init, negotiated))
     }
 
+    /// Whether the plugin's process exits within `wait`. A remote plugin's
+    /// process can't be watched from here: the cases check its connection.
     pub async fn exits(&mut self, wait: Duration) -> bool {
+        if self.target.launched_remotely() {
+            return true;
+        }
         match &mut self.child {
             Some(child) => tokio::time::timeout(wait, child.wait()).await.is_ok(),
             None => true,
@@ -167,6 +182,26 @@ impl Fixture {
         if let Some(child) = &mut self.child {
             let _ = child.start_kill();
             let _ = child.wait().await;
+        }
+        if let Err(e) = self.remote_stop().await {
+            eprintln!("remote stop: {e}");
+        }
+    }
+
+    /// A remote plugin's `stop` command, if it has one.
+    async fn remote_stop(&self) -> Result<(), String> {
+        let Some(remote) = self.target.remote.as_ref().filter(|r| !r.stop.is_empty()) else {
+            return Ok(());
+        };
+        let argv = remote.command(&remote.stop, self.port(), self.target.instance_id(), &self.token);
+        match tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::stimulus::run_command(&argv, &remote.dir, self.port()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!("{} didn't finish within 60 s", argv.join(" "))),
         }
     }
 }
@@ -180,10 +215,32 @@ fn spawn(target: &Target, listener: &TcpListener, token: &str) -> Result<Child, 
             Stdio::null()
         }
     };
+    if let Some(remote) = target.remote.as_ref().filter(|r| !r.start.is_empty()) {
+        let argv = remote.command(&remote.start, port, target.instance_id(), token);
+        let (program, args) = argv
+            .split_first()
+            .ok_or("[remote] start is empty: give the command that makes the plugin connect")?;
+        return Command::new(program)
+            .args(args)
+            .current_dir(&remote.dir)
+            .env("FLWRS_TOKEN", token)
+            .stdin(Stdio::null())
+            .stdout(output())
+            .stderr(output())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("couldn't run {program}: {e}"));
+    }
+    if target.program.as_os_str().is_empty() {
+        return Err(
+            "a remote plugin definition has no executable: give [remote] start in trellis.toml (commands that make the plugin connect), or a local stand-in (--executable, Target::with_executable)"
+                .into(),
+        );
+    }
     Command::new(&target.program)
         .args([
             "--id",
-            INSTANCE_ID,
+            target.instance_id(),
             "--host",
             "127.0.0.1",
             "--port",

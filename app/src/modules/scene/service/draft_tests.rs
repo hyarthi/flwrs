@@ -716,7 +716,7 @@ async fn layout_is_kept_apart_from_content() {
     // Live: no revision for a move.
     let one = |id: &str, p| BTreeMap::from([(id.to_string(), p)]);
     f.service
-        .set_layout(&s.id, &one(&a.id, at(1.0, 2.0)))
+        .set_layout(&s.id, &one(&a.id, at(1.0, 2.0)), &BTreeMap::new())
         .await
         .unwrap();
     assert_eq!(
@@ -729,7 +729,7 @@ async fn layout_is_kept_apart_from_content() {
     // reaches live and the draft alike.
     f.service.start_draft(&s.id).await.unwrap();
     f.service
-        .set_layout(&s.id, &one(&a.id, at(3.0, 4.0)))
+        .set_layout(&s.id, &one(&a.id, at(3.0, 4.0)), &BTreeMap::new())
         .await
         .unwrap();
     let draft = f.service.get_draft(&s.id).await.unwrap();
@@ -750,7 +750,7 @@ async fn layout_is_kept_apart_from_content() {
         .await
         .unwrap();
     f.service
-        .set_layout(&s.id, &one(&b.id, at(70.0, 80.0)))
+        .set_layout(&s.id, &one(&b.id, at(70.0, 80.0)), &BTreeMap::new())
         .await
         .unwrap();
     f.service
@@ -774,7 +774,7 @@ async fn layout_is_kept_apart_from_content() {
 
     // Clearing; unknown nodes and bad numbers refuse the whole request.
     f.service
-        .set_layout(&s.id, &one(&b.id, None))
+        .set_layout(&s.id, &one(&b.id, None), &BTreeMap::new())
         .await
         .unwrap();
     assert_eq!(
@@ -785,7 +785,11 @@ async fn layout_is_kept_apart_from_content() {
         (a.id.clone(), at(0.0, 0.0)),
         ("nope".to_string(), at(0.0, 0.0)),
     ]);
-    let e = f.service.set_layout(&s.id, &mixed).await.unwrap_err();
+    let e = f
+        .service
+        .set_layout(&s.id, &mixed, &BTreeMap::new())
+        .await
+        .unwrap_err();
     assert!(
         matches!(&e, ServiceError::Invalid(d) if d[0].contains("nope")),
         "{e:?}"
@@ -796,7 +800,7 @@ async fn layout_is_kept_apart_from_content() {
     );
     let e = f
         .service
-        .set_layout(&s.id, &one(&a.id, at(f64::MAX, 0.0)))
+        .set_layout(&s.id, &one(&a.id, at(f64::MAX, 0.0)), &BTreeMap::new())
         .await
         .unwrap_err();
     assert!(matches!(e, ServiceError::Invalid(_)));
@@ -833,4 +837,267 @@ async fn layout_is_kept_apart_from_content() {
         .collect();
     positions.sort_by(|p, q| format!("{p:?}").cmp(&format!("{q:?}")));
     assert_eq!(positions, vec![None, at(-5.0, 5.5), at(3.0, 4.0)]);
+}
+
+#[tokio::test]
+async fn edge_layout_is_kept_apart_from_content() {
+    let f = fixture().await;
+    let s = f.scene().await;
+    let a = f.node(&s.id, "test-source", Value::Null).await;
+    let b = f.node(&s.id, "test-sink", sink(5)).await;
+    let e = f.edge(&s.id, &a.id, &b.id).await.unwrap();
+    let via = |x: f64, y: f64| Some(Position { x, y });
+    let edges = |id: &str, p| BTreeMap::from([(id.to_string(), p)]);
+    let revision = f.service.get_scene(&s.id).await.unwrap().revision;
+
+    f.service
+        .set_layout(&s.id, &BTreeMap::new(), &edges(&e.id, via(5.0, 6.0)))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.service.get_edge(&s.id, &e.id).await.unwrap().via,
+        via(5.0, 6.0)
+    );
+    assert_eq!(f.service.get_scene(&s.id).await.unwrap().revision, revision);
+
+    // In a draft: copied, moved alike, no change; a new edge takes its point
+    // to live on submit.
+    f.service.start_draft(&s.id).await.unwrap();
+    let c = f
+        .service
+        .save_node(Store::Draft, &s.id, None, node_input("test-sink", sink(6)))
+        .await
+        .unwrap();
+    let new = f
+        .service
+        .write_edge(
+            Store::Draft,
+            &s.id,
+            None,
+            edge_input(&a.id, &c.id, Value::Null),
+        )
+        .await
+        .unwrap();
+    f.service
+        .set_layout(&s.id, &BTreeMap::new(), &edges(&new.id, via(7.0, 8.0)))
+        .await
+        .unwrap();
+    let draft = f.service.get_draft(&s.id).await.unwrap();
+    assert_eq!(
+        draft
+            .edges
+            .iter()
+            .find(|d| d.edge.id == e.id)
+            .unwrap()
+            .edge
+            .via,
+        via(5.0, 6.0)
+    );
+    f.service.submit_draft(&s.id, None, false).await.unwrap();
+    assert_eq!(
+        f.service.get_edge(&s.id, &new.id).await.unwrap().via,
+        via(7.0, 8.0)
+    );
+
+    let unknown = f
+        .service
+        .set_layout(&s.id, &BTreeMap::new(), &edges("nope", via(0.0, 0.0)))
+        .await
+        .unwrap_err();
+    assert!(matches!(&unknown, ServiceError::Invalid(d) if d[0].contains("no such edge")));
+
+    let export = f.service.export_scene(&s.id, false).await.unwrap();
+    let imported = f.service.import_scene(&export.bytes).await.unwrap();
+    let mut points: Vec<_> = f
+        .service
+        .list_edges(&imported.scene.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.via)
+        .collect();
+    points.sort_by(|p, q| format!("{p:?}").cmp(&format!("{q:?}")));
+    assert_eq!(points, vec![via(5.0, 6.0), via(7.0, 8.0)]);
+}
+
+#[tokio::test]
+async fn undo_and_redo_walk_the_drafts_states() {
+    let f = fixture().await;
+    let s = f.scene().await;
+    let a = f.node(&s.id, "test-source", Value::Null).await;
+    let steps = |d: &draft::Draft| (d.undo.clone(), d.redo.clone());
+
+    // Each draft change is a step: start, add, connect, move, edit.
+    let b = f
+        .service
+        .save_node(Store::Draft, &s.id, None, node_input("test-sink", sink(5)))
+        .await
+        .unwrap();
+    let e = f
+        .service
+        .write_edge(
+            Store::Draft,
+            &s.id,
+            None,
+            edge_input(&a.id, &b.id, Value::Null),
+        )
+        .await
+        .unwrap();
+    f.service
+        .set_layout(
+            &s.id,
+            &BTreeMap::from([(b.id.clone(), Some(Position { x: 9.0, y: 9.0 }))]),
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    f.service
+        .save_node(
+            Store::Draft,
+            &s.id,
+            Some(&b.id),
+            node_input("test-sink", sink(6)),
+        )
+        .await
+        .unwrap();
+    let d = f.service.get_draft(&s.id).await.unwrap();
+    assert_eq!(steps(&d), (Some("Edit test-sink".into()), None));
+
+    let (d, step) = f.service.step_draft(&s.id, true).await.unwrap();
+    assert_eq!(step, "Edit test-sink");
+    assert_eq!(
+        f.service
+            .get_node_in(Store::Draft, &s.id, &b.id)
+            .await
+            .unwrap()
+            .config
+            .launch_args,
+        sink(5)["launch_args"]
+    );
+    assert_eq!(
+        steps(&d),
+        (Some("Move".into()), Some("Edit test-sink".into()))
+    );
+    let (_, step) = f.service.step_draft(&s.id, true).await.unwrap();
+    assert_eq!(step, "Move");
+    // Layout goes back live too (it's shared).
+    assert_eq!(
+        f.service
+            .get_node_in(Store::Draft, &s.id, &b.id)
+            .await
+            .unwrap()
+            .position,
+        None
+    );
+    let (d, step) = f.service.step_draft(&s.id, true).await.unwrap();
+    assert!(step.starts_with("Connect"), "{step}");
+    assert!(d.edges.is_empty(), "the edge is gone");
+    let (d, _) = f.service.step_draft(&s.id, true).await.unwrap();
+    assert_eq!(d.nodes.len(), 1, "back to live's graph");
+    let nothing = f.service.step_draft(&s.id, true).await.unwrap_err();
+    assert!(matches!(nothing, ServiceError::Conflict(..)), "{nothing:?}");
+
+    // Redo, then a change drops what could still be redone.
+    let (d, _) = f.service.step_draft(&s.id, false).await.unwrap();
+    assert_eq!(d.nodes.len(), 2);
+    let (d, _) = f.service.step_draft(&s.id, false).await.unwrap();
+    assert_eq!(d.edges[0].edge.id, e.id, "ids are kept");
+    f.service
+        .update_draft_settings(&s.id, &SceneInput::named("renamed"))
+        .await
+        .unwrap();
+    let d = f.service.get_draft(&s.id).await.unwrap();
+    assert_eq!(steps(&d), (Some("Scene settings".into()), None));
+}
+
+#[tokio::test]
+async fn an_undo_group_is_one_step_and_uploads_are_kept_for_undo() {
+    let f = fixture().await;
+    let s = f.scene().await;
+    let a = f.node(&s.id, "test-source", Value::Null).await;
+    // The group's first change starts the draft: its start stays a step of its own.
+    let group = Some(("paste-1".to_string(), Some("Paste 2 nodes".to_string())));
+    draft::history::with_group(group, async {
+        let b = f
+            .service
+            .save_node(Store::Draft, &s.id, None, node_input("test-sink", sink(5)))
+            .await
+            .unwrap();
+        f.service
+            .write_edge(
+                Store::Draft,
+                &s.id,
+                None,
+                edge_input(&a.id, &b.id, Value::Null),
+            )
+            .await
+            .unwrap();
+    })
+    .await;
+    let d = f.service.get_draft(&s.id).await.unwrap();
+    assert_eq!(d.undo.as_deref(), Some("Paste 2 nodes"));
+    let (d, _) = f.service.step_draft(&s.id, true).await.unwrap();
+    assert_eq!(
+        (d.nodes.len(), d.edges.len()),
+        (1, 0),
+        "both went in one step"
+    );
+
+    // An upload deleted from the draft comes back with its file.
+    let incoming = f.service.incoming_path().await.unwrap();
+    std::fs::write(&incoming, b"weights").unwrap();
+    f.service
+        .put_upload_in(Store::Draft, &s.id, &a.id, "model.onnx", &incoming)
+        .await
+        .unwrap();
+    f.service
+        .delete_upload_in(Store::Draft, &s.id, &a.id, "model.onnx")
+        .await
+        .unwrap();
+    let (d, _) = f.service.step_draft(&s.id, true).await.unwrap();
+    let upload = d.nodes[0]
+        .node
+        .uploads
+        .iter()
+        .find(|u| u.name == "model.onnx")
+        .expect("restored");
+    assert!(
+        f.service
+            .files()
+            .files_dir
+            .join(upload.stored_name())
+            .exists(),
+        "its file was kept"
+    );
+}
+
+#[tokio::test]
+async fn plugin_usage_lists_live_and_draft_only_nodes() {
+    let f = fixture().await;
+    let s = f.scene().await;
+    let live = f.node(&s.id, "test-sink", sink(5)).await;
+    let draft_only = f
+        .service
+        .save_node(Store::Draft, &s.id, None, node_input("test-sink", sink(6)))
+        .await
+        .unwrap();
+    let uses: Vec<_> = f
+        .service
+        .plugin_usage()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|u| u.plugin_id == "test-sink")
+        .map(|u| (u.node_id, u.draft_only, u.scene_name))
+        .collect();
+    assert!(
+        uses.contains(&(live.id.clone(), false, s.name.clone())),
+        "{uses:?}"
+    );
+    assert!(
+        uses.contains(&(draft_only.id.clone(), true, s.name.clone())),
+        "{uses:?}"
+    );
+    // The live node is also in the draft: listed once.
+    assert_eq!(uses.iter().filter(|u| u.0 == live.id).count(), 1);
 }

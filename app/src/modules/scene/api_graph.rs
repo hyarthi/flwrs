@@ -102,16 +102,22 @@ const MAX_LAYOUT_NODES: usize = 10_000;
 #[serde(deny_unknown_fields)]
 pub(crate) struct LayoutRequest {
     /// Node id → its position (`null` = not placed). Nodes left out keep theirs.
+    #[serde(default)]
     #[schema(value_type = BTreeMap<String, Position>)]
     pub nodes: BTreeMap<String, Option<Position>>,
+    /// Edge id → the point it passes through, where its box sits (`null` =
+    /// the editor's own routing). Edges left out keep theirs.
+    #[serde(default)]
+    #[schema(value_type = BTreeMap<String, Position>)]
+    pub edges: BTreeMap<String, Option<Position>>,
 }
 
 #[utoipa::path(
     patch,
     path = "/by-id/{id}/layout",
     operation_id = "set-layout",
-    summary = "Place nodes on the editor's canvas",
-    description = "Sets the positions of several nodes at once, live and in the scene's draft (a node only in the draft too). Layout isn't content: no revision, no reload, not a draft change.",
+    summary = "Place nodes and edges on the editor's canvas",
+    description = "Sets the positions of several nodes (and the points edges pass through) at once, live and in the scene's draft (a node only in the draft too). Layout isn't content: no revision, no reload, not a draft change.",
     params(("id" = String, Path, description = "Scene ID")),
     request_body(content = LayoutRequest, content_type = "application/json"),
     responses(
@@ -125,13 +131,13 @@ pub(crate) async fn set_layout(
     Path(id): Path<String>,
     Json(req): Json<LayoutRequest>,
 ) -> Result<StatusCode, ApiError> {
-    if req.nodes.len() > MAX_LAYOUT_NODES {
+    if req.nodes.len() + req.edges.len() > MAX_LAYOUT_NODES {
         return Err(service::ServiceError::Invalid(vec![format!(
-            "at most {MAX_LAYOUT_NODES} nodes per request"
+            "at most {MAX_LAYOUT_NODES} nodes and edges per request"
         )])
         .into());
     }
-    service.set_layout(&id, &req.nodes).await?;
+    service.set_layout(&id, &req.nodes, &req.edges).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -145,6 +151,9 @@ pub(crate) struct Edge {
     /// Mapping applied on handover; null = pass through as-is.
     #[schema(value_type = Option<Object>)]
     pub mapping: Option<Value>,
+    /// The point the edge passes through on the canvas (where its box
+    /// sits); `null` = the editor routes it. Layout only.
+    pub via: Option<Position>,
     pub create_time: i64,
     pub update_time: i64,
 }
@@ -158,6 +167,7 @@ impl From<service::Edge> for Edge {
             source_node_id: e.source_node_id,
             target_node_id: e.target_node_id,
             mapping: e.mapping,
+            via: e.via,
             create_time: e.create_time.timestamp_millis(),
             update_time: e.update_time.timestamp_millis(),
         }

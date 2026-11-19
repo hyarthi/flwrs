@@ -37,13 +37,36 @@ async fn shutdown_signal() {
     }
 }
 
+/// Asked to stop from inside (e.g. a restart from the management API).
+static STOP: std::sync::LazyLock<CancellationToken> =
+    std::sync::LazyLock::new(CancellationToken::new);
+
+/// Stops the registry as a shutdown signal would: every service is cancelled
+/// and [`ServiceRegistry::start`] returns once they've finished.
+pub fn request_stop() {
+    STOP.cancel();
+}
+
+/// Whether [`request_stop`] was called.
+pub fn stop_requested() -> bool {
+    STOP.is_cancelled()
+}
+
 /// Runs a set of long-lived services and stops them together.
 #[derive(Default)]
 pub struct ServiceRegistry {
     services: Vec<&'static dyn Service>,
+    /// Stops it like a signal (default: the process-wide [`request_stop`]).
+    stop: Option<CancellationToken>,
 }
 
 impl ServiceRegistry {
+    /// Stopped by `token` instead of [`request_stop`] (tests).
+    pub fn with_stop(mut self, token: CancellationToken) -> Self {
+        self.stop = Some(token);
+        self
+    }
+
     pub fn register_service(&mut self, service: &'static dyn Service) {
         self.services.push(service);
     }
@@ -64,9 +87,14 @@ impl ServiceRegistry {
         let mut first_error = None;
         let signal = shutdown_signal();
         tokio::pin!(signal);
+        let stop = self.stop.clone().unwrap_or_else(|| STOP.clone());
         loop {
             tokio::select! {
                 _ = &mut signal => break,
+                () = stop.cancelled() => {
+                    log::info!("Stop requested");
+                    break;
+                }
                 joined = tasks.join_next() => match joined {
                     None => {
                         log::info!("All services stopped");
@@ -182,5 +210,21 @@ mod tests {
             WAITING.0.load(Ordering::SeqCst),
             "other services get cancelled"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stop_request_stops_every_service() {
+        let stop = CancellationToken::new();
+        let mut registry = ServiceRegistry::default().with_stop(stop.clone());
+        let waiting: &'static Waiting = Box::leak(Box::new(Waiting(AtomicBool::new(false))));
+        registry.register_service(waiting);
+        let run = tokio::spawn(async move { registry.start().await });
+        tokio::task::yield_now().await;
+        stop.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("stopped")
+            .unwrap();
+        assert!(result.is_ok());
     }
 }

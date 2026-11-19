@@ -7,21 +7,30 @@ use crate::registry::build_registry;
 use std::env;
 
 /// `[runtime]`: the server's own threads.
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize, serde::Serialize, Default, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
-struct RuntimeSection {
+pub(crate) struct RuntimeSection {
     /// Cores to use: 1 = single-threaded, N = the main thread + N - 1
     /// workers; unset or 0 = a worker per core.
     threads: Option<usize>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before the config is read: a changed config that was never confirmed
+    // goes back to the last good one (`modules::server_config`).
+    modules::server_config::at_start();
+    modules::server_config::wait_after_restart();
     let section: RuntimeSection = flwrs_core::config::read_struct(
         flwrs_core::config::main_config(),
         &["runtime".to_string()],
     )
     .unwrap_or_default();
-    flwrs_plugin::rt::runtime(section.threads)?.block_on(run())
+    flwrs_plugin::rt::runtime(section.threads)?.block_on(run())?;
+    // Everything has stopped (the runtime too): a restart from the server page.
+    if modules::server_config::restart_requested() {
+        modules::server_config::perform_restart();
+    }
+    Ok(())
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,6 +49,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     modules::plugin::init(director.clone()).await;
     modules::scene::init(director.clone()).await;
 
+    modules::server_config::watch_pending();
     let registry = build_registry().await;
     registry.start().await?;
 

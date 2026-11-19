@@ -4,6 +4,7 @@ mod configure_tests;
 pub(crate) mod draft;
 #[cfg(test)]
 mod draft_tests;
+pub(crate) mod mapping_test;
 mod query_sqlite;
 mod transfer;
 mod uploads;
@@ -108,6 +109,39 @@ impl Position {
     }
 }
 
+/// A node using a plugin.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct PluginUse {
+    pub plugin_id: String,
+    pub scene_id: String,
+    pub scene_name: String,
+    pub node_id: String,
+    pub node_name: Option<String>,
+    /// Only in the scene's draft (not live yet): it doesn't keep the plugin
+    /// from being deleted.
+    pub draft_only: bool,
+}
+
+/// A node's inbound queue as the director sets it up.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct NodeQueueView {
+    pub kind: QueueKindView,
+    #[schema(value_type = String)]
+    pub when_full: crate::modules::node_config::WhenFull,
+}
+
+/// Where a queue keeps its events.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueueKindView {
+    /// In memory; lost on a restart.
+    Memory,
+    /// In memory, overflowing to disk.
+    Spill,
+    /// On disk until delivered; survives a restart.
+    Durable,
+}
+
 /// A scene node: one plugin instance.
 #[derive(Debug, Clone)]
 pub(crate) struct Node {
@@ -172,6 +206,8 @@ pub(crate) struct EdgeRow {
     pub source_node_id: String,
     pub target_node_id: String,
     pub mapping: Option<String>,
+    /// Layout (`Position` as JSON: where the edge's box sits); not content.
+    pub ui: Option<String>,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
 }
@@ -186,6 +222,8 @@ pub(crate) struct Edge {
     pub target_node_id: String,
     /// `None` = pass events through as-is.
     pub mapping: Option<Value>,
+    /// The point the edge passes through on the canvas (its box), if placed.
+    pub via: Option<Position>,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
 }
@@ -207,6 +245,7 @@ impl From<EdgeRow> for Edge {
                 .mapping
                 .as_deref()
                 .and_then(|m| serde_json::from_str(m).ok()),
+            via: Position::from_json(row.ui.as_deref()),
             id: row.id,
             name: row.name,
             scene_id: row.scene_id,
@@ -1045,9 +1084,11 @@ impl Service {
         &self,
         scene_id: &str,
         nodes: &BTreeMap<String, Option<Position>>,
+        edges: &BTreeMap<String, Option<Position>>,
     ) -> Result<(), ServiceError> {
         let errors: Vec<String> = nodes
             .iter()
+            .chain(edges)
             .filter_map(|(id, p)| p.as_ref()?.check().err().map(|e| format!("{id}: {e}")))
             .collect();
         if !errors.is_empty() {
@@ -1070,11 +1111,93 @@ impl Service {
                 unknown.push(format!("{id}: no such node in this scene"));
             }
         }
+        for (id, via) in edges {
+            let ui = via.map(Position::to_json);
+            let live = query_sqlite::set_edge_ui(&mut tx, Store::Live, scene_id, id, ui.as_deref())
+                .await?;
+            let draft =
+                query_sqlite::set_edge_ui(&mut tx, Store::Draft, scene_id, id, ui.as_deref())
+                    .await?;
+            if !live && !draft {
+                unknown.push(format!("{id}: no such edge in this scene"));
+            }
+        }
         if !unknown.is_empty() {
             return Err(ServiceError::Invalid(unknown));
         }
+        // Moves are undoable too (when there's a draft).
+        if draft::query::get(&mut tx, scene_id).await?.is_some() {
+            draft::history::record(&mut tx, scene_id).await?;
+        }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Each receiving node's inbound queue as the director would set it up
+    /// (kind and when-full policy), for a graph that may not run yet (a
+    /// stopped scene, a draft). Nodes whose plugin isn't installed, and
+    /// sources, are left out.
+    pub(crate) async fn node_queues(
+        &self,
+        nodes: &[Node],
+        edges: &[(String, String)],
+        scene_durable: Option<bool>,
+        spill_default: bool,
+    ) -> BTreeMap<String, NodeQueueView> {
+        use crate::modules::director::queue::QueueKind;
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        let pairs: Vec<(&str, &str)> = edges
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let cyclic = super::graph::nodes_in_cycles(&ids, &pairs);
+        let mut out = BTreeMap::new();
+        for node in nodes.iter().filter(|n| n.node_type != "SOURCE") {
+            let Ok(plugin) = self.plugins.get(&node.plugin_id).await else {
+                continue;
+            };
+            let defaults = plugin
+                .parsed_manifest()
+                .and_then(|m| crate::modules::supervisor::runtime_defaults(&m).ok())
+                .unwrap_or_default();
+            let spec =
+                crate::modules::supervisor::QueueSpec::resolve(&node.config.runtime, &defaults);
+            let (kind, when_full) = crate::modules::director::running::effective_queue(
+                &spec,
+                scene_durable,
+                spill_default,
+                cyclic.contains(node.id.as_str()),
+            );
+            out.insert(
+                node.id.clone(),
+                NodeQueueView {
+                    kind: match kind {
+                        QueueKind::Memory => QueueKindView::Memory,
+                        QueueKind::Spill => QueueKindView::Spill,
+                        QueueKind::Durable => QueueKindView::Durable,
+                    },
+                    when_full,
+                },
+            );
+        }
+        out
+    }
+
+    /// Which nodes use which plugins: live ones, and nodes only in a draft.
+    pub(crate) async fn plugin_usage(&self) -> Result<Vec<PluginUse>, ServiceError> {
+        let mut conn = self.conn().await?;
+        Ok(sqlx::query_as::<sqlx::Sqlite, PluginUse>(
+            "SELECT n.plugin_id, n.scene_id, s.\"name\" AS scene_name, n.id AS node_id, n.\"name\" AS node_name, \
+                 FALSE AS draft_only \
+             FROM scene_nodes n JOIN scenes s ON s.id = n.scene_id \
+             UNION ALL \
+             SELECT d.plugin_id, d.scene_id, s.\"name\", d.id, d.\"name\", TRUE \
+             FROM scene_draft_nodes d JOIN scenes s ON s.id = d.scene_id \
+             WHERE d.removed = FALSE AND NOT EXISTS (SELECT 1 FROM scene_nodes n WHERE n.id = d.id) \
+             ORDER BY 3, 2, 5, 4",
+        )
+        .fetch_all(&mut *conn)
+        .await?)
     }
 
     /// Records a committed change in the transaction: the live graph's
@@ -1104,6 +1227,7 @@ impl Service {
         }
         query_sqlite::bump_revision(&mut conn, scene_id).await?;
         self.collect_garbage(&mut conn).await?;
+        crate::modules::node_logs::forget(id);
         if !scene.enabled {
             // Nothing runs it: its folder goes now. (A running scene's
             // reload removes it once the node has stopped.)
@@ -1201,6 +1325,12 @@ impl Service {
                 plugin.id, plugin.plugin_type
             ));
         }
+        // Before the configurator: a definition has no program to run.
+        if let (Some(rules), Some(config)) = (&rules, &config)
+            && let Some(problem) = rules.launch_problem(config.launch)
+        {
+            errors.push(problem);
+        }
         // A draft's incomplete node: stored without running its configurator.
         let mut incomplete = false;
         if lenient
@@ -1255,6 +1385,8 @@ impl Service {
             );
         }
         if !errors.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            errors.retain(|e| seen.insert(e.clone())); // the launch check runs twice
             return Err(ServiceError::Invalid(errors));
         }
         let plugin = plugin.expect("no errors");
@@ -1431,12 +1563,27 @@ impl Service {
         scene_id: &str,
         id: &str,
     ) -> Result<Node, ServiceError> {
+        self.reconfigure_node_in(Store::Live, scene_id, id).await
+    }
+
+    /// As [`Service::reconfigure_node`], live or in the scene's draft
+    /// (started from live if there's none).
+    pub(crate) async fn reconfigure_node_in(
+        &self,
+        store: Store,
+        scene_id: &str,
+        id: &str,
+    ) -> Result<Node, ServiceError> {
         let _guard = self.lock.lock().await;
         let mut conn = self.conn().await?;
         let scene = query_sqlite::get_scene(&mut conn, scene_id)
             .await
             .map_err(not_found("scene"))?;
-        let node: Node = query_sqlite::get_node(&mut conn, Store::Live, scene_id, id)
+        let defaults = match store {
+            Store::Live => scene.defaults.clone(),
+            Store::Draft => self.ensure_draft(&mut conn, &scene).await?.defaults,
+        };
+        let node: Node = query_sqlite::get_node(&mut conn, store, scene_id, id)
             .await
             .map_err(not_found("node"))?
             .try_into()?;
@@ -1466,8 +1613,7 @@ impl Service {
                 }
             },
         };
-        let uploads =
-            configurator::uploads(&mut conn, Store::Live, &self.files.files_dir, id).await?;
+        let uploads = configurator::uploads(&mut conn, store, &self.files.files_dir, id).await?;
         let configured = self
             .run_configurator(
                 &package,
@@ -1480,7 +1626,7 @@ impl Service {
             .map_err(ServiceError::Invalid)?;
         let mut config = node.config.clone();
         config.launch_args = configured.launch_args.clone();
-        let mut errors = validate_against_plugin(&config, &plugin, &scene.defaults)?;
+        let mut errors = validate_against_plugin(&config, &plugin, &defaults)?;
         if !errors.is_empty() {
             errors.insert(0, "the configured node isn't valid".into());
             return Err(ServiceError::Invalid(errors));
@@ -1494,14 +1640,15 @@ impl Service {
             configured: Some(configured),
         };
         let mut tx = conn.begin_with(WRITE_TX).await?;
-        let row = query_sqlite::update_node(&mut tx, Store::Live, scene_id, id, &prepared.values())
-            .await?;
-        self.store_configured(&mut tx, Store::Live, id, &prepared)
-            .await?;
-        query_sqlite::bump_revision(&mut tx, scene_id).await?;
+        let row =
+            query_sqlite::update_node(&mut tx, store, scene_id, id, &prepared.values()).await?;
+        self.store_configured(&mut tx, store, id, &prepared).await?;
+        self.committed(&mut tx, store, scene_id).await?;
         tx.commit().await?;
         self.collect_garbage(&mut conn).await?;
-        self.changed(&scene);
+        if store == Store::Live {
+            self.changed(&scene);
+        }
         self.with_secrets(row.try_into()?).await
     }
 
@@ -2122,6 +2269,52 @@ pub(crate) mod tests {
                 .unwrap_err(),
             ServiceError::NotFound("scene")
         ));
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn a_remote_definitions_nodes_must_be_remote() {
+        let f = fixture().await;
+        let def: crate::modules::plugin::definition::Definition = serde_json::from_value(json!({
+            "manifest": {"manifest_version": 2, "id": "far", "name": "Far", "version": "1.0.0",
+                         "type": "SINK", "launch": "remote", "payload_schemas": {"in": "in.json"}},
+            "files": {"in.json": {"json": {"fields": [{"key": "a", "type": "STRING"}]}}}
+        }))
+        .unwrap();
+        f.plugins.service.register_definition(&def).await.unwrap();
+        let s = f.scene().await;
+        let errors = invalid(
+            f.service
+                .create_node(&s.id, node_input("far", json!({})))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("config.launch: plugin far is a remote plugin definition"));
+        let remote = f
+            .node(
+                &s.id,
+                "far",
+                json!({"launch": "remote", "token": "a-long-enough-token"}),
+            )
+            .await;
+        assert_eq!(remote.node_type, "SINK");
+        // One made local behind the service's back (an import, an old row): the check lists it.
+        let Database::SQLite(db) = f.plugins.service.db();
+        let mut conn = db.get_connection().await.unwrap();
+        sqlx::query("UPDATE scene_nodes SET config = '{}' WHERE id = $1")
+            .bind(&remote.id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let check = f.service.check(&s.id).await.unwrap();
+        assert!(
+            check
+                .problems
+                .iter()
+                .any(|p| p.contains("remote plugin definition")),
+            "{check:?}"
+        );
     }
 
     #[cfg(not(feature = "remote"))]

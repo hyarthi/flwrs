@@ -7,6 +7,8 @@
 //!   the manifest's `platforms` becomes the build's platform.
 //! - `[build]` in `trellis.toml`: its command, then its `executable`.
 //! - Neither: the manifest's executable as it is in the folder (a script).
+//! - A remote plugin definition (`"launch": "remote"`): nothing is built;
+//!   the ZIP holds the manifest and its files, without an executable.
 //!
 //! The ZIP is reproducible (sorted entries, fixed timestamps, explicit
 //! permissions) and checked with the server's own rules before it's kept.
@@ -70,6 +72,116 @@ pub struct Packaged {
     pub executable_size: u64,
 }
 
+/// A build's result.
+struct Build {
+    executable: PathBuf,
+    /// The platform of a native (cargo) build.
+    platform: Option<String>,
+    /// Where the ZIP goes by default.
+    default_out: PathBuf,
+    /// A Rust crate's configurator binary.
+    configurator: Option<PathBuf>,
+}
+
+/// Builds the plugin's executable: `[build]`, cargo, or the manifest's file.
+fn build(
+    opts: &PackageOptions,
+    config: &Config,
+    flavor: Option<&Flavor>,
+    manifest: &Manifest,
+    manifest_file: &str,
+) -> Result<Build, String> {
+    let dir = &opts.dir;
+    let profile = if opts.release { "release" } else { "debug" };
+    // A Rust plugin's configurator is another binary of the crate, named as the file.
+    let configurator_bin = manifest
+        .configurator
+        .as_ref()
+        .filter(|c| !c.executable.is_empty())
+        .map(|c| {
+            Path::new(&c.executable)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+    let built = if let Some(build) = &config.build {
+        let (program, args) = build
+            .command
+            .split_first()
+            .ok_or("[build] command is empty")?;
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .current_dir(dir)
+            .env("TRELLIS_PROFILE", profile)
+            .env("TRELLIS_FLAVOR", opts.flavor.as_deref().unwrap_or(""));
+        if let Some(target) = &opts.target {
+            command.env("TRELLIS_TARGET", target);
+        }
+        let status = command
+            .status()
+            .map_err(|e| format!("couldn't run {program}: {e}"))?;
+        if !status.success() {
+            return Err(format!("the build command failed ({status})"));
+        }
+        Build {
+            executable: dir.join(&build.executable),
+            platform: None,
+            default_out: dir.join("dist"),
+            configurator: None,
+        }
+    } else if dir.join("Cargo.toml").is_file() {
+        let built = cargo_build(dir, opts, flavor, configurator_bin.as_deref())?;
+        if built.version != manifest.version {
+            return Err(format!(
+                "{manifest_file} version {} doesn't match Cargo.toml version {}",
+                manifest.version, built.version
+            ));
+        }
+        Build {
+            executable: built.binary,
+            platform: Some(platform_of(opts.target.as_deref())?),
+            default_out: built.target_dir.join("plugins"),
+            configurator: built.configurator,
+        }
+    } else if manifest.executable.is_empty() {
+        return Err(format!(
+            "{manifest_file} is a remote plugin definition: there's nothing to build without [build] in trellis.toml or a Cargo.toml (or give the remote plugin's executable)"
+        ));
+    } else {
+        Build {
+            executable: dir.join(&manifest.executable),
+            platform: None,
+            default_out: dir.join("dist"),
+            configurator: None,
+        }
+    };
+    if !built.executable.is_file() {
+        return Err(format!(
+            "the executable {} doesn't exist",
+            built.executable.display()
+        ));
+    }
+    Ok(built)
+}
+
+/// Builds the program of a remote plugin definition's folder for checks
+/// (`[build]` in `trellis.toml`, or a Rust crate), without packaging it: the
+/// definition's package has no executable, but `audit`, `test` and `bench`
+/// run the plugin that will connect from elsewhere.
+pub fn build_remote_executable(opts: &PackageOptions) -> Result<PathBuf, String> {
+    let config = match &opts.config {
+        Some(path) => Config::read(path)?,
+        None => Config::load(&opts.dir)?,
+    };
+    let file = opts.dir.join(MANIFEST_FILE);
+    let manifest: Manifest = serde_json::from_str(
+        &std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?,
+    )
+    .map_err(|e| format!("{MANIFEST_FILE}: {e}"))?;
+    Ok(build(opts, &config, None, &manifest, MANIFEST_FILE)?.executable)
+}
+
 /// Builds and packages the plugin in `opts.dir`.
 pub fn package(opts: &PackageOptions) -> Result<Packaged, String> {
     let dir = &opts.dir;
@@ -95,70 +207,30 @@ pub fn package(opts: &PackageOptions) -> Result<Packaged, String> {
         serde_json::from_str(&manifest_text).map_err(|e| format!("{manifest_file}: {e}"))?;
     let manifest: Manifest = serde_json::from_value(manifest_value.clone())
         .map_err(|e| format!("{manifest_file}: {e}"))?;
+    let remote = manifest.is_remote_only();
 
-    // Build.
-    let profile = if opts.release { "release" } else { "debug" };
-    // A Rust plugin's configurator is another binary of the crate, named as the file.
-    let configurator_bin = manifest.configurator.as_ref().map(|c| {
-        Path::new(&c.executable)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
-    let mut configurator_built = None;
-    let (executable, platform, default_out) = if let Some(build) = &config.build {
-        let (program, args) = build
-            .command
-            .split_first()
-            .ok_or("[build] command is empty")?;
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(dir)
-            .env("TRELLIS_PROFILE", profile)
-            .env("TRELLIS_FLAVOR", opts.flavor.as_deref().unwrap_or(""));
-        if let Some(target) = &opts.target {
-            command.env("TRELLIS_TARGET", target);
-        }
-        let status = command
-            .status()
-            .map_err(|e| format!("couldn't run {program}: {e}"))?;
-        if !status.success() {
-            return Err(format!("the build command failed ({status})"));
-        }
-        (dir.join(&build.executable), None, dir.join("dist"))
-    } else if dir.join("Cargo.toml").is_file() {
-        let built = cargo_build(dir, opts, flavor, configurator_bin.as_deref())?;
-        configurator_built = built.configurator.clone();
-        if built.version != manifest.version {
-            return Err(format!(
-                "{manifest_file} version {} doesn't match Cargo.toml version {}",
-                manifest.version, built.version
-            ));
-        }
-        let platform = platform_of(opts.target.as_deref())?;
-        (
-            built.binary,
-            Some(platform),
-            built.target_dir.join("plugins"),
-        )
+    // Build (a remote plugin definition: nothing to build or pack).
+    let (executable, platform, default_out, configurator_built) = if remote {
+        (None, None, dir.join("dist"), None)
     } else {
-        (dir.join(&manifest.executable), None, dir.join("dist"))
+        let built = build(opts, &config, flavor, &manifest, &manifest_file)?;
+        (
+            Some(built.executable),
+            built.platform,
+            built.default_out,
+            built.configurator,
+        )
     };
-    if !executable.is_file() {
-        return Err(format!(
-            "the executable {} doesn't exist",
-            executable.display()
-        ));
-    }
     if let Some(platform) = &platform {
         manifest_value["platforms"] = Value::Array(vec![Value::String(platform.clone())]);
     }
 
     // Files: path in the ZIP → (source, mode).
     let mut files: BTreeMap<String, (PathBuf, u32)> = BTreeMap::new();
-    files.insert(manifest.executable.clone(), (executable.clone(), 0o755));
-    if let Some(c) = &manifest.configurator {
+    if let Some(executable) = &executable {
+        files.insert(manifest.executable.clone(), (executable.clone(), 0o755));
+    }
+    if let Some(c) = manifest.configurator.as_ref().filter(|c| !c.executable.is_empty()) {
         let source = configurator_built
             .clone()
             .unwrap_or_else(|| dir.join(&c.executable));
@@ -243,7 +315,10 @@ pub fn package(opts: &PackageOptions) -> Result<Packaged, String> {
     }
     std::fs::rename(&partial, &out).map_err(|e| format!("{}: {e}", out.display()))?;
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
-    let executable_size = std::fs::metadata(&executable).map(|m| m.len()).unwrap_or(0);
+    let executable_size = executable
+        .as_ref()
+        .and_then(|e| std::fs::metadata(e).ok())
+        .map_or(0, |m| m.len());
     let manifest: Manifest = serde_json::from_value(manifest_value).map_err(|e| e.to_string())?;
     Ok(Packaged {
         path: out,

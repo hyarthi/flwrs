@@ -499,6 +499,9 @@ impl NodeConfig {
         if let Some(unsupported) = self.unsupported() {
             errors.push(unsupported);
         }
+        if let Some(problem) = plugin.node.and_then(|n| n.launch_problem(self.launch)) {
+            errors.push(problem);
+        }
         let node_schemas = plugin.node.is_some_and(|n| n.has_node_schemas());
         match self.launch {
             LaunchMode::Local => {

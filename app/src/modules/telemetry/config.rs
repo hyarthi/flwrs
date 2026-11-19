@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Deserialize, Clone, Debug, Default, PartialEq, serde::Serialize, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct TelemetryConfig {
     /// Export to an OpenTelemetry collector (OTLP/HTTP). Present = on.
@@ -19,7 +19,9 @@ pub(crate) struct TelemetryConfig {
 
 /// The format of a file sink; each has its own file extension, so several
 /// formats can share a folder.
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum FileFormat {
     /// OTLP JSON Lines (`.jsonl`): one OTLP `MetricsData` per line, as the
@@ -46,12 +48,13 @@ impl FileFormat {
 }
 
 /// A `[[telemetry.file]]` entry. Durations are strings like `30m`, `6h`, `1d`.
-#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileConfig {
     pub format: FileFormat,
     /// Folder for the files; created if missing.
     #[serde(default = "default_file_dir")]
+    #[schema(value_type = String)]
     pub dir: PathBuf,
     /// How often stats are collected.
     #[serde(default = "default_file_interval_ms")]
@@ -162,7 +165,7 @@ impl TelemetryConfig {
     }
 }
 
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Temporality {
     /// Totals since the start (OTLP default; Prometheus-style backends).
@@ -173,7 +176,7 @@ pub(crate) enum Temporality {
 
 /// Every key is optional; unset keys fall back to the standard
 /// `OTEL_*` environment variables, then to the defaults.
-#[derive(Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Deserialize, Clone, Debug, Default, PartialEq, serde::Serialize, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct OtlpConfig {
     /// Full URL of the metrics endpoint, e.g. `http://collector:4318/v1/metrics`.

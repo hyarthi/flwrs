@@ -26,7 +26,7 @@ A naive model is probably enough: the goal is "don't wait when nothing's coming,
 ## Things to measure first
 
 - Latency per durable hop at 10 / 100 / 1 000 / 10 000 events/s, fixed window vs adaptive.
-- Commits (fsyncs) per second and bytes written per event, on an SSD and on an SD card (the edge measurements in phase 9).
+- Commits (fsyncs) per second and bytes written per event, on an SSD and on an SD card.
 - Behaviour around the rate where the model switches (no flapping: hysteresis on the EWMA).
 
 ## Related

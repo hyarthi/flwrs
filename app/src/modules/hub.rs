@@ -2,7 +2,7 @@
 //! reader and writer). The director runs it (so it outlives every scene) and
 //! uses it through [`Hub::expect`] and [`NodeLink`].
 
-mod config;
+pub(crate) mod config;
 mod link_stats;
 mod pending;
 mod service;

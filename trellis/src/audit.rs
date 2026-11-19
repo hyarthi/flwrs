@@ -1,7 +1,7 @@
 //! `audit`: the conformance cases. Each case starts the plugin afresh against
 //! the fake hub and checks one part of the plugin protocol (`docs/protocol.md`).
 
-use crate::hub::{Fixture, INSTANCE_ID, decode};
+use crate::hub::{Fixture, decode};
 use crate::payload::sample_payload;
 use crate::stimulus::{Stimulus, StimulusCtx};
 use crate::target::Target;
@@ -156,14 +156,20 @@ type CaseResultInner = Result<Outcome, String>;
 async fn handshake(f: &mut Fixture) -> CaseResultInner {
     let (_, init) = f.handshake().await?;
     let mut problems = vec![];
-    if init.instance_id != INSTANCE_ID {
+    if init.instance_id != f.target.instance_id() {
         problems.push(format!(
-            "instance_id {:?}, expected {INSTANCE_ID:?} (from --id)",
-            init.instance_id
+            "instance_id {:?}, expected {:?} (from --id{})",
+            init.instance_id,
+            f.target.instance_id(),
+            if f.target.remote.is_some() { ", or [remote] id" } else { "" }
         ));
     }
     if init.token != f.token {
-        problems.push("token isn't FLWRS_TOKEN".to_string());
+        problems.push(if f.target.remote.is_some() {
+            "token isn't the one it was given (${token} / FLWRS_TOKEN, or [remote] token)".to_string()
+        } else {
+            "token isn't FLWRS_TOKEN".to_string()
+        });
     }
     if init.plugin_type != f.target.plugin_type as i32 {
         problems.push(format!(
@@ -440,6 +446,15 @@ async fn shuts_down(f: &mut Fixture) -> CaseResultInner {
             }
             Ok(Some(_)) => {} // in-flight events, acks
         }
+    }
+    // A remote plugin's process isn't ours to watch: its connection closes.
+    if f.target.launched_remotely() {
+        return conn
+            .reader
+            .closed(Duration::from_secs(10))
+            .await
+            .map(|_| Outcome::Pass)
+            .map_err(|e| format!("after EXIT: {e}"));
     }
     if f.exits(Duration::from_secs(10)).await {
         Ok(Outcome::Pass)

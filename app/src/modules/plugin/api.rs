@@ -1,3 +1,4 @@
+use super::definition::{Definition, DefinitionFile, MAX_BODY_BYTES};
 use super::service::{Plugin, Service, ServiceError};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -33,6 +34,21 @@ pub(crate) struct PluginInfo {
     pub out_schema: Option<serde_json::Value>,
     /// How a UI presents it (the manifest's `ui`); absent if it says nothing.
     pub ui: Option<PluginUi>,
+    /// The launch args the plugin's configurator sets (manifest
+    /// `configurator.fields`): a local node's values for them come from it.
+    pub configured_fields: Vec<String>,
+    /// Whether the plugin takes a core count (manifest `threads`), so a
+    /// node's `runtime.threads` reaches it.
+    pub takes_threads: bool,
+    /// The manifest's format version (1 or 2).
+    pub manifest_version: u32,
+    /// A remote plugin definition (manifest `"launch": "remote"`): nothing
+    /// runs on this server, its nodes must be remote.
+    pub remote_only: bool,
+    /// Whether a node's `in` / `out` payload schema comes from its own
+    /// launch args (manifest `payload_schemas.*.from_launch_args`); then
+    /// `in_schema` / `out_schema` are the package's default, if any.
+    pub node_schemas: NodeSchemaSources,
     /// Whether the package's files are present on disk.
     pub installed: bool,
     pub archive_sha256: String,
@@ -56,6 +72,27 @@ impl PluginInfo {
             });
         Self {
             ui,
+            configured_fields: manifest
+                .as_ref()
+                .and_then(|m| m.configurator.as_ref())
+                .map(|c| c.fields.clone())
+                .unwrap_or_default(),
+            takes_threads: manifest.as_ref().is_some_and(|m| m.threads.is_some()),
+            manifest_version: manifest.as_ref().map_or(0, |m| m.manifest_version),
+            remote_only: manifest.as_ref().is_some_and(|m| m.is_remote_only()),
+            node_schemas: {
+                use flwrs_plugin::package::manifest::SchemaSource;
+                let from_args =
+                    |s: Option<&SchemaSource>| matches!(s, Some(SchemaSource::FromLaunchArgs(_)));
+                NodeSchemaSources {
+                    input: manifest
+                        .as_ref()
+                        .is_some_and(|m| from_args(m.payload_schemas.input.as_ref())),
+                    output: manifest
+                        .as_ref()
+                        .is_some_and(|m| from_args(m.payload_schemas.output.as_ref())),
+                }
+            },
             installed,
             platforms: manifest.as_ref().and_then(|m| m.platforms.clone()),
             launch_args_style: manifest
@@ -76,6 +113,42 @@ impl PluginInfo {
             update_time: plugin.update_time.timestamp_millis(),
         }
     }
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct NodeSchemaSources {
+    #[serde(rename = "in")]
+    pub input: bool,
+    #[serde(rename = "out")]
+    pub output: bool,
+}
+
+/// Whether this server takes plugin changes, and what they need.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PluginSettings {
+    /// `[plugins] allow_upload`: uploads, upgrades and deletes are on.
+    pub allow_upload: bool,
+    /// `[plugins] admin_token` is set: changes need `X-Flwrs-Admin-Token`.
+    /// Without one, only loopback clients may change plugins.
+    pub admin_token_required: bool,
+    /// The largest package upload (bytes).
+    pub max_upload_bytes: u64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/settings",
+    operation_id = "plugin-settings",
+    summary = "Whether this server takes plugin uploads, and what they need",
+    responses((status = 200, description = "The settings", body = PluginSettings))
+)]
+async fn plugin_settings(State(service): State<Svc>) -> Json<PluginSettings> {
+    let c = service.config();
+    Json(PluginSettings {
+        allow_upload: c.allow_upload,
+        admin_token_required: c.admin_token.is_some(),
+        max_upload_bytes: c.max_upload_bytes,
+    })
 }
 
 /// The manifest's `ui` block. The icon and the docs are served by
@@ -188,6 +261,154 @@ async fn get_ui_file(
         .into_response())
 }
 
+/// The package files the launch-args schema names as `x-flwrs-code`
+/// `definitions` (LuaCATS files for editors).
+fn definitions_named(schema: &serde_json::Value, out: &mut Vec<String>) {
+    match schema {
+        serde_json::Value::Object(map) => {
+            if let Some(path) = map
+                .get("x-flwrs-code")
+                .and_then(|c| c.get("definitions"))
+                .and_then(|d| d.as_str())
+            {
+                out.push(path.to_string());
+            }
+            map.values().for_each(|v| definitions_named(v, out));
+        }
+        serde_json::Value::Array(list) => list.iter().for_each(|v| definitions_named(v, out)),
+        _ => {}
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/by-id/{id}/definitions/{path}",
+    operation_id = "get-plugin-code-definitions",
+    summary = "Get a code field's definitions file",
+    description = "A LuaCATS (`---@meta`) file the launch-args schema names in an `x-flwrs-code` `definitions`: the globals and types a code field's editor completes. Only such files; served as `text/plain`, sandboxed, `ETag` = the package's hash.",
+    params(
+        ("id" = String, Path, description = "Plugin id"),
+        ("path" = String, Path, description = "The file's path in the package, as the schema names it"),
+    ),
+    responses(
+        (status = 200, description = "The file", content_type = "text/plain", body = String),
+        (status = 404, description = "No such plugin, or the schema names no such file", body = ErrorBody),
+    )
+)]
+async fn get_definitions(
+    State(service): State<Svc>,
+    Path((id, path)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let plugin = service.get(&id).await?;
+    let not_found = || {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "the plugin names no such file",
+            vec![],
+        )
+    };
+    let schema: serde_json::Value = plugin
+        .launch_args_schema
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .ok_or_else(not_found)?;
+    let mut named = vec![];
+    definitions_named(&schema, &mut named);
+    if !named.contains(&path) {
+        return Err(not_found());
+    }
+    // The schema's paths were checked at install (relative, no `..`).
+    let file = std::path::Path::new(&plugin.install_path).join(&path);
+    let size = tokio::fs::metadata(&file)
+        .await
+        .map_err(|_| not_found())?
+        .len();
+    if size > MAX_UI_FILE_BYTES {
+        return Err(not_found());
+    }
+    let bytes = tokio::fs::read(&file).await.map_err(|_| not_found())?;
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            (header::ETAG, format!("\"{}\"", plugin.archive_sha256)),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; sandbox".to_string(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+#[derive(serde::Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NodeSchemasRequest {
+    /// A node's launch args (as being edited; secrets may be left out).
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub launch_args: serde_json::Value,
+}
+
+#[derive(Serialize, ToSchema)]
+pub(crate) struct NodeSchemasResponse {
+    /// The `in` payload schema a node with these launch args has; `null` =
+    /// none (a source) or not given yet.
+    #[serde(rename = "in")]
+    pub input: Option<Vec<crate::modules::scene::service::mapping_test::SchemaField>>,
+    #[serde(rename = "out")]
+    pub output: Option<Vec<crate::modules::scene::service::mapping_test::SchemaField>>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/by-id/{id}/node-schemas",
+    operation_id = "get-plugin-node-schemas",
+    summary = "The payload schemas a node of this plugin would have",
+    description = "For launch args as a node's settings form holds them: the plugin's schemas, or the node's own (`payload_schemas.from_launch_args`). For editors (e.g. typing `payload` in a code field). A schema that's missing or malformed in the args is `null`.",
+    params(("id" = String, Path, description = "Plugin id")),
+    request_body(content = NodeSchemasRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "The schemas", body = NodeSchemasResponse),
+        (status = 404, description = "No such plugin", body = ErrorBody),
+    )
+)]
+async fn node_schemas(
+    State(service): State<Svc>,
+    Path(id): Path<String>,
+    Json(req): Json<NodeSchemasRequest>,
+) -> Result<Json<NodeSchemasResponse>, ApiError> {
+    use super::node_rules::{NodeRules, Side};
+    use crate::modules::scene::service::mapping_test::SchemaField;
+    let plugin = service.get(&id).await?;
+    let rules = NodeRules::of(&plugin)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, e, vec![]))?;
+    let args = if req.launch_args.is_null() {
+        serde_json::json!({})
+    } else {
+        req.launch_args
+    };
+    let side = |side| {
+        rules
+            .node_schema(side, &args)
+            .ok()
+            .flatten()
+            .map(|s| SchemaField::list(&s))
+    };
+    Ok(Json(NodeSchemasResponse {
+        input: side(Side::In),
+        output: side(Side::Out),
+    }))
+}
+
 /// Error response with a list of details (e.g. every problem in a package).
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ErrorBody {
@@ -249,14 +470,20 @@ pub(crate) const ADMIN_TOKEN_HEADER: &str = "x-flwrs-admin-token";
 /// present the admin token (`X-Flwrs-Admin-Token`, if one is configured) or
 /// connect from a loopback address.
 fn authorize(service: Svc, headers: &HeaderMap, peer: SocketAddr) -> Result<(), ApiError> {
-    let config = service.config();
-    if !config.allow_upload {
+    if !service.config().allow_upload {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "plugin changes are disabled",
             vec!["set [plugins] allow_upload = true in the server config".into()],
         ));
     }
+    authorize_admin(service, headers, peer)
+}
+
+/// Remote plugin definitions run nothing on this server, so they don't need
+/// `allow_upload`: only the admin token (or a loopback client).
+fn authorize_admin(service: Svc, headers: &HeaderMap, peer: SocketAddr) -> Result<(), ApiError> {
+    let config = service.config();
     match &config.admin_token {
         Some(token) => {
             let presented = headers
@@ -402,7 +629,7 @@ async fn get_launch_args_schema(
     path = "",
     operation_id = "upload-plugin",
     summary = "Upload and register a plugin package",
-    description = "Requires `[plugins] allow_upload = true`, and the admin token (`X-Flwrs-Admin-Token`, if configured) or a loopback client, on top of the API's own auth.",
+    description = "Requires `[plugins] allow_upload = true` (also for a remote plugin definition's ZIP; `POST /api/plugins/remote` takes one as JSON without it), and the admin token (`X-Flwrs-Admin-Token`, if configured) or a loopback client, on top of the API's own auth.",
     request_body(content = PluginUpload, content_type = "multipart/form-data"),
     responses(
         (status = 201, description = "Registered", body = PluginInfo),
@@ -477,9 +704,127 @@ async fn delete_plugin(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    authorize(service, &headers, peer)?;
+    // A remote plugin definition goes without `allow_upload`, as it came.
+    let definition = service
+        .get(&id)
+        .await?
+        .parsed_manifest()
+        .is_some_and(|m| m.is_remote_only());
+    if definition {
+        authorize_admin(service, &headers, peer)?;
+    } else {
+        authorize(service, &headers, peer)?;
+    }
     service.delete(&id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/remote",
+    operation_id = "register-remote-plugin",
+    summary = "Register a remote plugin definition from JSON",
+    description = "A plugin that runs elsewhere, described by a manifest with `\"launch\": \"remote\"` and the files it references (no ZIP; see `docs/plugin-spec.md` §4.2). Checked and stored like a package. Nothing in it runs here, so it needs the admin token (`X-Flwrs-Admin-Token`, if configured) or a loopback client, but not `[plugins] allow_upload`.",
+    request_body = Definition,
+    responses(
+        (status = 201, description = "Registered", body = PluginInfo),
+        (status = 401, description = "Missing or wrong admin token", body = ErrorBody),
+        (status = 403, description = "Non-loopback client without a token", body = ErrorBody),
+        (status = 409, description = "Plugin id already registered", body = ErrorBody),
+        (status = 413, description = "Too large"),
+        (status = 422, description = "Invalid definition; details list every problem", body = ErrorBody),
+    )
+)]
+async fn register_definition(
+    State(service): State<Svc>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(definition): Json<Definition>,
+) -> Result<(StatusCode, Json<PluginInfo>), ApiError> {
+    authorize_admin(service, &headers, peer)?;
+    let plugin = service.register_definition(&definition).await?;
+    Ok((StatusCode::CREATED, Json(PluginInfo::new(plugin, service))))
+}
+
+#[utoipa::path(
+    get,
+    path = "/by-id/{id}/definition",
+    operation_id = "get-remote-plugin-definition",
+    summary = "A remote plugin definition's manifest and files",
+    params(("id" = String, Path, description = "Plugin id")),
+    responses(
+        (status = 200, description = "The definition", body = Definition),
+        (status = 404, description = "No such plugin, or a package that runs here", body = ErrorBody),
+    )
+)]
+async fn get_definition(
+    State(service): State<Svc>,
+    Path(id): Path<String>,
+) -> Result<Json<Definition>, ApiError> {
+    Ok(Json(service.definition(&id).await?))
+}
+
+#[utoipa::path(
+    get,
+    path = "/by-id/{id}/export",
+    operation_id = "export-remote-plugin",
+    summary = "A remote plugin definition as a package ZIP",
+    description = "The definition packed as a package (`<id>-<version>.zip`), to pass along: any server takes it as an upload (`POST /api/plugins`). Packages that run here aren't exported: their file is the one that was uploaded.",
+    params(("id" = String, Path, description = "Plugin id")),
+    responses(
+        (status = 200, description = "The package", content_type = "application/zip"),
+        (status = 404, description = "No such plugin, or a package that runs here", body = ErrorBody),
+    )
+)]
+async fn export_definition(
+    State(service): State<Svc>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    let (name, bytes) = service.export_definition(&id).await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+#[utoipa::path(
+    put,
+    path = "/by-id/{id}/definition",
+    operation_id = "replace-remote-plugin-definition",
+    summary = "Replace a remote plugin definition",
+    description = "Same id and type; a new version or the same one again. Refused if a node would no longer fit (details list them).",
+    params(("id" = String, Path, description = "Plugin id")),
+    request_body = Definition,
+    responses(
+        (status = 200, description = "Replaced", body = PluginInfo),
+        (status = 401, description = "Missing or wrong admin token", body = ErrorBody),
+        (status = 403, description = "Non-loopback client without a token", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "Scene nodes would become invalid; details list them", body = ErrorBody),
+        (status = 413, description = "Too large"),
+        (status = 422, description = "Invalid definition, or a package that runs here", body = ErrorBody),
+    )
+)]
+async fn replace_definition(
+    State(service): State<Svc>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(definition): Json<Definition>,
+) -> Result<Json<PluginInfo>, ApiError> {
+    authorize_admin(service, &headers, peer)?;
+    let plugin = service.replace_definition(&id, &definition).await?;
+    Ok(Json(PluginInfo::new(plugin, service)))
 }
 
 #[derive(OpenApi)]
@@ -489,12 +834,31 @@ async fn delete_plugin(
         list_plugins,
         get_plugin,
         get_launch_args_schema,
+        plugin_settings,
         get_ui_file,
+        get_definitions,
+        node_schemas,
         upload_plugin,
         upgrade_plugin,
-        delete_plugin
+        delete_plugin,
+        register_definition,
+        get_definition,
+        replace_definition,
+        export_definition
     ),
-    components(schemas(PluginInfo, PluginUi, UiFile, ErrorBody, PluginUpload))
+    components(schemas(
+        PluginInfo,
+        PluginUi,
+        NodeSchemaSources,
+        PluginSettings,
+        UiFile,
+        NodeSchemasRequest,
+        NodeSchemasResponse,
+        ErrorBody,
+        PluginUpload,
+        Definition,
+        DefinitionFile
+    ))
 )]
 pub(crate) struct Api;
 
@@ -511,8 +875,27 @@ impl Api {
                 "/plugins/by-id/{id}/launch-args-schema",
                 get(get_launch_args_schema),
             )
+            .route("/plugins/settings", get(plugin_settings))
             .route("/plugins/by-id/{id}/ui/{file}", get(get_ui_file))
+            .route(
+                "/plugins/by-id/{id}/definitions/{*path}",
+                get(get_definitions),
+            )
+            .route(
+                "/plugins/by-id/{id}/node-schemas",
+                axum::routing::post(node_schemas),
+            )
             .layer(DefaultBodyLimit::max(limit))
+            .merge(
+                Router::new()
+                    .route("/plugins/remote", axum::routing::post(register_definition))
+                    .route(
+                        "/plugins/by-id/{id}/definition",
+                        get(get_definition).put(replace_definition),
+                    )
+                    .route("/plugins/by-id/{id}/export", get(export_definition))
+                    .layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
+            )
             .with_state(service)
     }
 }
@@ -674,6 +1057,217 @@ mod tests {
         assert_eq!(none.status(), StatusCode::NOT_FOUND);
         let (_, plain) = call(&f, LOCAL, get("/plugins/by-id/plain")).await;
         assert!(plain["ui"].is_null());
+        assert_eq!(plain["configured_fields"], serde_json::json!([]));
+        assert_eq!(info["manifest_version"], 2);
+        assert_eq!(
+            info["node_schemas"],
+            serde_json::json!({"in": false, "out": false})
+        );
+        let (status, settings) = call(&f, LOCAL, get("/plugins/settings")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(settings["allow_upload"], false);
+        assert_eq!(settings["admin_token_required"], false);
+        assert_eq!(plain["takes_threads"], false);
+    }
+
+    #[tokio::test]
+    async fn serves_code_definitions_and_node_schemas() {
+        use crate::modules::plugin::package::tests::{IN_SCHEMA, Item, PLATFORM, build_zip};
+        let f = fixture(|_| {}).await;
+        let path = f.service.new_upload_path();
+        let manifest = format!(
+            r#"{{"manifest_version": 2, "id": "coder", "name": "Coder", "version": "1.0.0",
+                "type": "SINK", "executable": "bin/run", "platforms": ["{PLATFORM}"],
+                "launch_args_schema": "schema/launch.json", "payload_schemas": {{"in": "schema/in.json"}}}}"#
+        );
+        let launch = r#"{"type": "object", "properties": {"script": {"type": "string",
+            "x-flwrs-launch": {"via": "file"},
+            "x-flwrs-code": {"language": "lua", "params": ["payload"], "definitions": "types/api.d.lua"}}}}"#;
+        build_zip(
+            &path,
+            &[
+                Item::File("manifest.json", manifest.as_bytes()),
+                Item::File("bin/run", b"#!/bin/sh\n"),
+                Item::File("schema/in.json", IN_SCHEMA.as_bytes()),
+                Item::File("schema/launch.json", launch.as_bytes()),
+                Item::File("types/api.d.lua", b"---@meta\nfunction hello() end\n"),
+                Item::File("types/other.lua", b"secret"),
+            ],
+        );
+        f.service.install(&path).await.unwrap();
+
+        let app = Api::build_router(f.service);
+        let get = |uri: &str| Request::get(uri).body(Body::empty()).unwrap();
+        let defs = app
+            .clone()
+            .oneshot(get("/plugins/by-id/coder/definitions/types/api.d.lua"))
+            .await
+            .unwrap();
+        assert_eq!(defs.status(), StatusCode::OK);
+        assert!(
+            defs.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain")
+        );
+        assert!(
+            std::str::from_utf8(&defs.into_body().collect().await.unwrap().to_bytes())
+                .unwrap()
+                .contains("hello")
+        );
+        // Only the files the schema names.
+        let other = app
+            .clone()
+            .oneshot(get("/plugins/by-id/coder/definitions/types/other.lua"))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::NOT_FOUND);
+
+        let schemas = app
+            .oneshot(
+                Request::post("/plugins/by-id/coder/node-schemas")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"launch_args": {}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(schemas.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&schemas.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["in"][0]["key"], "url");
+        assert!(body["out"].is_null());
+    }
+
+    fn json_request(method: &str, uri: &str, body: &serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn definition(version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "manifest": {"manifest_version": 2, "id": "far-sensor", "name": "Far sensor",
+                         "version": version, "type": "SOURCE", "launch": "remote",
+                         "payload_schemas": {"out": "schema/out.json"},
+                         "ui": {"docs": "README.md", "categories": ["Remote"]}},
+            "files": {
+                "schema/out.json": {"json": {"fields": [{"key": "t", "type": "F64"}]}},
+                "README.md": {"text": "# Far sensor"}
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn remote_definitions_register_from_json_without_uploads() {
+        let f = fixture(|_| {}).await; // allow_upload off
+        let (status, _) = call(
+            &f,
+            REMOTE,
+            json_request("POST", "/plugins/remote", &definition("1.0.0")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "no token: loopback only");
+        let (status, json) = call(
+            &f,
+            LOCAL,
+            json_request("POST", "/plugins/remote", &definition("1.0.0")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert_eq!(json["remote_only"], true);
+        assert_eq!(json["installed"], true);
+        assert_eq!(json["platforms"], serde_json::Value::Null);
+        assert_eq!(json["out_schema"]["fields"][0]["key"], "t");
+        assert_eq!(json["ui"]["docs"], true);
+
+        let get = |uri: &str| Request::get(uri).body(Body::empty()).unwrap();
+        let (status, json) = call(&f, LOCAL, get("/plugins/by-id/far-sensor/definition")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, definition("1.0.0"));
+
+        let (status, json) = call(
+            &f,
+            LOCAL,
+            json_request(
+                "PUT",
+                "/plugins/by-id/far-sensor/definition",
+                &definition("1.1.0"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["version"], "1.1.0");
+
+        // Not a definition: refused with the reason.
+        let mut package = definition("1.0.0");
+        package["manifest"]["id"] = "other".into();
+        package["manifest"]
+            .as_object_mut()
+            .unwrap()
+            .remove("launch");
+        let (status, json) =
+            call(&f, LOCAL, json_request("POST", "/plugins/remote", &package)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            json["details"][0].as_str().unwrap().contains("launch"),
+            "{json}"
+        );
+        // The package checks apply: a missing file.
+        let mut missing = definition("1.0.0");
+        missing["manifest"]["id"] = "other".into();
+        missing["files"]
+            .as_object_mut()
+            .unwrap()
+            .remove("README.md");
+        let (status, json) =
+            call(&f, LOCAL, json_request("POST", "/plugins/remote", &missing)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(json["details"].to_string().contains("README.md"), "{json}");
+
+        let response = Api::build_router(f.service)
+            .layer(MockConnectInfo(LOCAL.parse::<SocketAddr>().unwrap()))
+            .oneshot(get("/plugins/by-id/far-sensor/export"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"far-sensor-1.1.0.zip\""
+        );
+        let zip = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&zip[..2], b"PK");
+        // As a ZIP it's a package upload like any other: allow_upload.
+        let (status, _) = call(
+            &f,
+            LOCAL,
+            upload_request("POST", "/plugins", multipart_body(&zip), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "uploads are off");
+        let other = fixture(|c| c.allow_upload = true).await;
+        let (status, json) = call(
+            &other,
+            LOCAL,
+            upload_request("POST", "/plugins", multipart_body(&zip), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert_eq!(json["remote_only"], true);
+
+        let delete = Request::delete("/plugins/by-id/far-sensor")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = call(&f, LOCAL, delete).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "deleted without allow_upload"
+        );
     }
 
     #[tokio::test]

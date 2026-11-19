@@ -16,13 +16,14 @@ const DEFAULT_TTL: &str = "7d";
 const MAX_TTL: Duration = Duration::from_secs(365 * 86_400);
 
 /// The section as written. Strict: an unknown key is an error.
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Default, Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct AuthConfig {
     /// The key itself. Prefer `secret_key_file` or `FLWRS_SECRET_KEY`, so the
     /// key needn't sit in the config file.
     pub secret_key: Option<String>,
     /// A file holding the key (surrounding whitespace ignored).
+    #[schema(value_type = Option<String>)]
     pub secret_key_file: Option<PathBuf>,
     /// How long a login lasts: `12h`, `7d` (default), …
     pub session_ttl: Option<String>,

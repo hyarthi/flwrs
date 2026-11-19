@@ -1,6 +1,6 @@
 # Idea: application-level acks in the WebSocket source
 
-Status: idea, deferred (phase 8, Nov 2026): a configuration-time feature, with modes per integration (and "none", today's behaviour).
+Status: idea, deferred (Nov 2026): a configuration-time feature, with modes per integration (and "none", today's behaviour).
 
 ## Problem
 

@@ -1,6 +1,6 @@
 # Idea: connect and disconnect events in the WebSocket source
 
-Status: idea, deferred (phase 8, Nov 2026: "still need to think whether they are needed and how to best implement").
+Status: idea, deferred (Nov 2026: "still need to think whether they are needed and how to best implement").
 
 ## Problem
 

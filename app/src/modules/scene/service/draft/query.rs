@@ -68,14 +68,14 @@ pub(crate) async fn insert(
     .await
 }
 
-/// Marks the draft as changed now.
+/// Marks the draft as changed now, and records its state for undo.
 pub(crate) async fn touch(conn: &mut SqliteConnection, scene_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE scene_drafts SET update_time = $1 WHERE scene_id = $2")
         .bind(Local::now())
         .bind(scene_id)
-        .execute(conn)
+        .execute(&mut *conn)
         .await?;
-    Ok(())
+    super::history::record(conn, scene_id).await
 }
 
 pub(crate) async fn set_settings(
@@ -261,12 +261,13 @@ pub(crate) async fn put_edge(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO scene_draft_edges (id, \"name\", scene_id, source_node_id, target_node_id, mapping, \
-             create_time, update_time, base_hash, removed, conflict) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             create_time, update_time, base_hash, removed, conflict, ui) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (id) DO UPDATE SET \"name\" = excluded.\"name\", \
              source_node_id = excluded.source_node_id, target_node_id = excluded.target_node_id, \
              mapping = excluded.mapping, update_time = excluded.update_time, \
-             base_hash = excluded.base_hash, removed = excluded.removed, conflict = excluded.conflict",
+             base_hash = excluded.base_hash, removed = excluded.removed, conflict = excluded.conflict, \
+             ui = COALESCE(excluded.ui, scene_draft_edges.ui)",
     )
     .bind(&row.id)
     .bind(&row.name)
@@ -279,6 +280,7 @@ pub(crate) async fn put_edge(
     .bind(meta.base_hash.as_deref())
     .bind(meta.removed)
     .bind(meta.conflict.as_deref())
+    .bind(&row.ui)
     .execute(conn)
     .await?;
     Ok(())

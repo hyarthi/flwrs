@@ -4,7 +4,17 @@
 //! link to each top-level entry of the package, its `launch_args` delivered as
 //! arguments, environment variables and files in `config/`, and files
 //! uploaded to the node linked into `config/` too.
+//!
+//! A **remote node** (a remote plugin definition, manifest `"launch":
+//! "remote"`, or any plugin given a [`RemoteLaunch`]) runs elsewhere: its
+//! launch args aren't delivered (the server never delivers a remote node's),
+//! they only set the node's own payload schemas, and its configurator is its
+//! endpoint. With a [`RemoteLaunch`], trellis runs its commands to make the
+//! plugin start or connect; a definition can also be checked against a local
+//! stand-in ([`Target::with_executable`]: the bootstrap arguments, in an
+//! empty folder).
 
+use crate::remote::RemoteLaunch;
 use flwrs_plugin::package::configure::{self, Configured, Invocation};
 use flwrs_plugin::package::launch::check_file_name;
 use flwrs_plugin::package::{
@@ -50,6 +60,8 @@ pub struct Target {
     configured: Option<Arc<Configured>>,
     /// The node's folder: the plugin's working directory.
     node: Arc<tempfile::TempDir>,
+    /// A plugin that runs elsewhere: how it's made to connect.
+    pub remote: Option<Arc<RemoteLaunch>>,
 }
 
 impl Target {
@@ -94,9 +106,19 @@ impl Target {
             }
         };
         let cwd = std::path::absolute(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let remote = manifest.is_remote_only();
         Ok(Self {
-            program: cwd.join(&manifest.executable),
-            node: Arc::new(node_folder(&cwd)?),
+            // A remote plugin's comes from `with_executable`.
+            program: if remote {
+                PathBuf::new()
+            } else {
+                cwd.join(&manifest.executable)
+            },
+            node: Arc::new(if remote {
+                tempfile::tempdir().map_err(|e| format!("temporary folder: {e}"))?
+            } else {
+                node_folder(&cwd)?
+            }),
             cwd,
             plugin_type: protocol_type(manifest.plugin_type),
             version: manifest.version.clone(),
@@ -112,6 +134,7 @@ impl Target {
             unpacked: None,
             configurator_program: None,
             configured: None,
+            remote: None,
         })
     }
 
@@ -139,6 +162,40 @@ impl Target {
     pub fn with_executable(mut self, program: impl Into<PathBuf>) -> Self {
         self.program = program.into();
         self
+    }
+
+    /// A remote plugin definition (manifest `"launch": "remote"`).
+    pub fn is_remote(&self) -> bool {
+        self.manifest.is_remote_only()
+    }
+
+    /// Checked as a remote node: a definition, or a plugin with a [`RemoteLaunch`].
+    pub fn remote_node(&self) -> bool {
+        self.is_remote() || self.remote.is_some()
+    }
+
+    /// Runs the plugin elsewhere: `remote`'s commands make it connect, and
+    /// its `configurator` endpoint runs the configurator.
+    pub fn with_remote(mut self, remote: RemoteLaunch) -> Self {
+        self.remote = Some(Arc::new(remote));
+        self
+    }
+
+    /// Started by [`RemoteLaunch::start`] commands (not a process of ours).
+    pub fn launched_remotely(&self) -> bool {
+        self.remote.as_ref().is_some_and(|r| !r.start.is_empty())
+    }
+
+    /// The instance id the plugin must declare.
+    pub fn instance_id(&self) -> &str {
+        self.remote
+            .as_ref()
+            .and_then(|r| r.id.as_deref())
+            .unwrap_or(crate::hub::INSTANCE_ID)
+    }
+
+    fn endpoint(&self) -> Option<&crate::remote::RemoteConfigurator> {
+        self.remote.as_ref().and_then(|r| r.configurator.as_ref())
     }
 
     /// Runs `program` as the plugin's configurator (manifest `configurator`)
@@ -179,7 +236,7 @@ impl Target {
                 .find(|(n, _)| n == name)
                 .map(|(_, p)| p.clone())
         };
-        configure::configure(&Invocation {
+        let inv = Invocation {
             package_dir: &self.cwd,
             executable: self.configurator_program.as_deref(),
             manifest: &self.manifest,
@@ -187,9 +244,25 @@ impl Target {
             schema: validator.as_ref(),
             launch_args: args,
             uploads: &uploads,
-            node_id: crate::hub::INSTANCE_ID,
+            node_id: self.instance_id(),
             limits: &configure::Limits::default(),
-        })
+        };
+        // A remote node's configurator is its endpoint (unless a program is
+        // given to run in its place).
+        match self.endpoint() {
+            Some(endpoint) if self.configurator_program.is_none() => {
+                crate::remote::configure_remote(&inv, endpoint)
+            }
+            _ if self.remote_node()
+                && self.configurator_program.is_none()
+                && self.manifest.configurator.as_ref().is_none_or(|c| c.executable.is_empty()) =>
+            {
+                Err(vec![
+                    "a remote node's configurator runs at its endpoint: give it ([remote.configurator] in trellis.toml, or Target::with_remote)".into(),
+                ])
+            }
+            _ => configure::configure(&inv),
+        }
     }
 
     /// The launch-args schema and its validator.
@@ -232,8 +305,16 @@ impl Target {
     /// folder's `config/`. With manifest version 2, payload schemas the
     /// plugin takes from its launch args are taken from `args`.
     pub fn with_launch_args(mut self, args: Value) -> Result<Self, String> {
-        // A configurator sets its fields first, as on the server.
-        let args = if self.manifest.configurator.is_some() {
+        // A configurator sets its fields first, as on the server (a remote
+        // definition's runs at its nodes' endpoints: only with one given here).
+        let runs_configurator = self.manifest.configurator.as_ref().is_some_and(|c| {
+            if self.remote_node() {
+                self.endpoint().is_some() || self.configurator_program.is_some()
+            } else {
+                !c.executable.is_empty() || self.configurator_program.is_some()
+            }
+        });
+        let args = if runs_configurator {
             let configured = self
                 .configure(&args)
                 .map_err(|e| format!("configurator: {}", e.join("; ")))?;
@@ -252,9 +333,14 @@ impl Target {
         if !report.errors.is_empty() {
             return Err(report.errors.join("; "));
         }
-        let problems = validate_launch_args(validator.as_ref(), &spec, &args);
-        if !problems.is_empty() {
-            return Err(problems.join("; "));
+        // A remote node's launch args are checked only for its payload
+        // schemas, as on the server.
+        let remote = self.remote_node();
+        if !remote {
+            let problems = validate_launch_args(validator.as_ref(), &spec, &args);
+            if !problems.is_empty() {
+                return Err(problems.join("; "));
+            }
         }
         // The node's own payload schemas.
         let (input, output) = spec.schema_pointers();
@@ -279,6 +365,10 @@ impl Target {
             }
         }
 
+        if remote {
+            self.launch_args = args;
+            return Ok(self);
+        }
         let node = node_folder(&self.cwd)?;
         let config = node.path().join(CONFIG_DIR);
         let plan = spec.plan(&args, &config).map_err(|e| e.join("; "))?;

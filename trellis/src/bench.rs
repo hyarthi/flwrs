@@ -1185,6 +1185,11 @@ fn environment() -> Environment {
 /// Conditions that make numbers unreliable.
 fn environment_warnings(target: &Target) -> Vec<String> {
     let mut warnings = vec![];
+    if target.launched_remotely() {
+        warnings.push(
+            "the plugin runs elsewhere: CPU and memory are the [remote] start command's, not the plugin's; latencies include the network".into(),
+        );
+    }
     let program = target.program.to_string_lossy();
     if program.contains("/debug/") || program.contains("\\debug\\") {
         warnings.push("the plugin looks like a debug build".into());

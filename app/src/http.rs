@@ -1,6 +1,6 @@
 use crate::modules::api_error::{ApiError, api_error};
 use crate::modules::auth::api::SecuritySchemes;
-use crate::modules::{auth, director, plugin, scene, status_api};
+use crate::modules::{auth, director, lua_api, plugin, scene, server_config, status_api};
 use axum::Router;
 use axum::http::StatusCode;
 use flwrs_core::http::{HttpServer, ServerConfig};
@@ -23,6 +23,7 @@ fn api(auth: &'static auth::Auth, stopping: CancellationToken) -> Router {
         scenes: scene::service(),
         stopping,
         interval: scene::config::ScenesConfig::read().stream_interval(),
+        spill_default: director::config::DirectorConfig::read().spill_default,
     };
     let protected = Router::new()
         .merge(scene::api::Api::build_router(scene::service()))
@@ -30,6 +31,8 @@ fn api(auth: &'static auth::Auth, stopping: CancellationToken) -> Router {
         .merge(scene::api_scene_stream::router(stream))
         .merge(plugin::api::Api::build_router(plugin::service()))
         .merge(status_api::Api::build_router(director::init()))
+        .merge(lua_api::router())
+        .merge(server_config::api::router())
         .merge(auth::api::Api::protected_router())
         .fallback(api_not_found);
     auth.protect(protected)
@@ -90,8 +93,13 @@ pub fn server() -> &'static HttpServer {
         (path = "/api/scenes", api = scene::api_stream::Api),
         (path = "/api/scenes", api = scene::api_scene_stream::Api),
         (path = "/api/scenes", api = scene::api_draft::Api),
+        (path = "/api/scenes", api = scene::api_mapping::Api),
         (path = "/api/plugins", api = plugin::api::Api),
+        (path = "/api/plugins", api = scene::api_usage::Api),
         (path = "/api/status", api = status_api::Api),
+        (path = "/api/status", api = scene::api_stream::StatusApi),
+        (path = "/api/lua", api = lua_api::Api),
+        (path = "/api/server", api = server_config::api::Api),
     )
 )]
 struct OpenApiSpec;

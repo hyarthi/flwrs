@@ -1243,6 +1243,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "toml 1.2.0+spec-1.1.0",
+ "toml_edit 0.25.18+spec-1.1.0",
  "tower",
  "ulid",
  "utoipa",
@@ -1275,6 +1276,7 @@ dependencies = [
  "toml 1.2.0+spec-1.1.0",
  "tower-layer",
  "tower-service",
+ "utoipa",
 ]
 
 [[package]]
@@ -1502,12 +1504,15 @@ dependencies = [
  "jsonschema",
  "pbjson-types",
  "prost",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sysinfo",
  "tempfile",
  "tokio",
  "toml 1.2.0+spec-1.1.0",
+ "webpki-roots",
  "zip",
 ]
 
@@ -4913,7 +4918,7 @@ dependencies = [
  "serde",
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
- "toml_edit",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]
@@ -4961,6 +4966,19 @@ dependencies = [
  "toml_datetime 0.6.11",
  "toml_write",
  "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.25.18+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ec6e78bd70db9420d8d212fa9dc97f116448a1ceff5d00eabb991d407e21396"
+dependencies = [
+ "indexmap",
+ "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.5",
 ]
 
 [[package]]
@@ -5767,6 +5785,9 @@ name = "winnow"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wit-bindgen"

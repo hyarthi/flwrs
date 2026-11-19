@@ -19,7 +19,7 @@
 //! `[plugins] admin_token` stays a separate gate on top, for plugin changes.
 
 pub(crate) mod api;
-mod config;
+pub(crate) mod config;
 mod guard;
 mod limiter;
 mod session;
@@ -122,6 +122,29 @@ impl Auth {
     /// Whether only loopback clients get in (no key configured).
     pub(crate) fn loopback_only(&self) -> bool {
         self.key.is_none()
+    }
+
+    /// Step-up for a sensitive change (the server page's save and restart):
+    /// the key again, even with a valid session; failures count against the
+    /// login limiter. Without a key (loopback clients only) there's nothing
+    /// to ask, so it passes. `Err(None)`: wrong or missing key;
+    /// `Err(Some(wait))`: too many failures from this address.
+    pub(crate) fn step_up(
+        &self,
+        peer: std::net::IpAddr,
+        presented: Option<&str>,
+    ) -> Result<(), Option<Duration>> {
+        let Some(key) = &self.key else {
+            return Ok(());
+        };
+        self.limiter.check(peer).map_err(Some)?;
+        if presented.is_some_and(|p| key.matches(p)) {
+            self.limiter.succeeded(peer);
+            Ok(())
+        } else {
+            self.limiter.failed(peer);
+            Err(None)
+        }
     }
 
     /// `router` behind the guard: every route, and its fallback, needs a

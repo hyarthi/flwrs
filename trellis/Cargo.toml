@@ -32,3 +32,7 @@ glob.workspace = true
 tempfile.workspace = true # unpacked packages
 hdrhistogram.workspace = true
 sysinfo.workspace = true
+# remote configurator endpoints (as the server calls them)
+reqwest.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true

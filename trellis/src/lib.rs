@@ -30,6 +30,7 @@ pub mod configure_test;
 mod hub;
 pub mod package;
 pub mod payload;
+pub mod remote;
 pub mod stimulus;
 pub mod target;
 pub mod testing;

@@ -8,7 +8,7 @@
 use crate::audit::{Audit, CASES, Outcome};
 use crate::bench::{BenchFile, BenchResult, Bencher};
 use crate::config::Config;
-use crate::package::{PackageOptions, package};
+use crate::package::{PackageOptions, build_remote_executable, package};
 use crate::stimulus::{CommandStimulus, Vars, free_port, substitute, substitute_json};
 use crate::target::Target;
 use crate::testing::{TestResult, Tester};
@@ -116,6 +116,12 @@ struct PluginArgs {
     /// (repeatable; on top of trellis.toml's [uploads]).
     #[arg(long = "upload", value_name = "NAME=PATH", value_parser = parse_var)]
     uploads: Vec<(String, String)>,
+    /// Run this program as the plugin instead of the package's executable.
+    /// For a remote plugin definition (`"launch": "remote"`, no executable):
+    /// the remote plugin to check (default: built by [build] in trellis.toml
+    /// or cargo, in a plugin folder).
+    #[arg(long)]
+    executable: Option<PathBuf>,
     /// Show the plugin's stdout and stderr.
     #[arg(long)]
     show_output: bool,
@@ -404,14 +410,14 @@ fn open(plugin: &PluginArgs, default_profile: Profile) -> Result<(Target, Option
         None if path.is_dir() => Some(Config::load(path)?),
         None => None,
     };
+    let buildable = path.is_dir()
+        && (config.as_ref().is_some_and(|c| c.build.is_some()) || path.join("Cargo.toml").is_file());
+    let profile = plugin.profile.unwrap_or(default_profile);
     let mut target = if path.is_file() {
         Target::from_zip(path)?
     } else {
-        let buildable =
-            config.as_ref().is_some_and(|c| c.build.is_some()) || path.join("Cargo.toml").is_file();
         if buildable {
             let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
-            let profile = plugin.profile.unwrap_or(default_profile);
             let packaged = package(&PackageOptions {
                 dir: path.clone(),
                 target: None,
@@ -427,6 +433,40 @@ fn open(plugin: &PluginArgs, default_profile: Profile) -> Result<(Target, Option
             Target::from_package(path)?
         }
     };
+    // A plugin that runs elsewhere: [remote] makes it connect (and is its
+    // configurator endpoint).
+    if let Some(remote) = config.as_ref().and_then(|c| c.remote.clone()) {
+        target = target.with_remote(remote);
+    }
+    // A local stand-in: --executable, or a definition's folder that builds one.
+    let executable = match &plugin.executable {
+        Some(program) => Some(program.clone()),
+        None if target.is_remote() && !target.launched_remotely() && buildable => {
+            Some(build_remote_executable(&PackageOptions {
+                dir: path.clone(),
+                target: None,
+                flavor: None,
+                release: matches!(profile, Profile::Release),
+                out: None,
+                config: plugin.config.config.clone(),
+                target_dir: None,
+            })?)
+        }
+        None => None,
+    };
+    if let Some(program) = executable {
+        if !program.is_file() {
+            return Err(format!("--executable {} isn't a file", program.display()));
+        }
+        target = target.with_executable(std::path::absolute(&program).map_err(|e| e.to_string())?);
+        // Run locally: [remote] start doesn't apply.
+        if let Some(remote) = target.remote.take() {
+            let mut remote = (*remote).clone();
+            remote.start.clear();
+            remote.stop.clear();
+            target = target.with_remote(remote);
+        }
+    }
     target.show_output = plugin.show_output;
     if let Some(config) = &config {
         for (name, path) in &config.uploads {

@@ -576,3 +576,20 @@ async fn without_a_key_only_loopback_gets_in() {
     assert_eq!(reply.json["loopback_only"], true);
     assert_eq!(reply.json["providers"], serde_json::json!([]));
 }
+
+#[test]
+fn step_up_asks_for_the_key_again() {
+    let auth = Auth::new(settings(Some(KEY)));
+    let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+    assert_eq!(auth.step_up(ip, None), Err(None));
+    assert_eq!(auth.step_up(ip, Some("wrong")), Err(None));
+    assert_eq!(auth.step_up(ip, Some(KEY)), Ok(()));
+    // Failures count against the login limiter.
+    for _ in 0..20 {
+        let _ = auth.step_up(ip, Some("wrong"));
+    }
+    assert!(matches!(auth.step_up(ip, Some(KEY)), Err(Some(_))));
+    // Without a key (loopback clients only) there's nothing to ask.
+    let open = Auth::new(settings(None));
+    assert_eq!(open.step_up(ip, None), Ok(()));
+}

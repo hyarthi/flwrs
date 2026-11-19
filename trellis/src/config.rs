@@ -24,6 +24,9 @@
 //! args = ["--verbose"]
 //! stimulus = ["curl", "-s", "-d", "{}", "http://127.0.0.1:${port}/in"]
 //!
+//! [remote]                       # a plugin that runs elsewhere (see `remote`)
+//! start = ["./connect.sh", "${hub_host}", "${hub_port}"]
+//!
 //! [test]
 //! files = ["tests/*.test.toml"]
 //!
@@ -47,6 +50,9 @@ pub struct Config {
     /// `"source": "upload"` launch args. Used by audit, test and bench.
     pub uploads: BTreeMap<String, String>,
     pub audit: AuditSection,
+    /// A plugin that runs elsewhere: how it's made to connect, its
+    /// configurator endpoint (see [`crate::remote`]).
+    pub remote: Option<crate::remote::RemoteLaunch>,
     pub test: FilesSection,
     pub bench: FilesSection,
     /// The folder the file was read from: relative paths start there.
@@ -121,6 +127,13 @@ impl Config {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        if let Some(remote) = config.remote.take() {
+            config.remote = Some(
+                remote
+                    .resolve(&config.dir)
+                    .map_err(|e| format!("{}: [remote] {e}", path.display()))?,
+            );
+        }
         Ok(config)
     }
 

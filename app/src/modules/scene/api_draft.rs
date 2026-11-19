@@ -47,6 +47,10 @@ pub(crate) struct DraftResponse {
     pub edges: Vec<DraftEdge>,
     /// Unresolved conflicts (from a rebase), described. Submit waits for none.
     pub conflicts: Vec<String>,
+    /// What `…/draft/undo` would take back (e.g. "Add Ticker"); `null` = nothing.
+    pub undo: Option<String>,
+    /// What `…/draft/redo` would make again; `null` = nothing.
+    pub redo: Option<String>,
     pub create_time: i64,
     pub update_time: i64,
 }
@@ -89,6 +93,8 @@ impl From<draft::Draft> for DraftResponse {
             behind: d.behind(),
             has_changes: d.has_changes(),
             conflicts: d.conflicts(),
+            undo: d.undo.clone(),
+            redo: d.redo.clone(),
             scene_id: d.row.scene_id,
             base_revision: d.row.base_revision,
             live_revision: d.live_revision,
@@ -448,6 +454,62 @@ async fn discard_draft(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// What undo or redo did, and the draft after it.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct StepResponse {
+    /// The step taken back (undo) or made again (redo).
+    pub step: String,
+    pub draft: DraftResponse,
+}
+
+#[utoipa::path(
+    post,
+    path = "/by-id/{id}/draft/undo",
+    operation_id = "undo-scene-draft",
+    summary = "Undo the draft's last change",
+    description = "Puts the draft's state before its last change back (every draft change counts, layout moves too; requests sent with the same `X-Flwrs-Undo-Group` header are one change). The draft's last 100 states are kept. Live isn't touched.",
+    params(("id" = String, Path, description = "Scene ID")),
+    responses(
+        (status = 200, description = "Undone", body = StepResponse),
+        (status = 404, description = "No such scene, or no draft", body = ErrorBody),
+        (status = 409, description = "Nothing to undo", body = ErrorBody),
+    )
+)]
+async fn undo(
+    State(service): State<Svc>,
+    Path(id): Path<String>,
+) -> Result<Json<StepResponse>, ApiError> {
+    let (draft, step) = service.step_draft(&id, true).await?;
+    Ok(Json(StepResponse {
+        step,
+        draft: draft.into(),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/by-id/{id}/draft/redo",
+    operation_id = "redo-scene-draft",
+    summary = "Redo the change undo took back",
+    description = "Until the draft changes otherwise (a change after an undo drops what could be redone).",
+    params(("id" = String, Path, description = "Scene ID")),
+    responses(
+        (status = 200, description = "Redone", body = StepResponse),
+        (status = 404, description = "No such scene, or no draft", body = ErrorBody),
+        (status = 409, description = "Nothing to redo", body = ErrorBody),
+    )
+)]
+async fn redo(
+    State(service): State<Svc>,
+    Path(id): Path<String>,
+) -> Result<Json<StepResponse>, ApiError> {
+    let (draft, step) = service.step_draft(&id, false).await?;
+    Ok(Json(StepResponse {
+        step,
+        draft: draft.into(),
+    }))
+}
+
 #[utoipa::path(
     put,
     path = "/by-id/{id}/draft/settings",
@@ -759,6 +821,31 @@ async fn delete_node(
 ) -> Result<StatusCode, ApiError> {
     service.remove_draft_node(&id, &node_id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    post,
+    path = "/by-id/{id}/draft/nodes/by-id/{node_id}/configure",
+    operation_id = "configure-scene-draft-node",
+    summary = "Run a draft node's configurator again",
+    description = "As `…/nodes/by-id/{node_id}/configure`, on the draft's node (a draft is started if there's none); live gets the result when the draft is submitted.",
+    params(("id" = String, Path, description = "Scene ID"), ("node_id" = String, Path, description = "Node ID")),
+    responses(
+        (status = 200, description = "The node, configured", body = Node),
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 422, description = "No configurator, a remote node without an endpoint, or the configurator failed", body = ErrorBody),
+    )
+)]
+async fn configure_node(
+    State(service): State<Svc>,
+    Path((id, node_id)): Path<(String, String)>,
+) -> Result<Json<Node>, ApiError> {
+    Ok(Json(
+        service
+            .reconfigure_node_in(Store::Draft, &id, &node_id)
+            .await?
+            .into(),
+    ))
 }
 
 #[utoipa::path(
@@ -1115,6 +1202,8 @@ async fn batch(
         get_draft,
         start_draft,
         discard_draft,
+        undo,
+        redo,
         update_settings,
         diff_draft,
         check_draft,
@@ -1127,6 +1216,7 @@ async fn batch(
         update_node,
         delete_node,
         restore_node,
+        configure_node,
         list_edges,
         create_edge,
         get_edge,
@@ -1142,6 +1232,7 @@ async fn batch(
     ),
     components(schemas(
         DraftResponse,
+        StepResponse,
         DraftSettings,
         DraftNode,
         DraftEdge,
@@ -1172,6 +1263,8 @@ pub(super) fn routes() -> Router<Svc> {
         )
         .route(&format!("{DRAFT}/settings"), put(update_settings))
         .route(&format!("{DRAFT}/diff"), get(diff_draft))
+        .route(&format!("{DRAFT}/undo"), post(undo))
+        .route(&format!("{DRAFT}/redo"), post(redo))
         .route(&format!("{DRAFT}/check"), get(check_draft))
         .route(&format!("{DRAFT}/rebase"), post(rebase_draft))
         .route(&format!("{DRAFT}/resolve"), post(resolve_conflict))
@@ -1179,6 +1272,7 @@ pub(super) fn routes() -> Router<Svc> {
         .route(&format!("{DRAFT}/nodes"), get(list_nodes).post(create_node))
         .route(&node, get(get_node).put(update_node).delete(delete_node))
         .route(&format!("{node}/restore"), post(restore_node))
+        .route(&format!("{node}/configure"), post(configure_node))
         .route(&format!("{node}/uploads"), get(list_uploads))
         .route(
             &format!("{node}/uploads/{{name}}"),

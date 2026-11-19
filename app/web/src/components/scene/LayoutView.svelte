@@ -19,7 +19,8 @@
   import { untrack } from 'svelte';
   import X from '@lucide/svelte/icons/x';
   import FlowNode, { type FlowNodeData } from './FlowNode.svelte';
-  import FlowEdge, { type FlowEdgeData } from './FlowEdge.svelte';
+  import FlowEdge, { type EdgeFlow, type FlowEdgeData } from './FlowEdge.svelte';
+  import EdgeDialog from './EdgeDialog.svelte';
   import Palette, { PLUGIN_DRAG_TYPE } from './Palette.svelte';
   import DraftBar from './DraftBar.svelte';
   import { ApiError } from '../../lib/api';
@@ -41,6 +42,7 @@
     type Conflict,
     type GraphEdge,
     type GraphNode,
+    type NodeState,
     type Plugin,
     type Position,
     type SceneStatusEvent,
@@ -80,6 +82,92 @@
   );
   const check = $derived(view.draft_check ?? view.check);
   const states = $derived(new Map((status?.nodes ?? []).map((n) => [n.node_id, n.status.state])));
+  const queues = $derived(view.draft_queues ?? view.queues);
+
+  // ---- flow states: what the motes and glows show ----
+
+  /** A receiving node's queue between the last two `status` samples. */
+  interface QueueTrend {
+    spilling: boolean;
+    /** Producers waited for room (block policy, queue full), or gave up. */
+    blocked: boolean;
+    /** Events dropped for a full queue (drop newest / drop oldest). */
+    dropping: boolean;
+  }
+  let trends = $state(new Map<string, QueueTrend>());
+  let lastQueues = new Map<string, { blocked_ms: number; dropped_timeout: number; dropped_full: number; evicted: number }>();
+  $effect(() => {
+    const reports = status?.nodes ?? [];
+    untrack(() => {
+      const next = new Map<string, QueueTrend>();
+      const seen = new Map<string, { blocked_ms: number; dropped_timeout: number; dropped_full: number; evicted: number }>();
+      for (const r of reports) {
+        if (!r.queue) continue;
+        const q = r.queue;
+        const before = lastQueues.get(r.node_id);
+        // A counter that went down: the node restarted; no trend from that sample.
+        const grew = (now: number, then: number | undefined) => then !== undefined && now > then;
+        next.set(r.node_id, {
+          spilling: q.spilling,
+          blocked: grew(q.blocked_ms, before?.blocked_ms) || grew(q.dropped_timeout, before?.dropped_timeout),
+          dropping: grew(q.dropped_full, before?.dropped_full) || grew(q.evicted, before?.evicted),
+        });
+        seen.set(r.node_id, { blocked_ms: q.blocked_ms, dropped_timeout: q.dropped_timeout, dropped_full: q.dropped_full, evicted: q.evicted });
+      }
+      lastQueues = seen;
+      trends = next;
+    });
+  });
+
+  const liveNodeIds = $derived(new Set(view.nodes.map((n) => n.id)));
+  const liveEdgeIds = $derived(new Set(view.edges.map((e) => e.id)));
+  /** The scene runs: edges animate. */
+  const flowing = $derived(view.scene.enabled && status?.state === 'RUNNING');
+
+  function healthOf(n: Row<GraphNode>, state: NodeState | undefined): FlowNodeData['health'] {
+    if (!view.scene.enabled || n.change === 'removed' || !liveNodeIds.has(n.id)) return null;
+    if (state === 'RUNNING') return 'ok';
+    if (state === 'DISCONNECTED' || state === 'LAUNCHING' || state === 'WAITING' || state === 'STOPPING') return 'warn';
+    return 'bad';
+  }
+
+  /**
+   * An edge's motes: none while the scene doesn't run, for removed edges,
+   * or when an end that runs live isn't connected (nothing flows from or
+   * into it). Ends only in the draft don't block it, but then (as for an
+   * edge only in the draft) only flow and filter show, not queue states.
+   */
+  function flowOf(e: Row<GraphEdge>, byNode: Map<string, Row<GraphNode>>): EdgeFlow | null {
+    if (!flowing || e.change === 'removed') return null;
+    const ends = [e.source_node_id, e.target_node_id].map((id) => {
+      const node = byNode.get(id);
+      if (!node || node.change === 'removed') return false;
+      if (!liveNodeIds.has(id)) return 'draft';
+      return states.get(id) === 'RUNNING';
+    });
+    if (ends.includes(false)) return null;
+    const stateful = liveEdgeIds.has(e.id) && ends.every((end) => end === true);
+    const trend = stateful ? trends.get(e.target_node_id) : undefined;
+    if (trend?.dropping) return { tone: 'jam', drop: true };
+    if (trend?.blocked) return { tone: 'jam', drop: false };
+    if (trend?.spilling) return { tone: 'spill', drop: false };
+    return { tone: 'ok', drop: false };
+  }
+
+  /** Parallel and opposite edges between the same two nodes, spread apart. */
+  function offsets(list: Row<GraphEdge>[]): Map<string, number> {
+    const groups = new Map<string, string[]>();
+    for (const e of list) {
+      const key = [e.source_node_id, e.target_node_id].sort().join('|');
+      groups.set(key, [...(groups.get(key) ?? []), e.id]);
+    }
+    const out = new Map<string, number>();
+    for (const ids of groups.values()) {
+      ids.sort();
+      ids.forEach((id, i) => out.set(id, (i - (ids.length - 1) / 2) * 56));
+    }
+    return out;
+  }
 
   let nodes = $state.raw<Node<FlowNodeData>[]>([]);
   let edges = $state.raw<Edge<FlowEdgeData>[]>([]);
@@ -115,8 +203,13 @@
     const warnings = check.warnings;
     const live = states;
     const byId = pluginById;
+    void [queues, trends, flowing, liveNodeIds, liveEdgeIds];
     untrack(() => {
-      const selected = new Set(nodes.filter((n) => n.selected).map((n) => n.id));
+      let selected = new Set(nodes.filter((n) => n.selected).map((n) => n.id));
+      if (pendingSelection && [...pendingSelection].every((id) => list.some((n) => n.id === id))) {
+        selected = pendingSelection;
+        pendingSelection = null;
+      }
       const selectedEdges = new Set(edges.filter((e) => e.selected).map((e) => e.id));
       const auto = autoPositions(list);
       nodes = list.map((n) => {
@@ -140,6 +233,7 @@
             conflict: n.conflict,
             parts: n.parts,
             state: live.get(n.id) ?? null,
+            health: healthOf(n, live.get(n.id)),
             problems: messagesFor(problems, n.id),
             warnings: messagesFor(warnings, n.id),
             onopen: openNode,
@@ -147,6 +241,8 @@
           },
         };
       });
+      const byNode = new Map(list.map((n) => [n.id, n]));
+      const spread = offsets(edgeList);
       edges = edgeList.map((e) => ({
         id: e.id,
         type: 'flwrs',
@@ -161,7 +257,13 @@
           mapped: !!e.mapping && (!!e.mapping.script || (e.mapping.rules?.length ?? 0) > 0),
           filtered: !!e.mapping?.filter,
           problems: edgeMessages(problems, e.source_node_id, e.target_node_id),
+          via: e.via,
+          offset: spread.get(e.id) ?? 0,
+          queue: queues[e.target_node_id] ?? null,
+          flow: flowOf(e, byNode),
           onrestore: restoreEdge,
+          onconfig: (id: string) => (editingEdge = id),
+          onmovebox: moveBox,
         },
       }));
       // Save where unplaced nodes went, so they stay put.
@@ -183,6 +285,16 @@
   });
 
   // ---- edits ----
+
+  let editingEdge = $state<string | null>(null);
+
+  async function moveBox(id: string, via: Position | null) {
+    try {
+      await setLayout(sceneId, {}, { [id]: via });
+    } catch (e) {
+      fail("Couldn't save the edge's position", e);
+    }
+  }
 
   function openNode(id: string) {
     navigate(`/scenes/by-id/${encodeURIComponent(sceneId)}/nodes/by-id/${encodeURIComponent(id)}`);
@@ -207,7 +319,12 @@
   async function addNode(plugin: Plugin, position: Position) {
     const at = { x: Math.round(position.x), y: Math.round(position.y) };
     try {
-      const node = await createDraftNode(sceneId, { plugin_id: plugin.id, position: at });
+      const node = await createDraftNode(sceneId, {
+        plugin_id: plugin.id,
+        position: at,
+        // A remote plugin definition's nodes can only be remote.
+        ...(plugin.remote_only ? { config: { launch: 'remote' } } : {}),
+      });
       // Shown at once; the stream brings its state and check shortly.
       moving.set(node.id, at);
       nodes = [
@@ -228,6 +345,7 @@
             conflict: null,
             parts: [],
             state: null,
+            health: null,
             problems: [],
             warnings: [],
             onopen: openNode,
@@ -280,7 +398,21 @@
           type: 'flwrs',
           source: edge.source_node_id,
           target: edge.target_node_id,
-          data: { change: 'added', conflict: null, parts: [], mapped: false, filtered: false, problems: [], onrestore: restoreEdge },
+          data: {
+            change: 'added',
+            conflict: null,
+            parts: [],
+            mapped: false,
+            filtered: false,
+            problems: [],
+            via: null,
+            offset: 0,
+            queue: queues[edge.target_node_id] ?? null,
+            flow: null,
+            onrestore: restoreEdge,
+            onconfig: (id: string) => (editingEdge = id),
+            onmovebox: moveBox,
+          },
         },
       ];
     } catch (e) {
@@ -317,14 +449,125 @@
     }
   }
 
+  // ---- keyboard: undo / redo, copy / paste ----
+
+  let draftBar: { step: (back: boolean) => Promise<void> } | undefined = $state();
+
+  /** Keys and clipboard events are the canvas's unless a field or a dialog has them. */
+  function mine(target: EventTarget | null): boolean {
+    if (document.querySelector('dialog[open]')) return false;
+    const el = target instanceof Element ? target : null;
+    return !el?.closest('input, textarea, select, [contenteditable], .cm-editor');
+  }
+
+  function onkeydown(e: KeyboardEvent) {
+    if (!mine(e.target) || !(e.metaKey || e.ctrlKey) || e.altKey) return;
+    const key = e.key.toLowerCase();
+    if (key === 'z' || key === 'y') {
+      e.preventDefault();
+      draftBar?.step(key === 'z' && !e.shiftKey);
+    } else if (key === 'd') {
+      e.preventDefault();
+      const copied = selection();
+      if (copied) paste(copied);
+    }
+  }
+
+  /** What a copy carries: the selected nodes, and the edges between them. */
+  interface Copied {
+    flwrs: 'nodes';
+    version: 1;
+    nodes: { key: string; plugin_id: string; name: string | null; config: Record<string, unknown>; position: Position }[];
+    edges: { source: string; target: string; name: string | null; mapping: GraphEdge['mapping'] }[];
+  }
+
+  function selection(): Copied | null {
+    const chosen = nodes.filter((n) => n.selected && n.data.change !== 'removed');
+    if (!chosen.length) return null;
+    const ids = new Set(chosen.map((n) => n.id));
+    const rows = new Map(graphNodes.map((n) => [n.id, n]));
+    return {
+      flwrs: 'nodes',
+      version: 1,
+      nodes: chosen.map((n) => {
+        const row = rows.get(n.id)!;
+        // Tokens and secrets never leave the server: pasted nodes need them set again.
+        const { token: _, ...config } = row.config as Record<string, unknown>;
+        // A local node's configured fields are its configurator's: it sets them again.
+        const configured = pluginById.get(row.plugin_id)?.configured_fields ?? [];
+        if (config.launch !== 'remote' && configured.length && config.launch_args && typeof config.launch_args === 'object') {
+          config.launch_args = Object.fromEntries(Object.entries(config.launch_args).filter(([k]) => !configured.includes(k)));
+        }
+        return { key: n.id, plugin_id: row.plugin_id, name: row.name, config, position: n.position };
+      }),
+      edges: graphEdges
+        .filter((e) => e.change !== 'removed' && ids.has(e.source_node_id) && ids.has(e.target_node_id))
+        .map((e) => ({ source: e.source_node_id, target: e.target_node_id, name: e.name, mapping: e.mapping })),
+    };
+  }
+
+  function oncopy(e: ClipboardEvent) {
+    if (!mine(e.target)) return;
+    const copied = selection();
+    if (!copied || !e.clipboardData) return;
+    e.preventDefault();
+    e.clipboardData.setData('text/plain', JSON.stringify(copied));
+    pasteOffset = 0;
+  }
+
+  function onpaste(e: ClipboardEvent) {
+    if (!mine(e.target)) return;
+    const text = e.clipboardData?.getData('text/plain');
+    let copied: Copied | null = null;
+    try {
+      const value = text ? JSON.parse(text) : null;
+      if (value?.flwrs === 'nodes' && Array.isArray(value.nodes)) copied = value;
+    } catch {
+      // Not ours.
+    }
+    if (!copied) return;
+    e.preventDefault();
+    paste(copied);
+  }
+
+  let pasteOffset = 0;
+  /** New nodes and edges like the copied ones, a little apart, as one undo step. */
+  async function paste(copied: Copied) {
+    pasteOffset += 48;
+    const label = copied.nodes.length === 1 ? `Paste ${copied.nodes[0].name ?? copied.nodes[0].plugin_id}` : `Paste ${copied.nodes.length} nodes`;
+    const group = { group: `paste-${Date.now()}-${Math.random().toString(36).slice(2)}`, label };
+    const ids = new Map<string, string>();
+    try {
+      for (const n of copied.nodes) {
+        const at = { x: Math.round(n.position.x + pasteOffset), y: Math.round(n.position.y + pasteOffset) };
+        const created = await createDraftNode(sceneId, { plugin_id: n.plugin_id, name: n.name, config: n.config, position: at }, group);
+        ids.set(n.key, created.id);
+        moving.set(created.id, at);
+      }
+      for (const e of copied.edges) {
+        const source = ids.get(e.source);
+        const target = ids.get(e.target);
+        if (source && target) await createDraftEdge(sceneId, source, target, { name: e.name, mapping: e.mapping }, group);
+      }
+      // The pasted nodes become the selection once the stream has them.
+      pendingSelection = new Set(ids.values());
+      setTimeout(() => ids.forEach((id) => moving.delete(id)), 2000);
+    } catch (err) {
+      fail(ids.size ? `Pasted ${ids.size} of ${copied.nodes.length} nodes` : "Couldn't paste", err);
+    }
+  }
+  let pendingSelection: Set<string> | null = null;
+
   const nodeTypes = { flwrs: FlowNode };
   const edgeTypes = { flwrs: FlowEdge };
 </script>
 
+<svelte:window {onkeydown} {oncopy} {onpaste} />
+
 <div class="layout">
   <Palette {plugins} error={pluginsError} onadd={addAtCenter} />
   <div class="main">
-    <DraftBar {view} {check} onfocus={(id) => flow.fitView({ nodes: [{ id }], padding: 0.6, maxZoom: 1.25, duration: 300 })} onerror={fail} />
+    <DraftBar bind:this={draftBar} {view} {check} onfocus={(id) => flow.fitView({ nodes: [{ id }], padding: 0.6, maxZoom: 1.25, duration: 300 })} onerror={fail} />
     {#if notice}
       <div class="notice danger floating" role="alert">
         <div class="grow">
@@ -379,6 +622,9 @@
         <Controls showLock={false} />
         <MiniMap pannable zoomable />
       </SvelteFlow>
+      {#if editingEdge}
+        <EdgeDialog {view} edgeId={editingEdge} onclose={() => (editingEdge = null)} onopennode={(id) => { editingEdge = null; openNode(id); }} />
+      {/if}
       {#if nodes.length === 0}
         <div class="empty muted">Drag a plugin from the palette onto the canvas to add a node.</div>
       {/if}

@@ -6,7 +6,7 @@ use axum::Router;
 use axum::extract::Request;
 use axum::response::IntoResponse;
 use axum::routing::{MethodRouter, Route};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io;
@@ -16,17 +16,23 @@ use tokio_util::sync::CancellationToken;
 use tower_layer::Layer;
 use tower_service::Service;
 
-/// `[http]` config section. Missing fields fall back to the defaults.
-#[derive(Deserialize)]
+/// `[http]` config section: the management API and the web UI. Missing
+/// fields fall back to the defaults.
+#[derive(Deserialize, Serialize, Clone, Debug, utoipa::ToSchema)]
 #[serde(default)]
 pub struct ServerConfig {
     /// Off: no HTTP server at all (e.g. an edge box configured, then run
     /// without its management API to save resources).
     enabled: bool,
+    /// The address it listens on (`0.0.0.0`: every interface).
     host: String,
+    /// The port it listens on.
     port: u16,
-    /// Serve the API's Swagger UI (where the binary has it): opt-in.
+    /// Serve the API's Swagger UI at `/swagger-ui` (where the build has it): opt-in.
     swagger_ui: bool,
+    /// Let the web UI edit this config file (the server page). Off by default;
+    /// it can't be changed from the UI itself.
+    config_edit: bool,
 }
 
 impl Default for ServerConfig {
@@ -36,6 +42,7 @@ impl Default for ServerConfig {
             host: "0.0.0.0".to_string(),
             port: 80,
             swagger_ui: false,
+            config_edit: false,
         }
     }
 }
@@ -51,6 +58,16 @@ impl ServerConfig {
 
     pub fn swagger_ui(&self) -> bool {
         self.swagger_ui
+    }
+
+    /// Whether the web UI may edit the config file.
+    pub fn config_edit(&self) -> bool {
+        self.config_edit
+    }
+
+    /// The port it listens on.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// The address it listens on.

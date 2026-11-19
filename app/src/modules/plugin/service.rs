@@ -245,11 +245,103 @@ impl Service {
         Ok(query_sqlite::list(&mut conn).await?)
     }
 
-    /// Whether the plugin's folder and executable are present on disk.
+    /// Whether the plugin's folder and executable (a remote plugin
+    /// definition: its manifest) are present on disk.
     pub(crate) fn is_installed(&self, plugin: &Plugin) -> bool {
-        plugin
+        plugin.parsed_manifest().is_some_and(|m| {
+            let file = if m.is_remote_only() {
+                flwrs_plugin::package::MANIFEST_FILE.to_string()
+            } else {
+                m.executable
+            };
+            Path::new(&plugin.install_path).join(file).is_file()
+        })
+    }
+
+    /// Registers a remote plugin definition given as JSON (packed into a
+    /// package, then installed like an upload).
+    pub(crate) async fn register_definition(
+        &self,
+        definition: &super::definition::Definition,
+    ) -> Result<Plugin, ServiceError> {
+        let path = self.pack(definition).await?;
+        self.install(&path).await
+    }
+
+    /// Replaces remote plugin definition `id` (a new version, or the same
+    /// one again). A package that runs here is upgraded with a package.
+    pub(crate) async fn replace_definition(
+        &self,
+        id: &str,
+        definition: &super::definition::Definition,
+    ) -> Result<Plugin, ServiceError> {
+        let existing = self.get(id).await?;
+        if !existing
             .parsed_manifest()
-            .is_some_and(|m| Path::new(&plugin.install_path).join(m.executable).is_file())
+            .is_some_and(|m| m.is_remote_only())
+        {
+            return Err(ServiceError::InvalidPackage(vec![format!(
+                "plugin {id:?} is a package that runs on this server: upgrade it with a package"
+            )]));
+        }
+        let path = self.pack(definition).await?;
+        self.upgrade(id, &path).await
+    }
+
+    /// A remote plugin definition's manifest and files, as registered.
+    pub(crate) async fn definition(
+        &self,
+        id: &str,
+    ) -> Result<super::definition::Definition, ServiceError> {
+        let plugin = self.get(id).await?;
+        if !plugin.parsed_manifest().is_some_and(|m| m.is_remote_only()) {
+            return Err(ServiceError::NotFound);
+        }
+        let dir = PathBuf::from(&plugin.install_path);
+        tokio::task::spawn_blocking(move || super::definition::Definition::read(&dir))
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?
+            .map_err(ServiceError::Io)
+    }
+
+    /// A remote plugin definition as a package ZIP, to pass along: any
+    /// server takes it as an upload. Returns its file name and bytes.
+    pub(crate) async fn export_definition(
+        &self,
+        id: &str,
+    ) -> Result<(String, Vec<u8>), ServiceError> {
+        let plugin = self.get(id).await?;
+        let definition = self.definition(id).await?;
+        let path = self.new_upload_path();
+        let _cleanup = Cleanup(Some(path.clone()));
+        let out = path.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            definition
+                .write_package(&out)
+                .map_err(|e| ServiceError::Internal(e.join("; ")))?;
+            Ok::<_, ServiceError>(std::fs::read(&out)?)
+        })
+        .await
+        .map_err(|e| ServiceError::Internal(e.to_string()))??;
+        // Ids and versions are file-name safe (checked at registration).
+        Ok((format!("{}-{}.zip", plugin.id, plugin.version), bytes))
+    }
+
+    /// Writes a definition as a package into the staging folder.
+    async fn pack(
+        &self,
+        definition: &super::definition::Definition,
+    ) -> Result<PathBuf, ServiceError> {
+        let path = self.new_upload_path();
+        let (def, out) = (definition.clone(), path.clone());
+        tokio::task::spawn_blocking(move || def.write_package(&out))
+            .await
+            .map_err(|e| ServiceError::Internal(e.to_string()))?
+            .map_err(|errors| {
+                let _ = std::fs::remove_file(&path);
+                ServiceError::InvalidPackage(errors)
+            })?;
+        Ok(path)
     }
 
     /// Start-up check: logs registered plugins whose files are missing, and
@@ -570,6 +662,12 @@ impl Service {
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
             let remote = config.get("launch").and_then(|l| l.as_str()) == Some("remote");
+            if !remote && package.manifest.is_remote_only() {
+                problems.push(format!(
+                    "node {node_id}: it's local, and a remote plugin definition has nothing to run here (make it remote first)"
+                ));
+                continue;
+            }
             let mut errors = vec![];
             // A remote node runs it at its endpoint, if it has one.
             let endpoint: Option<crate::modules::node_config::RemoteConfigurator> = config
@@ -943,5 +1041,51 @@ pub(crate) mod tests {
             f.service.check_installations().await.unwrap(),
             ["test-sink"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_definition_fits_only_remote_nodes() {
+        let f = fixture(|_| {}).await;
+        let def = |version: &str| -> crate::modules::plugin::definition::Definition {
+            serde_json::from_value(serde_json::json!({
+                "manifest": {"manifest_version": 2, "id": "far", "name": "Far", "version": version,
+                             "type": "SINK", "launch": "remote", "payload_schemas": {"in": "in.json"}},
+                "files": {"in.json": {"json": {"fields": [{"key": "a", "type": "STRING"}]}}}
+            }))
+            .unwrap()
+        };
+        let plugin = f.service.register_definition(&def("1.0.0")).await.unwrap();
+        assert!(f.service.is_installed(&plugin));
+        f.add_node("n-remote", "far", r#"{"launch": "remote"}"#)
+            .await;
+        f.service
+            .replace_definition("far", &def("1.1.0"))
+            .await
+            .unwrap();
+        f.add_node("n-local", "far", "{}").await;
+        match f.service.replace_definition("far", &def("1.2.0")).await {
+            Err(ServiceError::IncompatibleNodes(problems)) => {
+                assert_eq!(problems.len(), 1, "{problems:?}");
+                assert!(problems[0].starts_with("node n-local"), "{problems:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Exported, it's a package any server takes.
+        let (name, zip) = f.service.export_definition("far").await.unwrap();
+        assert_eq!(name, "far-1.1.0.zip");
+        let upload = f.service.new_upload_path();
+        std::fs::write(&upload, &zip).unwrap();
+        let other = fixture(|_| {}).await;
+        let path = other.service.new_upload_path();
+        std::fs::rename(&upload, &path).unwrap();
+        let copy = other.service.install(&path).await.unwrap();
+        assert_eq!((copy.id.as_str(), copy.version.as_str()), ("far", "1.1.0"));
+        assert!(copy.parsed_manifest().unwrap().is_remote_only());
+        // A package isn't replaced by a definition.
+        f.service.install(&f.upload("pkg", "1.0.0")).await.unwrap();
+        assert!(matches!(
+            f.service.replace_definition("pkg", &def("1.0.0")).await,
+            Err(ServiceError::InvalidPackage(_))
+        ));
     }
 }

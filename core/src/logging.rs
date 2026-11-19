@@ -1,25 +1,28 @@
 use crate::config;
 use flexi_logger::FlexiLoggerError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::sync::LazyLock;
 use thiserror::Error;
 
 mod loglog;
 
-#[derive(Deserialize, Copy, Clone, Eq, PartialEq)]
+/// The log line format.
+#[derive(Deserialize, Serialize, Copy, Clone, Debug, Eq, PartialEq, utoipa::ToSchema)]
 pub enum FormatType {
     PLAIN,
 }
 
-#[derive(Deserialize, Copy, Clone, Eq, PartialEq)]
+/// Where log records go.
+#[derive(Deserialize, Serialize, Copy, Clone, Debug, Eq, PartialEq, utoipa::ToSchema)]
 pub enum SinkType {
     CONSOLE,
     FILE,
     SYSLOG,
 }
 
-#[derive(Deserialize, Copy, Clone, Debug, Eq, PartialEq)]
+/// The lowest level logged.
+#[derive(Deserialize, Serialize, Copy, Clone, Debug, Eq, PartialEq, utoipa::ToSchema)]
 pub enum LogLevel {
     TRACE,
     DEBUG,
@@ -56,26 +59,50 @@ pub enum FieldType {
     Binary,
 }
 
-#[derive(Deserialize)]
+/// `[logging]`: the server's own log. Missing fields fall back to the
+/// defaults (a console logger at INFO).
+#[derive(Deserialize, Serialize, Clone, Debug, utoipa::ToSchema)]
+#[serde(default)]
 pub struct LoggerConfig {
     /// Used as the syslog process name and the log file prefix.
-    #[serde(default = "default_id")]
     id: String,
+    /// The line format (only `PLAIN` so far).
     #[allow(dead_code)] // only PLAIN exists so far
     format: FormatType,
     level: LogLevel,
+    /// Where records go: one entry per sink (`[[logging.sinks]]`).
     sinks: Vec<SinkConfig>,
+}
+
+impl Default for LoggerConfig {
+    fn default() -> Self {
+        Self {
+            id: default_id(),
+            format: FormatType::PLAIN,
+            level: LogLevel::INFO,
+            sinks: vec![SinkConfig {
+                sink_type: SinkType::CONSOLE,
+                file_directory: None,
+                file_max_size_bytes: None,
+                file_max_log_history: None,
+            }],
+        }
+    }
 }
 
 fn default_id() -> String {
     "flwrs".to_string()
 }
 
-#[derive(Deserialize)]
+/// A log sink (`[[logging.sinks]]`).
+#[derive(Deserialize, Serialize, Clone, Debug, utoipa::ToSchema)]
 pub struct SinkConfig {
     sink_type: SinkType,
+    /// `FILE`: the folder for the rotating log files.
     file_directory: Option<String>,
+    /// `FILE`: rotate after this many bytes.
     file_max_size_bytes: Option<u64>,
+    /// `FILE`: how many rotated files to keep.
     file_max_log_history: Option<u32>,
 }
 

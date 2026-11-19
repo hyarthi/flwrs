@@ -72,6 +72,11 @@ host = "0.0.0.0"
 port = 8080
 # enabled = true      # false: no management API and no web UI (scenes still run; e.g. an edge box once configured)
 # swagger_ui = false  # opt-in: Swagger UI at /swagger-ui (builds with the swagger-ui feature); /api-docs/openapi.json is always served
+# config_edit = false # let the web UI's server page edit this file (some keys stay locked; saving asks for the key again; only set here)
+
+[server]             # restarts from the web UI's server page
+# restart = "exec"     # exec: restart in place (Unix: same PID, so systemd / launchd keep tracking it); exit: stop with status 75 for a service manager
+# confirm_timeout_s = 120  # after a restart with a changed config, confirm it on the page within this time or the previous config comes back
 
 [http.auth]          # who may use the API and the web UI; without a key, loopback clients only
 # secret_key = "…"    # or secret_key_file = "/run/secrets/flwrs-key", or FLWRS_SECRET_KEY; at least 16 bytes (openssl rand -hex 32)

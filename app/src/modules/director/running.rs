@@ -83,6 +83,32 @@ pub(crate) struct NodeReport {
     pub link: LinkReport,
 }
 
+/// The inbound queue a node gets, as the director sets it up: durable if
+/// the node (else the scene) says so, else spilling if the node (else
+/// `[director] spill_default`) says so, else memory; full = the node's
+/// policy, else `block` (`drop_newest` on a cycle, where blocking could
+/// deadlock). Also what the scene view shows for a stopped scene.
+pub(crate) fn effective_queue(
+    spec: &crate::modules::supervisor::QueueSpec,
+    scene_durable: Option<bool>,
+    spill_default: bool,
+    on_cycle: bool,
+) -> (QueueKind, WhenFull) {
+    let durable = spec.durable.or(scene_durable).unwrap_or(false);
+    let spill = spec.spill_enabled.unwrap_or(spill_default);
+    let kind = match (durable, spill) {
+        (true, _) => QueueKind::Durable,
+        (false, true) => QueueKind::Spill,
+        (false, false) => QueueKind::Memory,
+    };
+    let default_policy = if on_cycle {
+        WhenFull::DropNewest
+    } else {
+        WhenFull::Block
+    };
+    (kind, spec.when_full.unwrap_or(default_policy))
+}
+
 /// Per-node totals since the scene started.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, ToSchema)]
 pub(crate) struct NodeCounters {
@@ -264,34 +290,19 @@ impl Plan {
                     .find(|n| n.id == spec.node_id)
                     .expect("specs come from nodes");
                 let plugin = &snapshot.plugins[&node.plugin_id];
-                let queue = (spec.plugin_type != PluginType::Source).then(|| {
-                    let default_policy = if cyclic.contains(spec.node_id.as_str()) {
-                        WhenFull::DropNewest
-                    } else {
-                        WhenFull::Block
-                    };
-                    QueueSettings {
-                        capacity: spec.queue.capacity,
-                        max_bytes: spec.queue.max_bytes,
-                        when_full: spec.queue.when_full.unwrap_or(default_policy),
-                        block_timeout: spec.queue.block_timeout,
-                        max_evictions: spec.queue.max_evictions,
-                    }
+                let (kind, when_full) = effective_queue(
+                    &spec.queue,
+                    snapshot.scene.defaults.durable,
+                    ctx.spill.default_enabled,
+                    cyclic.contains(spec.node_id.as_str()),
+                );
+                let queue = (spec.plugin_type != PluginType::Source).then_some(QueueSettings {
+                    capacity: spec.queue.capacity,
+                    max_bytes: spec.queue.max_bytes,
+                    when_full,
+                    block_timeout: spec.queue.block_timeout,
+                    max_evictions: spec.queue.max_evictions,
                 });
-                let durable = spec
-                    .queue
-                    .durable
-                    .or(snapshot.scene.defaults.durable)
-                    .unwrap_or(false);
-                let spill = spec
-                    .queue
-                    .spill_enabled
-                    .unwrap_or(ctx.spill.default_enabled);
-                let kind = match (durable, spill) {
-                    (true, _) => QueueKind::Durable,
-                    (false, true) => QueueKind::Spill,
-                    (false, false) => QueueKind::Memory,
-                };
                 let key = NodeKey {
                     plugin_id: plugin.id.clone(),
                     plugin_version: plugin.version.clone(),
@@ -1256,7 +1267,7 @@ fn requeue_all(d: &Deliverer, flight: &mut InFlight, dead_log: &RateLimit) {
     d.queue.set_in_flight(0);
 }
 
-fn now() -> pbjson_types::Timestamp {
+pub(crate) fn now() -> pbjson_types::Timestamp {
     let since = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

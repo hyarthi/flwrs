@@ -294,6 +294,135 @@ async fn sdk_source_passes() {
     audit("source", "SOURCE").await;
 }
 
+/// A remote plugin definition (no executable) packages without a build, and
+/// the remote plugin given apart passes the audit through it.
+#[tokio::test]
+async fn a_remote_definition_packages_and_its_plugin_is_audited() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = package(dir.path(), "sink", "SINK");
+    let def = tempfile::tempdir().unwrap();
+    std::fs::write(def.path().join("schema.json"), SCHEMA).unwrap();
+    std::fs::write(
+        def.path().join("manifest.json"),
+        r#"{"manifest_version":2,"id":"far","name":"Far","version":"1.0.0","type":"SINK","launch":"remote","payload_schemas":{"in":"schema.json"}}"#,
+    )
+    .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let packaged = flwrs_trellis::package::package(&flwrs_trellis::package::PackageOptions {
+        out: Some(out.path().to_path_buf()),
+        ..flwrs_trellis::package::PackageOptions::new(def.path())
+    })
+    .unwrap();
+    assert_eq!(packaged.executable_size, 0);
+    assert_eq!(packaged.path.file_name().unwrap(), "far-1.0.0.zip");
+    let target = Target::from_zip(&packaged.path).unwrap();
+    assert!(target.is_remote());
+    // Nothing to run without the remote plugin.
+    let results = Audit::new(target.clone()).run().await;
+    assert!(results.iter().all(|r| r.outcome != Outcome::Pass));
+    let target = target.with_executable(local.program.clone());
+    let results = Audit::new(target).run().await;
+    assert!(
+        results.iter().all(|r| r.outcome == Outcome::Pass),
+        "{}",
+        flwrs_trellis::report(&results)
+    );
+}
+
+/// A remote plugin as trellis sees it: started by commands (with a fixed id
+/// and token), its payload schema set by its configurator endpoint. (Multi-
+/// threaded: `with_launch_args` blocks its thread while the endpoint answers.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_remote_plugin_is_started_by_commands_and_configured_at_its_endpoint() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // The endpoint: answers every request with the in schema.
+    let endpoint = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/configure", endpoint.local_addr().unwrap());
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = endpoint.accept().await {
+            let mut buf = vec![0u8; 65536];
+            let mut len = 0;
+            // Headers, then the body by Content-Length.
+            loop {
+                let n = stream.read(&mut buf[len..]).await.unwrap();
+                len += n;
+                let text = String::from_utf8_lossy(&buf[..len]).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length: usize = text
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                        .unwrap_or(0);
+                    if len >= end + 4 + length || n == 0 {
+                        seen.lock().unwrap().push(text[end + 4..].to_string());
+                        break;
+                    }
+                }
+            }
+            let body = format!(r#"{{"values":{{"in_schema":{SCHEMA}}}}}"#);
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(answer.as_bytes()).await.unwrap();
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let local = package(dir.path(), "sink", "SINK");
+    let def = tempfile::tempdir().unwrap();
+    write(
+        def.path(),
+        "schema/launch_args.json",
+        r#"{"type": "object", "properties": {"source": {"type": "string"}, "in_schema": {"type": "object"}}}"#,
+    );
+    write(
+        def.path(),
+        "manifest.json",
+        r#"{"manifest_version":2,"id":"far","name":"Far","version":"1.0.0","type":"SINK","launch":"remote",
+            "launch_args_schema":"schema/launch_args.json","configurator":{"fields":["in_schema"]},
+            "payload_schemas":{"in":{"from_launch_args":"/in_schema"}}}"#,
+    );
+    let remote = flwrs_trellis::remote::RemoteLaunch {
+        start: vec![
+            local.program.to_string_lossy().into_owned(),
+            "--id".into(),
+            "${id}".into(),
+            "--host".into(),
+            "${hub_host}".into(),
+            "--port".into(),
+            "${hub_port}".into(),
+        ],
+        id: Some("edge-1".into()),
+        token: Some("pre-shared".into()),
+        configurator: Some(flwrs_trellis::remote::RemoteConfigurator {
+            url,
+            auth: None,
+            ca: None,
+            send_secrets: false,
+        }),
+        dir: def.path().to_path_buf(),
+        ..Default::default()
+    };
+    let target = Target::from_package(def.path())
+        .unwrap()
+        .with_remote(remote)
+        .with_launch_args(serde_json::json!({"source": "s"}))
+        .unwrap();
+    assert!(target.in_schema.is_some(), "the endpoint's schema");
+    let request: serde_json::Value =
+        serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
+    assert_eq!(request["node_id"], "edge-1");
+    assert_eq!(request["fields"], serde_json::json!(["in_schema"]));
+    let results = Audit::new(target).run().await;
+    assert!(
+        results.iter().all(|r| r.outcome == Outcome::Pass),
+        "{}",
+        flwrs_trellis::report(&results)
+    );
+}
+
 #[tokio::test]
 async fn a_plugin_that_never_connects_fails() {
     let dir = tempfile::tempdir().unwrap();

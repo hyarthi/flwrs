@@ -3,10 +3,11 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 /// `[plugins]` config section. Every field is optional.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(default)]
 pub(crate) struct PluginsConfig {
     /// Where plugin packages are installed (`<dir>/<plugin-id>/`).
+    #[schema(value_type = String)]
     pub dir: PathBuf,
     /// Whether the mutating plugin endpoints (upload, upgrade, delete) are enabled.
     /// Uploading a plugin uploads code the server will run, so this is off by default.

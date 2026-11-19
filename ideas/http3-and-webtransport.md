@@ -1,6 +1,6 @@
 # Idea: HTTP/3 and WebTransport for the HTTP plugins
 
-Status: deferred (plugins plan §11; open question Q7 in phase 9). Bi-directional streaming is covered today by the WS source and the WS push sink (and WebSockets over HTTP/2).
+Status: deferred. Bi-directional streaming is covered today by the WS source and the WS push sink (and WebSockets over HTTP/2).
 
 ## Sketch
 
@@ -11,5 +11,5 @@ Status: deferred (plugins plan §11; open question Q7 in phase 9). Bi-directiona
 ## Costs and risks
 
 - `h3` is pre-1.0 and marked experimental; `h3-webtransport` more so.
-- A bigger binary and more memory per connection: the likeliest reason for a first edge / data-centre split of a plugin (plan §0).
+- A bigger binary and more memory per connection: the likeliest reason for a first edge / data-centre split of a plugin.
 - Firewalls and load balancers often block or don't proxy UDP 443.

@@ -187,10 +187,17 @@ mod tests {
     }
 
     /// The hashed name of the built JS entry (`assets/index-<hash>.js`).
+    /// A built script with precompressed variants (the build compresses
+    /// files over 1 KiB only).
     fn script() -> String {
         Assets::iter()
-            .find(|name| name.starts_with("assets/") && name.ends_with(".js"))
-            .expect("a built script")
+            .find(|name| {
+                name.starts_with("assets/")
+                    && name.ends_with(".js")
+                    && Assets::get(&format!("{name}.br")).is_some()
+                    && Assets::get(&format!("{name}.gz")).is_some()
+            })
+            .expect("a built, compressed script")
             .to_string()
     }
 

@@ -54,11 +54,17 @@ pub trait SourceReader<T: DeserializeOwned> {
     fn read(&self, path: &[String]) -> Option<T>;
 }
 
+static ARGS: LazyLock<CmdArgs> = LazyLock::new(CmdArgs::parse);
+
+/// The config file's path (`--config`), as given.
+pub fn main_config_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(&ARGS.config)
+}
+
 static MAIN_CONFIG: LazyLock<ESource> = LazyLock::new(init_main_config);
 
 fn init_main_config() -> ESource {
-    let args = CmdArgs::parse();
-    match toml_source::new_toml_source(args.config) {
+    match toml_source::new_toml_source(ARGS.config.clone()) {
         Ok(source) => ESource::Toml(source),
         Err(e) => {
             // The logger isn't up yet (it is configured from this file).

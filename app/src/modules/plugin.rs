@@ -3,6 +3,7 @@
 
 pub(crate) mod api;
 pub(crate) mod config;
+pub(crate) mod definition;
 pub(crate) mod manifest;
 pub(crate) mod node_rules;
 pub(crate) mod package;

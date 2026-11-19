@@ -5,11 +5,13 @@
   import Settings from '@lucide/svelte/icons/settings-2';
   import Send from '@lucide/svelte/icons/send';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
-  import Undo from '@lucide/svelte/icons/undo-2';
+  import Trash from '@lucide/svelte/icons/trash-2';
+  import Undo from '@lucide/svelte/icons/undo';
+  import Redo from '@lucide/svelte/icons/redo';
   import ConfirmDialog from '../ConfirmDialog.svelte';
   import ReviewDialog from './ReviewDialog.svelte';
   import SettingsDialog from './SettingsDialog.svelte';
-  import { discardDraft, rebaseDraft, submitDraft, type Check, type SceneView } from '../../lib/sceneView';
+  import { discardDraft, rebaseDraft, redoDraft, submitDraft, undoDraft, type Check, type SceneView } from '../../lib/sceneView';
 
   let {
     view,
@@ -58,6 +60,13 @@
   }
 
   const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+  /** Undo (`back`) or redo; the stream brings the draft back. */
+  export async function step(back: boolean) {
+    if (!draft || busy || !(back ? draft.undo : draft.redo)) return;
+    await run(back ? "Couldn't undo" : "Couldn't redo", () => (back ? undoDraft : redoDraft)(view.scene.id));
+  }
+  const mod = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘' : 'Ctrl+';
 </script>
 
 <div class="bar">
@@ -87,6 +96,14 @@
   </div>
 
   <div class="actions">
+    {#if draft}
+      <button class="btn ghost icon" type="button" disabled={busy || !draft.undo} title={draft.undo ? `Undo: ${draft.undo} (${mod}Z)` : 'Nothing to undo'} aria-label="Undo" onclick={() => step(true)}>
+        <Undo size={16} strokeWidth={1.75} />
+      </button>
+      <button class="btn ghost icon" type="button" disabled={busy || !draft.redo} title={draft.redo ? `Redo: ${draft.redo} (${mod}⇧Z)` : 'Nothing to redo'} aria-label="Redo" onclick={() => step(false)}>
+        <Redo size={16} strokeWidth={1.75} />
+      </button>
+    {/if}
     <button class="btn ghost" type="button" onclick={() => (editingSettings = true)} title="Scene settings">
       <Settings size={16} strokeWidth={1.75} />Settings
     </button>
@@ -95,7 +112,7 @@
         <GitCompare size={16} strokeWidth={1.75} />Review
       </button>
       <button class="btn ghost" type="button" onclick={() => (discarding = true)} disabled={busy}>
-        <Undo size={16} strokeWidth={1.75} />Discard
+        <Trash size={16} strokeWidth={1.75} />Discard
       </button>
       {#if draft.behind}
         <button class="btn primary" type="button" disabled={busy} onclick={() => run("Couldn't rebase the draft", () => rebaseDraft(view.scene.id))}>

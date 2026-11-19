@@ -9,7 +9,7 @@
     onclose,
     children,
     size = 'md',
-  }: { title: string; onclose: () => void; children: Snippet; size?: 'sm' | 'md' } = $props();
+  }: { title: string; onclose: () => void; children: Snippet; size?: 'sm' | 'md' | 'lg' | 'xl' } = $props();
 
   let dialog: HTMLDialogElement;
 
@@ -48,6 +48,14 @@
     background: var(--surface);
     color: var(--text);
     box-shadow: var(--shadow);
+  }
+
+  dialog.lg {
+    width: min(960px, calc(100vw - 2 * var(--space-5)));
+  }
+
+  dialog.xl {
+    width: min(1280px, calc(100vw - 2 * var(--space-5)));
   }
 
   dialog.sm {

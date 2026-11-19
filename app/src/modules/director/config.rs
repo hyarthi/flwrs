@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 /// `[director]` config section. Every field is optional.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct DirectorConfig {
     /// An event is dropped once it has been handed over this many times
@@ -12,6 +12,7 @@ pub(crate) struct DirectorConfig {
     /// Where spill-to-disk queue files go: `<spool_dir>/<scene-id>/<node-id>.db`.
     /// Wiped when the director starts (leftovers of an earlier run are
     /// dropped: delivery is at-most-once).
+    #[schema(value_type = String)]
     pub spool_dir: PathBuf,
     /// Spill to disk for nodes that don't say (`runtime.queue.spill.enabled`).
     pub spill_default: bool,
@@ -24,9 +25,11 @@ pub(crate) struct DirectorConfig {
     pub spill_min_free_bytes: u64,
     /// Local nodes' folders (their working directories): `<nodes_dir>/<scene-id>/<node-id>/`.
     /// Kept until the node or its scene is deleted.
+    #[schema(value_type = String)]
     pub nodes_dir: PathBuf,
     /// Files uploaded to nodes: `<files_dir>/<stem>_<sha256><.ext>`, stored
     /// once per name and content; removed once no node has them.
+    #[schema(value_type = String)]
     pub files_dir: PathBuf,
     /// Cores each plugin may use, for nodes that don't say (`runtime.threads`)
     /// and plugins whose manifest has no `runtime_defaults.threads`; `None` or

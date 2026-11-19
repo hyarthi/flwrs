@@ -10,4 +10,7 @@ mod tests;
 pub(crate) mod workdir;
 
 pub(crate) use node::{NodeHandle, NodeOutput, NodeState, NodeStatus, Output, supervise};
-pub(crate) use spec::{DeliverySpec, Launch, NodeSpec, SpillSpec, Surroundings, server_log_level};
+pub(crate) use spec::{
+    DeliverySpec, Launch, NodeSpec, QueueSpec, SpillSpec, Surroundings, runtime_defaults,
+    server_log_level,
+};

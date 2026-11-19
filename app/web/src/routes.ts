@@ -39,6 +39,7 @@ export const routes: RouteDef[] = [
   { pattern: '/plugins', component: PluginsPage, title: 'Plugins', section: 'plugins' },
   { pattern: '/plugins/new-remote', component: RemotePluginWizardPage, title: 'New remote plugin', section: 'plugins' },
   { pattern: '/plugins/by-id/:id', component: PluginPage, title: 'Plugin', section: 'plugins' },
+  { pattern: '/plugins/by-id/:id/edit', component: RemotePluginWizardPage, title: 'Edit remote plugin', section: 'plugins' },
   { pattern: '/server', component: ServerPage, title: 'Server', section: 'server' },
   { pattern: '/login', component: LoginPage, title: 'Log in', bare: true },
 ];

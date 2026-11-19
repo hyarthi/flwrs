@@ -1,7 +1,9 @@
 use crate::modules::api_error::{ApiError, ErrorBody, api_error, internal};
 use crate::modules::node_config::SceneDefaults;
 use crate::modules::scene::service::{self, ListFilters, Service, ServiceError};
-use crate::modules::scene::{api_draft, api_graph, api_status, api_transfer, api_uploads};
+use crate::modules::scene::{
+    api_draft, api_graph, api_mapping, api_status, api_transfer, api_uploads,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -246,6 +248,30 @@ async fn disable_scene(
     Ok(Json(service.set_enabled(&id, false).await?.into()))
 }
 
+/// `X-Flwrs-Undo-Group` (and `X-Flwrs-Undo-Label`): draft changes made by
+/// requests with the same group are one undo step (e.g. a paste's nodes and
+/// edges), named by the label if given.
+pub(crate) const UNDO_GROUP_HEADER: &str = "x-flwrs-undo-group";
+pub(crate) const UNDO_LABEL_HEADER: &str = "x-flwrs-undo-label";
+
+async fn undo_group(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let group = {
+        let headers = request.headers();
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.chars().take(200).collect::<String>())
+                .filter(|v| !v.is_empty())
+        };
+        header(UNDO_GROUP_HEADER).map(|g| (g, header(UNDO_LABEL_HEADER)))
+    };
+    crate::modules::scene::service::draft::history::with_group(group, next.run(request)).await
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -322,6 +348,9 @@ impl Api {
             .merge(api_status::routes())
             .merge(api_uploads::routes())
             .merge(api_draft::routes())
+            .merge(api_mapping::routes())
+            .merge(super::api_usage::routes())
             .with_state(service)
+            .layer(axum::middleware::from_fn(undo_group))
     }
 }

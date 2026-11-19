@@ -179,14 +179,29 @@ impl Threads {
     }
 }
 
+/// Where a plugin's nodes run (manifest `launch`, version 2). Absent = the
+/// package has an executable, and its nodes may be local or remote.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginLaunch {
+    /// A **remote plugin definition**: a plugin someone runs elsewhere, which
+    /// the server only describes (type, schemas, settings, UI). No
+    /// executable, platforms, threads or configurator program; its nodes must
+    /// be remote.
+    Remote,
+}
+
 /// A program in the package that fills some of a node's settings from its
 /// other settings (manifest version 2), e.g. an out schema derived from an
 /// OpenAPI document. The server runs it when a local node's settings change;
-/// see `docs/plugin-spec.md` and [`crate::package::configure`].
+/// see `docs/plugin-spec.md` and [`crate::package::configure`]. A remote
+/// plugin definition names only its `fields` (its nodes' endpoints run it).
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Configurator {
-    /// Path of its executable, relative to the package root.
+    /// Path of its executable, relative to the package root (empty for a
+    /// remote plugin definition).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub executable: String,
     /// The top-level launch-args properties it sets.
     pub fields: Vec<String>,
@@ -222,7 +237,12 @@ pub struct Manifest {
     pub plugin_type: PluginType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Path of the executable, relative to the package root.
+    /// `remote`: a remote plugin definition (no executable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<PluginLaunch>,
+    /// Path of the executable, relative to the package root (empty for a
+    /// remote plugin definition).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub executable: String,
     /// `<os>-<arch>` targets the executable runs on; `None` = any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -254,6 +274,11 @@ pub fn current_platform() -> String {
 }
 
 impl Manifest {
+    /// A remote plugin definition (`"launch": "remote"`): nothing to run here.
+    pub fn is_remote_only(&self) -> bool {
+        self.launch == Some(PluginLaunch::Remote)
+    }
+
     /// Checks the manifest's own fields. File references are checked against
     /// the package contents separately. Returns every problem found.
     ///
@@ -285,9 +310,41 @@ impl Manifest {
                 self.version
             ));
         }
+        let v2 = self.manifest_version >= 2;
         for (field, path) in self.file_references() {
             if let Err(e) = check_relative_path(path) {
                 errors.push(format!("{field} {path:?}: {e}"));
+            }
+        }
+        if self.is_remote_only() {
+            if !v2 {
+                errors.push("launch needs manifest_version 2".into());
+            }
+            for (field, set) in [
+                ("executable", !self.executable.is_empty()),
+                ("platforms", self.platforms.is_some()),
+                ("threads", self.threads.is_some()),
+                (
+                    "configurator.executable",
+                    self.configurator
+                        .as_ref()
+                        .is_some_and(|c| !c.executable.is_empty()),
+                ),
+            ] {
+                if set {
+                    errors.push(format!(
+                        "{field}: a remote plugin definition (launch \"remote\") runs nothing on this server"
+                    ));
+                }
+            }
+        } else {
+            if self.executable.is_empty() {
+                errors.push("executable is missing".into());
+            }
+            if let Some(c) = &self.configurator
+                && c.executable.is_empty()
+            {
+                errors.push("configurator.executable is missing".into());
             }
         }
         if let Some(platforms) = &self.platforms {
@@ -306,7 +363,6 @@ impl Manifest {
             PluginType::Transform => (true, true),
         };
         let schemas = &self.payload_schemas;
-        let v2 = self.manifest_version >= 2;
         for (name, source) in [("in", &schemas.input), ("out", &schemas.output)] {
             if let Some(SchemaSource::FromLaunchArgs(f)) = source {
                 if !v2 {
@@ -370,7 +426,7 @@ impl Manifest {
                     ));
                 }
             }
-            if configurator.executable == self.executable {
+            if !configurator.executable.is_empty() && configurator.executable == self.executable {
                 errors.push("configurator.executable must not be the plugin's executable".into());
             }
         }
@@ -399,8 +455,11 @@ impl Manifest {
 
     /// Every path the manifest points to, with the field it comes from.
     pub fn file_references(&self) -> Vec<(&'static str, &str)> {
-        let mut refs = vec![("executable", self.executable.as_str())];
-        if let Some(c) = &self.configurator {
+        let mut refs = vec![];
+        if !self.executable.is_empty() {
+            refs.push(("executable", self.executable.as_str()));
+        }
+        if let Some(c) = self.configurator.as_ref().filter(|c| !c.executable.is_empty()) {
             refs.push(("configurator.executable", c.executable.as_str()));
         }
         if let Some(p) = &self.launch_args_schema {
@@ -623,6 +682,7 @@ mod tests {
             version: "0.1.0".into(),
             plugin_type,
             description: None,
+            launch: None,
             executable: "bin/plugin".into(),
             platforms: None,
             launch_args_schema: None,
@@ -641,6 +701,52 @@ mod tests {
 
     fn path(p: &str) -> SchemaSource {
         SchemaSource::Path(p.into())
+    }
+
+    #[test]
+    fn remote_definitions_run_nothing_here() {
+        let mut m = manifest(PluginType::Sink);
+        m.manifest_version = 2;
+        m.launch = Some(PluginLaunch::Remote);
+        // Still a package's executable: refused.
+        let errors = m.validate("linux-x86_64");
+        assert!(errors.iter().any(|e| e.starts_with("executable:")), "{errors:?}");
+        m.executable = String::new();
+        assert!(m.validate("linux-x86_64").is_empty());
+        assert!(!m.file_references().iter().any(|(f, _)| *f == "executable"));
+        // Fields for its nodes' endpoints, but no program.
+        m.launch_args_schema = Some("schema/launch_args.json".into());
+        m.configurator = Some(Configurator {
+            executable: String::new(),
+            fields: vec!["out_schema".into()],
+        });
+        assert!(m.validate("linux-x86_64").is_empty());
+        m.configurator.as_mut().unwrap().executable = "bin/config".into();
+        m.platforms = Some(vec!["linux-x86_64".into()]);
+        m.threads = Some(Threads {
+            via: ThreadsVia::Env,
+            name: "GOMAXPROCS".into(),
+            value: "{n}".into(),
+        });
+        let errors = m.validate("linux-x86_64");
+        for field in ["configurator.executable:", "platforms:", "threads:"] {
+            assert!(errors.iter().any(|e| e.starts_with(field)), "{field} {errors:?}");
+        }
+        m.manifest_version = 1;
+        assert!(m.validate("linux-x86_64").iter().any(|e| e.contains("launch needs")));
+        // A package without an executable.
+        let mut m = manifest(PluginType::Sink);
+        m.executable = String::new();
+        assert_eq!(m.validate("linux-x86_64"), vec!["executable is missing"]);
+        // The JSON form.
+        let parsed: Manifest = serde_json::from_value(json!({
+            "manifest_version": 2, "id": "far", "name": "Far", "version": "1.0.0",
+            "type": "SOURCE", "launch": "remote", "payload_schemas": {"out": "out.json"}
+        }))
+        .unwrap();
+        assert!(parsed.is_remote_only());
+        assert!(parsed.validate("linux-x86_64").is_empty());
+        assert!(!serde_json::to_value(&parsed).unwrap().as_object().unwrap().contains_key("executable"));
     }
 
     #[test]
@@ -716,8 +822,12 @@ mod tests {
                         "type": "SINK", "executable": "a", "payload_schemas": {"in": "i.json"}});
         assert!(serde_json::from_value::<Manifest>(ok).is_ok());
         let typo = json!({"manifest_version": 1, "id": "a", "name": "A", "version": "1.0.0",
-                          "type": "SINK", "executabel": "a"});
-        assert!(serde_json::from_value::<Manifest>(typo).is_err());
+                          "type": "SINK", "executabel": "a", "payload_schemas": {"in": "i.json"}});
+        let m: Manifest = serde_json::from_value(typo).unwrap();
+        assert_eq!(
+            m.validate("x"),
+            ["unknown field \"executabel\"", "executable is missing"]
+        );
         let bad_type = json!({"manifest_version": 1, "id": "a", "name": "A", "version": "1.0.0",
                               "type": "sink", "executable": "a"});
         assert!(serde_json::from_value::<Manifest>(bad_type).is_err());

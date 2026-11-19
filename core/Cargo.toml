@@ -28,6 +28,7 @@ axum.workspace = true
 tower-service.workspace = true
 tower-layer.workspace = true
 async-trait.workspace = true
+utoipa.workspace = true # config sections' schemas (the server page's forms)
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -145,7 +145,8 @@ pub(super) async fn stored_files(
 ) -> Result<Vec<(String, String)>, sqlx::Error> {
     sqlx::query_as::<Sqlite, (String, String)>(
         "SELECT \"name\", sha256 FROM scene_node_uploads \
-         UNION SELECT \"name\", sha256 FROM scene_draft_node_uploads",
+         UNION SELECT \"name\", sha256 FROM scene_draft_node_uploads \
+         UNION SELECT \"name\", sha256 FROM scene_draft_history_uploads",
     )
     .fetch_all(conn)
     .await
@@ -382,6 +383,26 @@ pub(super) async fn set_ui(
     let result = sqlx::query(AssertSqlSafe(format!(
         "UPDATE {} SET ui = $1 WHERE scene_id = $2 AND id = $3",
         store.nodes()
+    )))
+    .bind(ui)
+    .bind(scene_id)
+    .bind(id)
+    .execute(conn)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// As [`set_ui`], for an edge.
+pub(super) async fn set_edge_ui(
+    conn: &mut SqliteConnection,
+    store: Store,
+    scene_id: &str,
+    id: &str,
+    ui: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(AssertSqlSafe(format!(
+        "UPDATE {} SET ui = $1 WHERE scene_id = $2 AND id = $3",
+        store.edges()
     )))
     .bind(ui)
     .bind(scene_id)

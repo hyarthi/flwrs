@@ -4,7 +4,7 @@ use flwrs_core::config::{self, main_config};
 use serde::Deserialize;
 
 /// `[scenes]` config section. Every field is optional.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ScenesConfig {
     /// Largest file uploaded to a node (`PUT …/nodes/by-id/{id}/uploads/{name}`).

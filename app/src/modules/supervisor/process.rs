@@ -72,6 +72,7 @@ impl PluginProcess {
             tokio::spawn(forward_output(
                 out,
                 tag.to_string(),
+                node_id.to_string(),
                 log::Level::Info,
                 "stdout",
             ));
@@ -80,6 +81,7 @@ impl PluginProcess {
             tokio::spawn(forward_output(
                 err,
                 tag.to_string(),
+                node_id.to_string(),
                 log::Level::Warn,
                 "stderr",
             ));
@@ -147,13 +149,22 @@ impl Drop for PluginProcess {
     }
 }
 
-/// Writes each output line to the server log, cutting overlong lines.
+/// Writes each output line to the server log (and the node's log book),
+/// cutting overlong lines.
 async fn forward_output(
     stream: impl AsyncRead + Unpin,
     tag: String,
+    node_id: String,
     level: log::Level,
     name: &str,
 ) {
+    use crate::modules::node_logs::{self, Source};
+    let source = if name == "stderr" {
+        Source::Stderr
+    } else {
+        Source::Stdout
+    };
+    let note = |text: String| node_logs::push(&node_id, level, source, text, Default::default());
     let mut reader = BufReader::new(stream);
     let mut line = Vec::new();
     loop {
@@ -171,12 +182,14 @@ async fn forward_output(
         let text = text.trim_end_matches(['\r', '\n']);
         if complete || line.len() < MAX_OUTPUT_LINE {
             log::log!(level, "{tag} {name}: {text}");
+            note(text.to_string());
             continue;
         }
         log::log!(
             level,
             "{tag} {name}: {text} [line cut at {MAX_OUTPUT_LINE} bytes]"
         );
+        note(format!("{text} [line cut at {MAX_OUTPUT_LINE} bytes]"));
         // Skip the rest of the overlong line.
         loop {
             line.clear();

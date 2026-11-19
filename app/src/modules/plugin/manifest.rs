@@ -36,6 +36,7 @@ mod tests {
             version: "0.1.0".into(),
             plugin_type: PluginType::Sink,
             description: None,
+            launch: None,
             executable: "bin/plugin".into(),
             platforms: None,
             launch_args_schema: None,

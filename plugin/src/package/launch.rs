@@ -1068,6 +1068,7 @@ mod tests {
             version: "0.1.0".into(),
             plugin_type: PluginType::Transform,
             description: None,
+            launch: None,
             executable: "bin/script".into(),
             platforms: None,
             launch_args_schema: Some("schema/launch_args.json".into()),

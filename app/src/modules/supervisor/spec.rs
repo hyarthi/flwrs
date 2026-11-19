@@ -209,6 +209,16 @@ pub(crate) struct SpillSpec {
     pub write_batch: usize,
 }
 
+/// The manifest's `runtime_defaults` (none = the built-in defaults).
+pub(crate) fn runtime_defaults(
+    manifest: &flwrs_plugin::package::Manifest,
+) -> Result<RuntimeConfig, String> {
+    match &manifest.runtime_defaults {
+        Some(value) => RuntimeConfig::parse(value),
+        None => Ok(RuntimeConfig::default()),
+    }
+}
+
 impl QueueSpec {
     pub(crate) fn resolve(node: &RuntimeConfig, defaults: &RuntimeConfig) -> Self {
         let (n, d) = (node.queue.as_ref(), defaults.queue.as_ref());
@@ -398,13 +408,10 @@ impl NodeSpec {
         let manifest = plugin
             .parsed_manifest()
             .ok_or_else(|| vec![format!("plugin [{}] has an invalid manifest", plugin.id)])?;
-        let defaults = match &manifest.runtime_defaults {
-            Some(value) => RuntimeConfig::parse(value).unwrap_or_else(|e| {
-                errors.push(format!("manifest runtime_defaults: {e}"));
-                RuntimeConfig::default()
-            }),
-            None => RuntimeConfig::default(),
-        };
+        let defaults = runtime_defaults(&manifest).unwrap_or_else(|e| {
+            errors.push(format!("manifest runtime_defaults: {e}"));
+            RuntimeConfig::default()
+        });
         errors.extend(config.runtime.validate("config.runtime"));
 
         let rules = NodeRules::of(plugin).map_err(|e| vec![e])?;

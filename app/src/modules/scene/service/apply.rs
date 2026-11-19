@@ -99,6 +99,8 @@ pub(crate) struct TargetEdge {
     pub target_node_id: String,
     /// The mapping as stored (JSON text); `None` = pass through.
     pub mapping: Option<String>,
+    /// Layout (the `ui` column); not content, so not in the hash.
+    pub ui: Option<String>,
 }
 
 impl TargetEdge {
@@ -109,6 +111,7 @@ impl TargetEdge {
             source_node_id: row.source_node_id,
             target_node_id: row.target_node_id,
             mapping: row.mapping,
+            ui: row.ui,
         }
     }
 
@@ -281,7 +284,12 @@ impl Service {
         }
 
         for t in &target.edges {
-            if !kept_edges.contains(&t.id) {
+            if kept_edges.contains(&t.id) {
+                let live = live_edges.iter().find(|e| e.id == t.id);
+                if t.ui.is_some() && live.is_some_and(|e| e.ui != t.ui) {
+                    query_sqlite::set_edge_ui(tx, Store::Live, id, &t.id, t.ui.as_deref()).await?;
+                }
+            } else {
                 query_sqlite::insert_edge(tx, Store::Live, id, &t.id, &t.values())
                     .await
                     .map_err(|e| match e.as_database_error().map(|d| d.kind()) {
@@ -300,6 +308,9 @@ impl Service {
                         }
                         _ => e.into(),
                     })?;
+                if t.ui.is_some() {
+                    query_sqlite::set_edge_ui(tx, Store::Live, id, &t.id, t.ui.as_deref()).await?;
+                }
             }
         }
         check_graph(tx, Store::Live, id).await?;
@@ -319,6 +330,9 @@ impl Service {
         disabled_now: bool,
     ) -> Result<(), ServiceError> {
         self.collect_garbage(conn).await?;
+        for node_id in &applied.removed_nodes {
+            crate::modules::node_logs::forget(node_id);
+        }
         if scene.enabled || disabled_now {
             // A reload of a disabled scene stops it.
             self.director.request_reload(&scene.id);
@@ -599,6 +613,11 @@ impl Service {
             source_node_id: source,
             target_node_id: dest,
             mapping: mapping.map(|s| serde_json::to_string(&s).expect("mapping serializes")),
+            ui: target
+                .edges
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| e.ui.clone()),
         })
     }
 }

@@ -1,6 +1,6 @@
 # Idea: per-channel authorization in the push sinks
 
-Status: idea, not scheduled (phase 8, Nov 2026: auth mirrors the other plugins for now: who may connect, not what they may read).
+Status: idea, not scheduled (Nov 2026: auth mirrors the other plugins for now: who may connect, not what they may read).
 
 ## Problem
 

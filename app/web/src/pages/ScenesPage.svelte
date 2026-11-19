@@ -424,12 +424,4 @@
     gap: var(--space-3);
     padding: var(--space-4) var(--space-5);
   }
-
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
-  }
 </style>

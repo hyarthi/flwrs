@@ -2,7 +2,7 @@ use flwrs_core::config::{self, main_config};
 use serde::Deserialize;
 
 /// `[hub]` config section: where plugins connect. Every field is optional.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct HubConfig {
     /// Address the hub listens on. Loopback by default; set it to a reachable
@@ -48,7 +48,7 @@ pub(crate) struct HubConfig {
 }
 
 /// `[hub.tls]`: the TLS listener for remote plugins.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, serde::Serialize, utoipa::ToSchema)]
 #[cfg_attr(
     not(feature = "remote"),
     allow(dead_code, reason = "read by the TLS listener (feature remote)")
@@ -61,11 +61,14 @@ pub(crate) struct HubTlsConfig {
     /// `0` picks a free port (tests); remote plugins need a fixed one.
     pub port: u16,
     /// The hub's certificate chain and private key (PEM files).
+    #[schema(value_type = String)]
     pub cert: std::path::PathBuf,
+    #[schema(value_type = String)]
     pub key: std::path::PathBuf,
     /// CA certificate(s) (PEM) that client certificates of `mtls` nodes
     /// chain to. Without it, `mtls` nodes need a pinned fingerprint.
     #[serde(default)]
+    #[schema(value_type = Option<String>)]
     pub client_ca: Option<std::path::PathBuf>,
 }
 
