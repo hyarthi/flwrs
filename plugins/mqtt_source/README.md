@@ -22,6 +22,8 @@ Subscribes to an MQTT broker, over MQTT 5 (default) or 3.1.1, and turns each mes
 | `max_packet_bytes` | 1 MiB | Largest packet the broker may send. |
 | `last_will` | | `{"topic", "payload", "qos", "retain"}`. |
 
+**Template:** in the web UI, an empty `subscriptions` starts with one filter ([`templates/subscriptions.json`](templates/subscriptions.json): `sensors/+/temperature`, QoS 1).
+
 ## Events
 
 The output schema (`schema/out.json`): `topic`, `payload` (bytes), `qos`, `retain`, `dup` (the broker may have sent it before), the MQTT 5 properties `content_type`, `response_topic`, `correlation_data`, `user_properties` (a map of string arrays) and `message_expiry_s`, and `receive_time`. Every event starts a new trace.

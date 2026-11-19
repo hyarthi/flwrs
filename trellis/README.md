@@ -7,7 +7,7 @@ Developer toolkit for [flwrs](https://github.com/hyarthi/flwrs) plugins, a light
 - **`test`** runs behavioural end-to-end tests: send events, trigger sources, and check ACKs, NACKs and outputs, through redeliveries, disconnects and restarts.
 - **`bench`** measures the plugin's throughput, latency, startup time, CPU and memory.
 
-> **Status:** early development; expect breaking changes. 0.0.1 was the protocol audit alone (then the `flwrs-trellis <package>` command); 0.0.2 adds `package`, `test` and `bench`, and the audit is now `flwrs-trellis audit <package>` (in Rust, `Audit::new(target).run()` instead of `run(&target, &[])`). 0.0.3 reads manifest version 2 packages and runs plugins as the server now does: in a node folder (a link to each of the package's top-level entries, and `config/` with the files the server delivers), with launch args delivered as arguments, environment variables or files, the node's own payload schemas, and uploaded files (`[uploads]`, `uploads` in test files, `--upload`, `Target::with_upload`). It needs `flwrs-plugin` 0.0.6. 0.0.4 fixes two bugs: `package` now includes the files the launch-args schema names (a code field's `definitions`), and `test` no longer matches a new connection's events with the previous connection's answers and outputs (after a `disconnect` or `restart` step). It needs `flwrs-plugin` 0.0.7. 0.0.5 adds `configure` and configurator tests (`*.configure.toml`; `Target::with_configurator_executable`, `Target::configure`, and `with_launch_args` running the configurator as the server does), quoted keys in output paths (`paths["/a/{b}"].x`), packaging a configurator binary, and paced open and step loops (a thread instead of tokio's timer, which woke about 1 ms late; the harness's own lateness is reported apart as `pacing_us`). It needs `flwrs-plugin` 0.0.8. 0.0.6 reads manifests with `threads` and `x-flwrs-listen`, and doesn't repeat a flavor in the package's file name when the plugin's id already ends with it (`http-source-edge-0.0.1-<platform>.zip`). It needs `flwrs-plugin` 0.0.9. It speaks plugin protocol version 2.
+> **Status:** early development; expect breaking changes. 0.0.1 was the protocol audit alone (then the `flwrs-trellis <package>` command); 0.0.2 adds `package`, `test` and `bench`, and the audit is now `flwrs-trellis audit <package>` (in Rust, `Audit::new(target).run()` instead of `run(&target, &[])`). 0.0.3 reads manifest version 2 packages and runs plugins as the server now does: in a node folder (a link to each of the package's top-level entries, and `config/` with the files the server delivers), with launch args delivered as arguments, environment variables or files, the node's own payload schemas, and uploaded files (`[uploads]`, `uploads` in test files, `--upload`, `Target::with_upload`). It needs `flwrs-plugin` 0.0.6. 0.0.4 fixes two bugs: `package` now includes the files the launch-args schema names (a code field's `definitions`), and `test` no longer matches a new connection's events with the previous connection's answers and outputs (after a `disconnect` or `restart` step). It needs `flwrs-plugin` 0.0.7. 0.0.5 adds `configure` and configurator tests (`*.configure.toml`; `Target::with_configurator_executable`, `Target::configure`, and `with_launch_args` running the configurator as the server does), quoted keys in output paths (`paths["/a/{b}"].x`), packaging a configurator binary, and paced open and step loops (a thread instead of tokio's timer, which woke about 1 ms late; the harness's own lateness is reported apart as `pacing_us`). It needs `flwrs-plugin` 0.0.8. 0.0.6 reads manifests with `threads` and `x-flwrs-listen`, and doesn't repeat a flavor in the package's file name when the plugin's id already ends with it (`http-source-edge-0.0.1-<platform>.zip`). It needs `flwrs-plugin` 0.0.9. 0.0.7 packages the files the launch-args schema names as `x-flwrs-template` (templates an editor fills an empty field with). It needs `flwrs-plugin` 0.0.10. It speaks plugin protocol version 2.
 
 ## Install
 
@@ -33,7 +33,7 @@ How the plugin is built depends on what its folder contains:
 - **Neither**: the manifest's executable goes in as it is, e.g. a script.
 - **A remote plugin definition** (`"launch": "remote"` in the manifest: a plugin that runs elsewhere, which the server only describes): nothing is built. The package holds the manifest and its files, without an executable or a platform (`<id>-<version>.zip`), and the server takes it like any package.
 
-The package holds the manifest, the executable (mode 0755), the files the manifest references, and the `[package] include` patterns. It's reproducible: the same input gives the same bytes.
+The package holds the manifest, the executable (mode 0755), the files the manifest references, the files its launch-args schema names (a code field's `definitions`, a field's `x-flwrs-template`), and the `[package] include` patterns. It's reproducible: the same input gives the same bytes.
 
 ## `audit`
 
@@ -253,7 +253,7 @@ Everything above is available as a library, for example in a Rust plugin's own i
 
 ```toml
 [dev-dependencies]
-flwrs-trellis = "0.0.6"
+flwrs-trellis = "0.0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

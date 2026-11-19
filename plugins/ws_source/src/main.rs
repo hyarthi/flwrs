@@ -151,7 +151,8 @@ mod package_tests {
             "asyncapi": {
                 "title": "AsyncAPI document", "x-flwrs-order": 1,
                 "description": "The API to serve: an AsyncAPI 3.0 or 3.1 document, as JSON or YAML text, or as an object. The channels of its receive operations are the WebSocket paths (their addresses), and their messages' JSON Schema payloads type and validate what clients send. It must be self-contained (no external $refs).",
-                "type": ["object", "string"], "x-flwrs-launch": { "via": "file" } },
+                "type": ["object", "string"], "x-flwrs-launch": { "via": "file" },
+                "x-flwrs-template": "templates/asyncapi.yaml" },
             "paths": {
                 "title": "Paths", "x-flwrs-order": 2,
                 "description": "Without a document: the paths clients connect to (default [\"/ws\"]); every message is an event, as bytes.",
@@ -200,6 +201,19 @@ mod package_tests {
             "title": "WebSocket source settings", "type": "object", "additionalProperties": false,
             "properties": props
         })
+    }
+
+    /// The template the editor offers (`x-flwrs-template`) is a document
+    /// this plugin serves as it is.
+    #[test]
+    fn the_template_is_a_working_document() {
+        let text = std::fs::read_to_string(file("templates/asyncapi.yaml")).unwrap();
+        let doc = flwrs_ws_source::spec::parse(&Value::String(text)).unwrap();
+        let api = flwrs_ws_source::spec::load(doc).unwrap();
+        let out = flwrs_ws_source::convert::out_schema(Some(&api)).unwrap();
+        let out = serde_json::to_string(&flwrs_ws_source::convert::to_json(&out)).unwrap();
+        assert!(out.contains("/devices/{device_id}"), "{out}");
+        assert!(out.contains("temp"), "{out}");
     }
 
     #[test]

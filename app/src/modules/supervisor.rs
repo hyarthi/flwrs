@@ -11,6 +11,6 @@ pub(crate) mod workdir;
 
 pub(crate) use node::{NodeHandle, NodeOutput, NodeState, NodeStatus, Output, supervise};
 pub(crate) use spec::{
-    DeliverySpec, Launch, NodeSpec, QueueSpec, SpillSpec, Surroundings, runtime_defaults,
-    server_log_level,
+    DeliverySpec, Launch, NodeSpec, QueueSpec, SpillSpec, Surroundings, node_defaults,
+    runtime_defaults, server_log_level,
 };

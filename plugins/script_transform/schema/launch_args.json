@@ -25,7 +25,8 @@
           "type": "object"
         }
       },
-      "x-flwrs-order": 1
+      "x-flwrs-order": 1,
+      "x-flwrs-template": "templates/schemas.json"
     },
     "script": {
       "title": "Script",
@@ -47,7 +48,8 @@
         "signature": "fun(payload: In, meta: Meta): Out|Many|nil"
       },
       "x-flwrs-widget": "code",
-      "x-flwrs-order": 2
+      "x-flwrs-order": 2,
+      "x-flwrs-template": "templates/script.lua"
     },
     "on_error": {
       "title": "When the script fails",

@@ -12,6 +12,10 @@
 //!   "alias"?, "file_name"?, "source"?: "upload"}`.
 //! - `x-flwrs-code` on a string property: `{"language", "params", "definitions"?, "signature"?}`.
 //! - UI hints: `x-flwrs-group`, `x-flwrs-order`, `x-flwrs-advanced`, `x-flwrs-widget`.
+//! - `x-flwrs-template` on a property: a file in the package that an editor
+//!   fills an empty field with (a starting point, e.g. a sample API document
+//!   or script): its text for a property that may be a string, else the JSON
+//!   value it holds. Never applied by the server.
 //! - `x-flwrs-listen: true` on a top-level string property: an address the
 //!   plugin listens on (`host:port`), so a server can warn when two nodes
 //!   would bind the same one.
@@ -126,6 +130,19 @@ pub struct CodeField {
     pub signature: Option<String>,
 }
 
+/// A field with a template (`x-flwrs-template`): a package file an editor
+/// fills the empty field with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateField {
+    /// JSON pointer of the field in `launch_args`.
+    pub pointer: String,
+    /// The file's path in the package.
+    pub path: String,
+    /// The property may be a string: the file's text is the value. Else the
+    /// file holds the value as JSON (the package check parses it).
+    pub text: bool,
+}
+
 /// The launch rules of a plugin: its manifest's style plus, for manifest
 /// version 2, what its launch-args schema declares.
 #[derive(Clone, Debug)]
@@ -134,6 +151,7 @@ pub struct LaunchSpec {
     style: LaunchArgsStyle,
     fields: BTreeMap<String, LaunchField>,
     code: Vec<CodeField>,
+    templates: Vec<TemplateField>,
     listen: Vec<ListenField>,
     input_pointer: Option<String>,
     output_pointer: Option<String>,
@@ -195,6 +213,7 @@ impl LaunchSpec {
             style: manifest.launch_args_style,
             fields: BTreeMap::new(),
             code: vec![],
+            templates: vec![],
             listen: Vec::new(),
             input_pointer: pointer(&manifest.payload_schemas.input),
             output_pointer: pointer(&manifest.payload_schemas.output),
@@ -207,7 +226,16 @@ impl LaunchSpec {
         let Some(schema) = schema.filter(|_| v2) else {
             return (spec, report);
         };
-        walk(schema, "", Place::Root, &mut spec.code, &mut report);
+        walk(
+            schema,
+            "",
+            Place::Root,
+            &mut Found {
+                code: &mut spec.code,
+                templates: &mut spec.templates,
+            },
+            &mut report,
+        );
         if let Some(props) = schema.get("properties").and_then(Value::as_object) {
             for (name, prop) in props {
                 if prop.get("x-flwrs-listen") == Some(&Value::Bool(true)) {
@@ -296,6 +324,7 @@ impl LaunchSpec {
             style: LaunchArgsStyle::Flags,
             fields: BTreeMap::new(),
             code: vec![],
+            templates: vec![],
             listen: Vec::new(),
             input_pointer: None,
             output_pointer: None,
@@ -365,18 +394,28 @@ impl LaunchSpec {
         )
     }
 
-    /// Package files the schema refers to (`x-flwrs-code.definitions`).
+    /// The fields with a template (`x-flwrs-template`).
+    pub fn template_fields(&self) -> &[TemplateField] {
+        &self.templates
+    }
+
+    /// Package files the schema refers to (`x-flwrs-code.definitions`,
+    /// `x-flwrs-template`).
     pub fn file_references(&self) -> Vec<(String, &str)> {
-        self.code
-            .iter()
-            .filter_map(|c| {
-                let path = c.definitions.as_deref()?;
-                Some((
-                    format!("launch_args_schema {}: definitions", c.pointer),
-                    path,
-                ))
-            })
-            .collect()
+        let definitions = self.code.iter().filter_map(|c| {
+            let path = c.definitions.as_deref()?;
+            Some((
+                format!("launch_args_schema {}: definitions", c.pointer),
+                path,
+            ))
+        });
+        let templates = self.templates.iter().map(|t| {
+            (
+                format!("launch_args_schema {}: x-flwrs-template", t.pointer),
+                t.path.as_str(),
+            )
+        });
+        definitions.chain(templates).collect()
     }
 
     /// The launch plan for a node's `launch_args`; file arguments point into
@@ -534,17 +573,17 @@ enum Place {
 
 /// Checks the annotations' places and shapes everywhere in the schema, and
 /// collects the code fields.
-fn walk(
-    node: &Value,
-    pointer: &str,
-    place: Place,
-    code: &mut Vec<CodeField>,
-    report: &mut SchemaReport,
-) {
+/// What `walk` collects.
+struct Found<'a> {
+    code: &'a mut Vec<CodeField>,
+    templates: &'a mut Vec<TemplateField>,
+}
+
+fn walk(node: &Value, pointer: &str, place: Place, found: &mut Found, report: &mut SchemaReport) {
     match node {
         Value::Array(items) => {
             for item in items {
-                walk(item, pointer, Place::Other, code, report);
+                walk(item, pointer, Place::Other, found, report);
             }
         }
         Value::Object(map) => {
@@ -590,10 +629,21 @@ fn walk(
                         at(pointer)
                     )),
                     "x-flwrs-code" => match code_field(pointer, map, value) {
-                        Ok(c) => code.push(c),
+                        Ok(c) => found.code.push(c),
                         Err(e) => report
                             .errors
                             .push(format!("launch_args_schema at {}: x-flwrs-code: {e}", at(pointer))),
+                    },
+                    "x-flwrs-template" if !property => report.errors.push(format!(
+                        "launch_args_schema at {}: x-flwrs-template is only allowed on properties",
+                        at(pointer)
+                    )),
+                    "x-flwrs-template" => match template_field(pointer, map, value) {
+                        Ok(t) => found.templates.push(t),
+                        Err(e) => report.errors.push(format!(
+                            "launch_args_schema at {}: x-flwrs-template: {e}",
+                            at(pointer)
+                        )),
                     },
                     hint if HINTS.contains(&hint) => {
                         if let Err(e) = check_hint(hint, value) {
@@ -622,10 +672,10 @@ fn walk(
                     };
                     for (name, prop) in props {
                         let p = format!("{pointer}/{}", escape(name));
-                        walk(prop, &p, Place::Property(depth), code, report);
+                        walk(prop, &p, Place::Property(depth), found, report);
                     }
                 } else {
-                    walk(value, pointer, Place::Other, code, report);
+                    walk(value, pointer, Place::Other, found, report);
                 }
             }
         }
@@ -667,6 +717,29 @@ fn check_hint(hint: &str, value: &Value) -> Result<(), String> {
         },
         _ => Ok(()),
     }
+}
+
+/// `x-flwrs-template`: the path of a package file. A property that may be a
+/// string takes its text; any other takes the JSON value it holds.
+fn template_field(
+    pointer: &str,
+    property: &Map<String, Value>,
+    value: &Value,
+) -> Result<TemplateField, String> {
+    let allowed = types(property);
+    let text = allowed.iter().any(|t| t == "string")
+        || (allowed.is_empty()
+            && !property.contains_key("properties")
+            && !property.contains_key("items"));
+    let Some(path) = value.as_str() else {
+        return Err("must be the path of a file in the package, as a string".into());
+    };
+    check_relative_path(path).map_err(|e| format!("{path:?}: {e}"))?;
+    Ok(TemplateField {
+        pointer: pointer.to_string(),
+        path: path.to_string(),
+        text,
+    })
 }
 
 fn code_field(
@@ -1212,6 +1285,49 @@ mod tests {
         }});
         let (_, report) = LaunchSpec::new(&manifest(2), Some(&bad));
         assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+    }
+
+    #[test]
+    fn templates_name_package_files() {
+        let schema = json!({"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+            "openapi": {"type": ["object", "string"], "x-flwrs-template": "templates/openapi.yaml"},
+            "count": {"type": "integer", "x-flwrs-template": "templates/count.json"},
+            "nested": {"type": "object", "properties": {
+                "script": {"type": "string", "x-flwrs-template": "templates/script.lua"}
+            }}
+        }});
+        let (spec, report) = LaunchSpec::new(&manifest(2), Some(&schema));
+        assert!(
+            report.errors.is_empty() && report.warnings.is_empty(),
+            "{report:?}"
+        );
+        let mut found: Vec<_> = spec
+            .template_fields()
+            .iter()
+            .map(|t| (t.pointer.as_str(), t.path.as_str(), t.text))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("/count", "templates/count.json", false),
+                ("/nested/script", "templates/script.lua", true),
+                ("/openapi", "templates/openapi.yaml", true)
+            ]
+        );
+        // The package must carry them.
+        let refs: Vec<_> = spec.file_references().into_iter().map(|(_, p)| p).collect();
+        assert!(refs.contains(&"templates/openapi.yaml") && refs.contains(&"templates/script.lua"));
+
+        // A path inside the package, on a property.
+        let bad = json!({"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+            "a": {"type": "string", "x-flwrs-template": "../outside.txt"},
+            "b": {"type": "string", "x-flwrs-template": {"file": "t.txt"}}
+        }, "x-flwrs-template": "templates/root.txt"});
+        let (_, report) = LaunchSpec::new(&manifest(2), Some(&bad));
+        assert_eq!(report.errors.len(), 3, "{:?}", report.errors);
     }
 
     #[test]

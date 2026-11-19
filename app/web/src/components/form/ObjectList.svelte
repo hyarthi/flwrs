@@ -7,6 +7,7 @@
   import ArrowDown from '@lucide/svelte/icons/arrow-down';
   import Plus from '@lucide/svelte/icons/plus';
   import Trash from '@lucide/svelte/icons/trash-2';
+  import type { Snippet } from 'svelte';
   import SchemaField from './SchemaField.svelte';
   import { resolve, type Schema } from '../../lib/schemaForm';
 
@@ -19,6 +20,7 @@
     required = false,
     disabled = false,
     onchange,
+    tools,
   }: {
     root: Schema;
     /** The (resolved) schema of one item. */
@@ -29,6 +31,8 @@
     required?: boolean;
     disabled?: boolean;
     onchange: (value: unknown) => void;
+    /** Buttons beside the label (e.g. the field's template). */
+    tools?: Snippet;
   } = $props();
 
   type Row = Record<string, unknown>;
@@ -87,7 +91,7 @@
 </script>
 
 <div class="field">
-  <span class="label">{label}{required ? ' *' : ''} <span class="muted">({rows.length})</span></span>
+  <span class="label"><span>{label}{required ? ' *' : ''} <span class="muted">({rows.length})</span></span>{@render tools?.()}</span>
   {#if description}<span class="hint">{description}</span>{/if}
   <ol class="rows">
     {#each rows as row, i (i)}
@@ -126,6 +130,10 @@
 
 <style>
   .label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
     font-weight: 500;
   }
 

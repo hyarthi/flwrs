@@ -25,7 +25,8 @@
           "type": "object"
         }
       },
-      "x-flwrs-order": 1
+      "x-flwrs-order": 1,
+      "x-flwrs-template": "templates/schemas.json"
     },
     "key": {
       "title": "Group by",
@@ -52,7 +53,8 @@
         "signature": "fun(key: string): any"
       },
       "x-flwrs-widget": "code",
-      "x-flwrs-order": 3
+      "x-flwrs-order": 3,
+      "x-flwrs-template": "templates/init.lua"
     },
     "step": {
       "title": "Step",
@@ -76,7 +78,8 @@
         "signature": "fun(state: any, payload: In, meta: Meta, key: string): any, Out|Many|nil"
       },
       "x-flwrs-widget": "code",
-      "x-flwrs-order": 4
+      "x-flwrs-order": 4,
+      "x-flwrs-template": "templates/step.lua"
     },
     "finish": {
       "title": "Finish",

@@ -303,7 +303,7 @@
   const pretty = (v: unknown) => JSON.stringify(v, null, 2);
 </script>
 
-<Modal title={edge ? `${nameOf(edge.source_node_id)} → ${nameOf(edge.target_node_id)}` : 'Edge'} {onclose} size="xl">
+<Modal title={edge ? `${nameOf(edge.source_node_id)} → ${nameOf(edge.target_node_id)}` : 'Edge'} {onclose} size="xl" fixed>
   {#if !edge}
     <p class="muted">This edge isn’t in the scene any more.</p>
   {:else}
@@ -322,171 +322,174 @@
 
     <Tabs tabs={[{ id: 'visual', label: 'Mapping' }, { id: 'json', label: 'JSON' }]} active={tab} onselect={switchTab} />
 
-    {#if tab === 'json'}
-      <textarea class="input code json" rows="16" spellcheck="false" bind:value={jsonText} oninput={change} placeholder="Empty: events pass through unchanged."></textarea>
-      {#if jsonError}<p class="error">{jsonError}</p>{/if}
-    {:else}
-      <div class="editor">
-        <aside class="schema">
-          <h3>{nameOf(edge.source_node_id)} sends</h3>
-          {#if test?.source}
-            <SchemaTree fields={test.source} side="source" used={usedSources} onpick={(p) => pick('source', p)} ondropfield={(path, dropped) => addRule('copy', dropped, path)} />
-          {:else}
-            <p class="muted small">{test ? 'Its schema isn’t known (its plugin is missing?): type paths by hand.' : 'Loading…'}</p>
-          {/if}
-        </aside>
-
-        <section class="rules" role="list" ondragover={accepts} ondrop={dropOnRules}>
-          <div class="row">
-            <label class="field">
-              Start from
-              <select class="input" bind:value={editor.mode} onchange={change}>
-                <option value="merge">The input (merge: rules change it)</option>
-                <option value="replace">Nothing (replace: only what rules set)</option>
-              </select>
-            </label>
-            <label class="field">
-              Build the output with
-              <select class="input" value={editor.useScript ? 'script' : 'rules'} onchange={(e) => { editor.useScript = e.currentTarget.value === 'script'; change(); }}>
-                <option value="rules">Rules</option>
-                <option value="script">A Lua script</option>
-              </select>
-            </label>
-          </div>
-
-          <div class="block">
-            <label class="check">
-              <input type="checkbox" checked={editor.filter !== null} onchange={(e) => { editor.filter = e.currentTarget.checked ? 'return true' : null; change(); }} />
-              Filter: only events for which this returns true go on
-            </label>
-            {#if editor.filter !== null}
-              <CodeEditor compact scope={luaScope} params={['payload', 'meta']} language="lua" value={editor.filter} onchange={(v) => { editor.filter = v; change(); }} />
-              <span class="hint mono">function(payload, meta) → boolean</span>
+    <!-- Only this scrolls; the name, the tabs and the actions stay put. -->
+    <div class="scroll">
+      {#if tab === 'json'}
+        <textarea class="input code json" rows="16" spellcheck="false" bind:value={jsonText} oninput={change} placeholder="Empty: events pass through unchanged."></textarea>
+        {#if jsonError}<p class="error">{jsonError}</p>{/if}
+      {:else}
+        <div class="editor">
+          <aside class="schema">
+            <h3>{nameOf(edge.source_node_id)} sends</h3>
+            {#if test?.source}
+              <SchemaTree fields={test.source} side="source" used={usedSources} onpick={(p) => pick('source', p)} ondropfield={(path, dropped) => addRule('copy', dropped, path)} />
+            {:else}
+              <p class="muted small">{test ? 'Its schema isn’t known (its plugin is missing?): type paths by hand.' : 'Loading…'}</p>
             {/if}
-          </div>
+          </aside>
 
-          {#if editor.useScript}
-            <div class="block">
-              <CodeEditor scope={luaScope} params={['payload', 'meta']} language="lua" value={editor.script} onchange={(v) => { editor.script = v; change(); }} />
-              <span class="hint mono">function(payload, meta) → the whole output table (nil: dropped)</span>
+          <section class="rules" role="list" ondragover={accepts} ondrop={dropOnRules}>
+            <div class="row">
+              <label class="field">
+                Start from
+                <select class="input" bind:value={editor.mode} onchange={change}>
+                  <option value="merge">The input (merge: rules change it)</option>
+                  <option value="replace">Nothing (replace: only what rules set)</option>
+                </select>
+              </label>
+              <label class="field">
+                Build the output with
+                <select class="input" value={editor.useScript ? 'script' : 'rules'} onchange={(e) => { editor.useScript = e.currentTarget.value === 'script'; change(); }}>
+                  <option value="rules">Rules</option>
+                  <option value="script">A Lua script</option>
+                </select>
+              </label>
             </div>
-          {:else}
-            {#each editor.rows as row, i (row.id)}
-              <div class="rule">
-                <div class="rule-head">
-                  <select class="input kind" bind:value={row.kind} onchange={() => { if (row.kind === 'set' && !row.value) row.value = '""'; change(); }} title={KINDS.find((k) => k.kind === row.kind)?.hint}>
-                    {#each KINDS as k (k.kind)}<option value={k.kind}>{k.label}</option>{/each}
-                  </select>
-                  {#if hasSource(row.kind)}
-                    <input class="input mono path" placeholder="source.path" bind:value={row.source} class:focused={focus?.row === row.id && focus.field === 'source'} onfocus={() => (focus = { row: row.id, field: 'source' })} oninput={change} ondragover={accepts} ondrop={(e) => dropOnPath(e, row, 'source')} />
-                    <span class="arrow">→</span>
-                  {/if}
-                  <input class="input mono path" placeholder="target.path" bind:value={row.target} class:focused={focus?.row === row.id && focus.field === 'target'} onfocus={() => (focus = { row: row.id, field: 'target' })} oninput={change} ondragover={accepts} ondrop={(e) => dropOnPath(e, row, 'target')} />
-                  {#if row.kind === 'set'}
-                    <span class="arrow">=</span>
-                    <input class="input mono value" placeholder="JSON value" bind:value={row.value} oninput={change} />
-                  {/if}
-                  <span class="rule-actions">
-                    <button class="btn ghost icon" type="button" disabled={i === 0} aria-label="Move up" onclick={() => moveRule(i, -1)}><ArrowUp size={14} strokeWidth={1.75} /></button>
-                    <button class="btn ghost icon" type="button" disabled={i === editor.rows.length - 1} aria-label="Move down" onclick={() => moveRule(i, 1)}><ArrowDown size={14} strokeWidth={1.75} /></button>
-                    <button class="btn ghost icon" type="button" aria-label="Remove the rule" onclick={() => { editor.rows = editor.rows.filter((r) => r.id !== row.id); change(); }}><X size={14} strokeWidth={1.75} /></button>
-                  </span>
-                </div>
-                {#if row.kind === 'lua'}
-                  <CodeEditor compact scope={luaScope} params={['payload', 'meta']} language="lua" value={row.lua} onchange={(v) => { row.lua = v; change(); }} />
-                {/if}
+
+            <div class="block">
+              <label class="check">
+                <input type="checkbox" checked={editor.filter !== null} onchange={(e) => { editor.filter = e.currentTarget.checked ? 'return true' : null; change(); }} />
+                Filter: only events for which this returns true go on
+              </label>
+              {#if editor.filter !== null}
+                <CodeEditor compact scope={luaScope} params={['payload', 'meta']} language="lua" value={editor.filter} onchange={(v) => { editor.filter = v; change(); }} />
+                <span class="hint mono">function(payload, meta) → boolean</span>
+              {/if}
+            </div>
+
+            {#if editor.useScript}
+              <div class="block">
+                <CodeEditor scope={luaScope} params={['payload', 'meta']} language="lua" value={editor.script} onchange={(v) => { editor.script = v; change(); }} />
+                <span class="hint mono">function(payload, meta) → the whole output table (nil: dropped)</span>
               </div>
             {:else}
-              <p class="muted small">No rules: {editor.mode === 'merge' ? 'events go on as they are' : 'the output is empty'}. Click a field on either side to start one, or add one:</p>
-            {/each}
-            <div class="add">
-              {#each KINDS as k (k.kind)}
-                <button class="btn ghost" type="button" title={k.hint} onclick={() => addRule(k.kind)}><Plus size={14} strokeWidth={1.75} />{k.label}</button>
+              {#each editor.rows as row, i (row.id)}
+                <div class="rule">
+                  <div class="rule-head">
+                    <select class="input kind" bind:value={row.kind} onchange={() => { if (row.kind === 'set' && !row.value) row.value = '""'; change(); }} title={KINDS.find((k) => k.kind === row.kind)?.hint}>
+                      {#each KINDS as k (k.kind)}<option value={k.kind}>{k.label}</option>{/each}
+                    </select>
+                    {#if hasSource(row.kind)}
+                      <input class="input mono path" placeholder="source.path" bind:value={row.source} class:focused={focus?.row === row.id && focus.field === 'source'} onfocus={() => (focus = { row: row.id, field: 'source' })} oninput={change} ondragover={accepts} ondrop={(e) => dropOnPath(e, row, 'source')} />
+                      <span class="arrow">→</span>
+                    {/if}
+                    <input class="input mono path" placeholder="target.path" bind:value={row.target} class:focused={focus?.row === row.id && focus.field === 'target'} onfocus={() => (focus = { row: row.id, field: 'target' })} oninput={change} ondragover={accepts} ondrop={(e) => dropOnPath(e, row, 'target')} />
+                    {#if row.kind === 'set'}
+                      <span class="arrow">=</span>
+                      <input class="input mono value" placeholder="JSON value" bind:value={row.value} oninput={change} />
+                    {/if}
+                    <span class="rule-actions">
+                      <button class="btn ghost icon" type="button" disabled={i === 0} aria-label="Move up" onclick={() => moveRule(i, -1)}><ArrowUp size={14} strokeWidth={1.75} /></button>
+                      <button class="btn ghost icon" type="button" disabled={i === editor.rows.length - 1} aria-label="Move down" onclick={() => moveRule(i, 1)}><ArrowDown size={14} strokeWidth={1.75} /></button>
+                      <button class="btn ghost icon" type="button" aria-label="Remove the rule" onclick={() => { editor.rows = editor.rows.filter((r) => r.id !== row.id); change(); }}><X size={14} strokeWidth={1.75} /></button>
+                    </span>
+                  </div>
+                  {#if row.kind === 'lua'}
+                    <CodeEditor compact scope={luaScope} params={['payload', 'meta']} language="lua" value={row.lua} onchange={(v) => { row.lua = v; change(); }} />
+                  {/if}
+                </div>
+              {:else}
+                <p class="muted small">No rules: {editor.mode === 'merge' ? 'events go on as they are' : 'the output is empty'}. Click a field on either side to start one, or add one:</p>
               {/each}
-            </div>
-          {/if}
-        </section>
+              <div class="add">
+                {#each KINDS as k (k.kind)}
+                  <button class="btn ghost" type="button" title={k.hint} onclick={() => addRule(k.kind)}><Plus size={14} strokeWidth={1.75} />{k.label}</button>
+                {/each}
+              </div>
+            {/if}
+          </section>
 
-        <aside class="schema">
-          <h3>{nameOf(edge.target_node_id)} takes</h3>
-          {#if test?.target}
-            <SchemaTree fields={test.target} side="target" used={usedTargets} onpick={(p) => pick('target', p)} ondropfield={(path, dropped) => addRule('copy', path, dropped)} />
-          {:else}
-            <p class="muted small">{test ? 'Its schema isn’t known: type paths by hand.' : 'Loading…'}</p>
-          {/if}
-        </aside>
+          <aside class="schema">
+            <h3>{nameOf(edge.target_node_id)} takes</h3>
+            {#if test?.target}
+              <SchemaTree fields={test.target} side="target" used={usedTargets} onpick={(p) => pick('target', p)} ondropfield={(path, dropped) => addRule('copy', path, dropped)} />
+            {:else}
+              <p class="muted small">{test ? 'Its schema isn’t known: type paths by hand.' : 'Loading…'}</p>
+            {/if}
+          </aside>
+        </div>
+      {/if}
+
+      {#each current.errors as e, i (i)}<p class="error">{e}</p>{/each}
+      {#if test?.problems.length}
+        <div class="notice danger"><ul>{#each test.problems as p, i (i)}<li>{p}</li>{/each}</ul></div>
+      {:else if !dirty && checkProblems.length}
+        <div class="notice danger"><ul>{#each checkProblems as p, i (i)}<li>{p}</li>{/each}</ul></div>
+      {/if}
+
+      <div class="samples" role="tablist">
+        {#each samples as sample, i (sample.id)}
+          {@const tone = toneOf(resultOf(sample.id))}
+          <span class="sample-tab" class:active={i === active}>
+            <button type="button" role="tab" aria-selected={i === active} onclick={() => (active = i)}>
+              <span class="dot {tone}"></span>Sample {i + 1}
+            </button>
+            {#if samples.length > 1}
+              <button type="button" class="close" aria-label={`Remove sample ${i + 1}`} onclick={() => removeSample(i)}><X size={12} strokeWidth={2} /></button>
+            {/if}
+          </span>
+        {/each}
+        <button class="btn ghost add-sample" type="button" onclick={addSample} title="Another sample"><Plus size={14} strokeWidth={1.75} />Sample</button>
+        {#if running}<span class="muted small">Running…</span>{/if}
       </div>
-    {/if}
 
-    {#each current.errors as e, i (i)}<p class="error">{e}</p>{/each}
-    {#if test?.problems.length}
-      <div class="notice danger"><ul>{#each test.problems as p, i (i)}<li>{p}</li>{/each}</ul></div>
-    {:else if !dirty && checkProblems.length}
-      <div class="notice danger"><ul>{#each checkProblems as p, i (i)}<li>{p}</li>{/each}</ul></div>
-    {/if}
-
-    <div class="samples" role="tablist">
-      {#each samples as sample, i (sample.id)}
-        {@const tone = toneOf(resultOf(sample.id))}
-        <span class="sample-tab" class:active={i === active}>
-          <button type="button" role="tab" aria-selected={i === active} onclick={() => (active = i)}>
-            <span class="dot {tone}"></span>Sample {i + 1}
-          </button>
-          {#if samples.length > 1}
-            <button type="button" class="close" aria-label={`Remove sample ${i + 1}`} onclick={() => removeSample(i)}><X size={12} strokeWidth={2} /></button>
-          {/if}
-        </span>
-      {/each}
-      <button class="btn ghost add-sample" type="button" onclick={addSample} title="Another sample"><Plus size={14} strokeWidth={1.75} />Sample</button>
-      {#if running}<span class="muted small">Running…</span>{/if}
-    </div>
-
-    {#if samples[active]}
-      {@const sample = samples[active]}
-      {@const result = resultOf(sample.id)}
-      <section class="test">
-        <div class="test-col">
-          <div class="test-head">
-            <h3>From {nameOf(edge.source_node_id)}</h3>
-            {#if test?.source}
-              <button class="btn ghost" type="button" title="A fresh sample from the schema" onclick={() => (sample.text = JSON.stringify(samplePayload(test!.source!), null, 2))}>
-                <RefreshCw size={14} strokeWidth={1.75} />Reset
-              </button>
+      {#if samples[active]}
+        {@const sample = samples[active]}
+        {@const result = resultOf(sample.id)}
+        <section class="test">
+          <div class="test-col">
+            <div class="test-head">
+              <h3>From {nameOf(edge.source_node_id)}</h3>
+              {#if test?.source}
+                <button class="btn ghost" type="button" title="A fresh sample from the schema" onclick={() => (sample.text = JSON.stringify(samplePayload(test!.source!), null, 2))}>
+                  <RefreshCw size={14} strokeWidth={1.75} />Reset
+                </button>
+              {/if}
+            </div>
+            <textarea class="input code" rows="9" spellcheck="false" bind:value={sample.text} placeholder="A payload as JSON (bytes as base64)"></textarea>
+          </div>
+          <div class="test-col">
+            <div class="test-head">
+              <h3>Sent to {nameOf(edge.target_node_id)}</h3>
+            </div>
+            {#if testError}
+              <p class="error">{testError}</p>
+            {:else if result && 'error' in result}
+              <pre class="out error">{result.error}</pre>
+            {:else if !result?.outcome}
+              <pre class="out muted">{test?.problems.length ? 'Fix the problems to try it.' : 'Give a sample to try it.'}</pre>
+            {:else if result.outcome.outcome === 'output'}
+              <pre class="out">{pretty(result.outcome.payload)}</pre>
+            {:else if result.outcome.outcome === 'filtered'}
+              <pre class="out muted">Filtered out: nothing is sent.</pre>
+            {:else}
+              <pre class="out error">{result.outcome.message}</pre>
             {/if}
           </div>
-          <textarea class="input code" rows="9" spellcheck="false" bind:value={sample.text} placeholder="A payload as JSON (bytes as base64)"></textarea>
-        </div>
-        <div class="test-col">
-          <div class="test-head">
-            <h3>Sent to {nameOf(edge.target_node_id)}</h3>
+        </section>
+      {/if}
+
+      {#if error}
+        <div class="notice danger" role="alert">
+          <div>
+            {error.message}
+            {#if error.details.length}<ul>{#each error.details as d, i (i)}<li>{d}</li>{/each}</ul>{/if}
           </div>
-          {#if testError}
-            <p class="error">{testError}</p>
-          {:else if result && 'error' in result}
-            <pre class="out error">{result.error}</pre>
-          {:else if !result?.outcome}
-            <pre class="out muted">{test?.problems.length ? 'Fix the problems to try it.' : 'Give a sample to try it.'}</pre>
-          {:else if result.outcome.outcome === 'output'}
-            <pre class="out">{pretty(result.outcome.payload)}</pre>
-          {:else if result.outcome.outcome === 'filtered'}
-            <pre class="out muted">Filtered out: nothing is sent.</pre>
-          {:else}
-            <pre class="out error">{result.outcome.message}</pre>
-          {/if}
         </div>
-      </section>
-    {/if}
+      {/if}
+    </div>
 
-    {#if error}
-      <div class="notice danger" role="alert">
-        <div>
-          {error.message}
-          {#if error.details.length}<ul>{#each error.details as d, i (i)}<li>{d}</li>{/each}</ul>{/if}
-        </div>
-      </div>
-    {/if}
-
-    <div class="dialog-actions">
+    <div class="dialog-actions footer">
       <span class="muted small grow">Saved to the draft: live changes when you submit it.</span>
       <button class="btn" type="button" onclick={onclose}>Cancel</button>
       <button class="btn primary" type="button" disabled={busy || current.errors.length > 0 || removed} onclick={save}>Save to draft</button>
@@ -495,6 +498,25 @@
 </Modal>
 
 <style>
+  /* The modal is a fixed height: this part scrolls, between the tabs and the actions. */
+  .scroll {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: var(--space-4);
+    min-height: 0;
+    overflow-y: auto;
+    /* Room for focus rings and the scrollbar, without shifting the content. */
+    margin: 0 calc(-1 * var(--space-2));
+    padding: var(--space-1) var(--space-2) var(--space-3);
+  }
+
+  .footer {
+    flex: none;
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border);
+  }
+
   .top {
     display: flex;
     flex-wrap: wrap;
@@ -577,7 +599,7 @@
   }
 
   .kind {
-    width: 118px;
+    width: 140px;
     flex: none;
   }
 
@@ -683,10 +705,13 @@
     background: var(--danger);
   }
 
+  /* The sample and its output side by side, the same height. */
   .test {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: var(--space-3);
+    flex: none;
+    height: 280px;
   }
 
   .test-col {
@@ -694,6 +719,13 @@
     flex-direction: column;
     gap: var(--space-1);
     min-width: 0;
+    min-height: 0;
+  }
+
+  .test-col textarea {
+    flex: 1;
+    min-height: 0;
+    resize: none;
   }
 
   .test-head {
@@ -709,8 +741,7 @@
 
   .out {
     flex: 1;
-    min-height: 160px;
-    max-height: 260px;
+    min-height: 0;
     margin: 0;
     padding: var(--space-2);
     overflow: auto;
@@ -748,6 +779,16 @@
     .editor,
     .test {
       grid-template-columns: 1fr;
+    }
+
+    /* Stacked: each its own height. */
+    .test {
+      height: auto;
+    }
+
+    .test-col textarea,
+    .out {
+      min-height: 180px;
     }
   }
 </style>

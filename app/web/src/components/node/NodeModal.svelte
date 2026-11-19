@@ -43,7 +43,14 @@
   const node = $derived<GraphNode | undefined>(view.draft ? draftNode : liveNode);
   const removed = $derived(draftNode?.change === 'removed');
 
-  let tab = $state<'settings' | 'uploads' | 'stats' | 'logs'>('settings');
+  type TabId = 'settings' | 'uploads' | 'stats' | 'logs';
+  let tab = $state<TabId>('settings');
+  /** Tabs shown so far: they stay mounted (hidden), so their inputs survive switching. */
+  let visited = $state(new Set<TabId>(['settings']));
+  function select(t: TabId) {
+    tab = t;
+    if (!visited.has(t)) visited = new Set([...visited, t]);
+  }
 
   // ---- the plugin and its settings schema ----
 
@@ -148,7 +155,7 @@
   const title = $derived(node ? (node.name ?? plugin?.name ?? node.plugin_id) : 'Node');
 </script>
 
-<Modal {title} {onclose} size="lg">
+<Modal {title} {onclose} size="lg" fixed>
   {#if !node}
     <p class="muted">This node isn’t in the scene{view.draft ? '’s draft' : ''}.</p>
   {:else}
@@ -189,11 +196,13 @@
         ...(liveNode ? [{ id: 'logs', label: 'Logs' }] : []),
       ]}
       active={tab}
-      onselect={(t) => (tab = t as typeof tab)}
+      onselect={(t) => select(t as TabId)}
     />
 
-    <div class="body">
-      {#if tab === 'settings'}
+    <!-- Only the tab's content scrolls; the header, the tabs and the
+         settings' actions stay put. -->
+    <div class="panes">
+      <div class="pane" hidden={tab !== 'settings'}>
         {#if removed}
           <p class="muted">Removed in the draft. Restore it to edit its settings.</p>
         {:else if !loaded || !formNode}
@@ -207,6 +216,7 @@
               {schema}
               {uploads}
               {problems}
+              sceneDefaults={(view.draft?.settings ?? view.scene).defaults}
               {savedToken}
               justSaved={formKey > 0}
               onsaved={(saved, token) => {
@@ -217,12 +227,21 @@
             />
           {/key}
         {/if}
-      {:else if tab === 'uploads'}
-        <NodeUploads {sceneId} {nodeId} {uploads} inDraft={!!view.draft} {usedBy} onchanged={fetchLive} />
-      {:else if tab === 'logs'}
-        <NodeLogs {sceneId} {nodeId} />
-      {:else}
-        <NodeStats {status} {nodeId} {running} />
+      </div>
+      {#if visited.has('uploads')}
+        <div class="pane scroll" hidden={tab !== 'uploads'}>
+          <NodeUploads {sceneId} {nodeId} {uploads} inDraft={!!view.draft} {usedBy} onchanged={fetchLive} />
+        </div>
+      {/if}
+      {#if visited.has('stats')}
+        <div class="pane scroll" hidden={tab !== 'stats'}>
+          <NodeStats {status} {nodeId} {running} />
+        </div>
+      {/if}
+      {#if liveNode && visited.has('logs')}
+        <div class="pane" hidden={tab !== 'logs'}>
+          <NodeLogs {sceneId} {nodeId} />
+        </div>
       {/if}
     </div>
   {/if}
@@ -251,8 +270,29 @@
     cursor: pointer;
   }
 
-  .body {
-    min-height: 200px;
+  .panes {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .pane {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .pane[hidden] {
+    display: none;
+  }
+
+  .pane.scroll {
+    overflow-y: auto;
+    /* Room for focus rings and the scrollbar, as in the settings. */
+    margin: 0 calc(-1 * var(--space-2));
+    padding: var(--space-1) var(--space-2);
   }
 
   ul {

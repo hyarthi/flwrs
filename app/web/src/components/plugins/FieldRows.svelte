@@ -100,7 +100,7 @@
   }
 
   .type {
-    width: 120px;
+    width: 140px;
   }
 
   .ct {

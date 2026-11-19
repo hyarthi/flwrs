@@ -130,6 +130,8 @@
 
 <style>
   .logs {
+    flex: 1;
+    min-height: 0;
     position: relative;
     display: flex;
     flex-direction: column;
@@ -150,8 +152,10 @@
     min-width: 0;
   }
 
+  /* Fills the tab (the node modal is a fixed height): the filters stay, the records scroll. */
   .list {
-    height: 420px;
+    flex: 1;
+    min-height: 200px;
     padding: var(--space-1) 0;
     overflow: auto;
     border: 1px solid var(--border);

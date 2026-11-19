@@ -17,6 +17,7 @@ script-transform-0.1.0-linux-x86_64.zip
 ├── schema/launch_args.json     JSON Schema of a node's settings
 ├── schema/out.json             payload schema(s), by plugin type
 ├── types/script.d.lua          definitions for a code field's editor (optional)
+├── templates/script.lua        a template an editor fills an empty field with (optional)
 ├── ui/script.svg               icon (optional)
 └── README.md                   help text (optional)
 ```
@@ -128,7 +129,9 @@ On a string property: `{"language": "lua", "params": [names], "definitions"?: "<
 
 ### 3.4 Presentation hints
 
-On any property, all optional: `x-flwrs-group` (a section name), `x-flwrs-order` (an integer), `x-flwrs-advanced` (collapsed by default), `x-flwrs-widget` (`duration`, `cron`, `file-path` or `code`). Standard keywords (`title`, `description`, `default`, `enum`, `minimum`, `format`, …) are used as they are. An unknown `x-flwrs-*` keyword is a warning at upload, and ignored.
+On any property, all optional: `x-flwrs-group` (a section name), `x-flwrs-order` (an integer), `x-flwrs-advanced` (collapsed by default), `x-flwrs-widget` (`duration`, `cron`, `file-path` or `code`), `x-flwrs-template` (below). Standard keywords (`title`, `description`, `default`, `enum`, `minimum`, `format`, …) are used as they are. An unknown `x-flwrs-*` keyword is a warning at upload, and ignored.
+
+**Templates:** `x-flwrs-template: "<file in the package>"` on a property names a file that an editor puts in the field while it's empty: a starting point the user edits, such as a sample API document, a script, or the payload schemas a script expects. For a property whose value may be a string the file is that text (UTF-8); for any other (an object, a list, a number) it's the value as JSON, and a package whose JSON template doesn't parse is refused. Give the fields that work together templates that fit each other (a script and the schemas it reads and writes). It's only a suggestion: the server never applies it (a node that leaves the field out gets the schema's `default`, or nothing), and the plugin never sees it unless the user saves it as the field's value. Write it so it works as it is, if it's saved unchanged. The server serves only the files the schema names this way (`GET /api/plugins/by-id/{id}/templates/{path}`), as text. A server that doesn't know the keyword warns about it at upload, and ignores it.
 
 **Listen addresses:** `x-flwrs-listen: true` on a top-level string property says its value is an address the plugin listens on, as `host:port` (its `default` is what the plugin binds when a node leaves it out). The server's scene check then warns when two local nodes would bind the same address (the same port, on the same address or a wildcard one: `0.0.0.0`, `::`; port 0 never clashes), within a scene or with the server's other enabled scenes. Only one of them could start listening. A server that doesn't know the keyword warns about it at upload, and ignores it.
 

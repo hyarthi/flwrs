@@ -19,6 +19,8 @@
   --text: light-dark(#14171c, #e7e9ee);
   --text-muted: light-dark(#5d6573, #9aa2b1);
   --text-faint: light-dark(#8b93a1, #6b7382);
+  --contrast: light-dark(#000000, #ffffff); /* full contrast: black / white (icons on tinted banners) */
+  --contrast-inverse: light-dark(#ffffff, #000000); /* its opposite: white / black (their backgrounds) */
 
   /* Accent and states */
   --accent: light-dark(#3b63f0, #7d9bff);
@@ -83,6 +85,8 @@
 
   /* Layout */
   --sidebar-width: 220px;
+  /* Collapsed: the icons only, each where it is when expanded (2 × 24px around an 18px icon, + the border). */
+  --sidebar-collapsed-width: 67px;
   --topbar-height: 52px;
 }
 

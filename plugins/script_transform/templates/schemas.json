@@ -1,0 +1,16 @@
+{
+  "in": {
+    "fields": [
+      { "key": "device", "type": "STRING", "description": "The device that took the reading" },
+      { "key": "temp_c", "type": "F64", "description": "Temperature, °C" }
+    ]
+  },
+  "out": {
+    "fields": [
+      { "key": "device", "type": "STRING" },
+      { "key": "temp_f", "type": "F64", "description": "Temperature, °F" },
+      { "key": "alert", "type": "BOOL", "description": "Above 30 °C" },
+      { "key": "readings", "type": "U64", "description": "Readings from this device so far" }
+    ]
+  }
+}

@@ -2,7 +2,7 @@
   // A code field: CodeMirror 6, loaded only when a code field is shown (its
   // own chunk), with a textarea until then (and if loading fails). For Lua
   // with a `scope`: completion (Ctrl+Space, or as you type) and hover docs.
-  // `toml`: highlighting only (the server config's text).
+  // `toml` and `yaml`: highlighting only (the server config's text, documents).
   import { onDestroy } from 'svelte';
   import type { Scope } from '../../lib/lua/types';
 
@@ -71,6 +71,11 @@
     if (language === 'toml') {
       const { toml } = await import('@codemirror/legacy-modes/mode/toml');
       extensions.push(StreamLanguage.define(toml));
+    }
+    if (language === 'yaml') {
+      // YAML highlighting reads JSON well enough too (documents may be either).
+      const { yaml } = await import('@codemirror/legacy-modes/mode/yaml');
+      extensions.push(StreamLanguage.define(yaml));
     }
     if (language === 'lua') {
       extensions.push(StreamLanguage.define(lua));

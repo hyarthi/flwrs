@@ -73,6 +73,28 @@ mod package_tests {
         serde_json::from_str(&text).unwrap()
     }
 
+    /// The template the editor offers (`x-flwrs-template`) fits the settings
+    /// schema and is a subscription list the plugin takes.
+    #[test]
+    fn the_subscriptions_template_works() {
+        let template = json("templates/subscriptions.json");
+        let schema = json("schema/launch_args.json");
+        assert_eq!(
+            schema["properties"]["subscriptions"]["x-flwrs-template"],
+            "templates/subscriptions.json"
+        );
+        let args = serde_json::json!({"broker_url": "mqtt://localhost", "subscriptions": template});
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let errors: Vec<_> = validator
+            .iter_errors(&args)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let subscriptions: Vec<crate::config::Subscription> =
+            serde_json::from_value(template).unwrap();
+        assert!(!subscriptions.is_empty());
+    }
+
     #[test]
     fn manifest_matches_the_crate() {
         let manifest = json("manifest.json");

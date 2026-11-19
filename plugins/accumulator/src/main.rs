@@ -92,6 +92,76 @@ mod package_tests {
         serde_json::from_str(&text).unwrap()
     }
 
+    fn read(path: &str) -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/").to_string() + path)
+            .unwrap()
+    }
+
+    /// The templates the editor offers (`x-flwrs-template`) fit the settings
+    /// schema, and init and step run on the schemas' events as they are.
+    #[test]
+    fn the_templates_work_together() {
+        use flwrs_accumulator::engine::{Accumulator, Code, LateClose};
+        use flwrs_accumulator::window::Window;
+        use flwrs_plugin::schema::rules::parse_json;
+        use flwrs_script_transform::store::{StateSettings, Store};
+        use flwrs_types::path::Path;
+        use flwrs_types::value::Value;
+
+        let schemas = json("templates/schemas.json");
+        let (init, step) = (read("templates/init.lua"), read("templates/step.lua"));
+        let args =
+            serde_json::json!({"schemas": schemas, "init": init, "step": step, "key": "device"});
+        let schema = json("schema/launch_args.json");
+        for (field, file) in [
+            ("schemas", "schemas.json"),
+            ("init", "init.lua"),
+            ("step", "step.lua"),
+        ] {
+            assert_eq!(
+                schema["properties"][field]["x-flwrs-template"],
+                format!("templates/{file}")
+            );
+        }
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let errors: Vec<_> = validator
+            .iter_errors(&args)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let output = parse_json(&schemas["out"].to_string()).unwrap();
+        let mut acc = Accumulator::new(
+            Code {
+                init: Some(&init),
+                step: &step,
+                finish: None,
+            },
+            Some(Path::parse("device").unwrap()),
+            Window::None { idle_ttl: None },
+            output,
+            LateClose::Run,
+            Default::default(),
+            Store::memory(StateSettings::default()).unwrap(),
+        )
+        .unwrap();
+        let reading = |v: f64| {
+            Value::Object(vec![
+                ("device".into(), Value::String("d1".into())),
+                ("value".into(), Value::F64(v)),
+            ])
+            .into_payload()
+            .unwrap()
+        };
+        acc.process_at(&reading(2.0), None, 0).unwrap();
+        let out = acc.process_at(&reading(4.0), None, 1).unwrap();
+        let text = format!("{:?}", Value::from_payload(&out[0]));
+        assert!(
+            text.contains("\"d1\"") && text.contains("I64(2)") && text.contains("F64(3.0)"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn manifest_matches_the_crate() {
         let manifest = json("manifest.json");

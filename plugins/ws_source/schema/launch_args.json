@@ -44,7 +44,8 @@
       "x-flwrs-launch": {
         "via": "file"
       },
-      "x-flwrs-order": 1
+      "x-flwrs-order": 1,
+      "x-flwrs-template": "templates/asyncapi.yaml"
     },
     "auth": {
       "description": "none, bearer (Authorization: Bearer <token>), api_key (a header or query parameter) or mtls (client certificates).",

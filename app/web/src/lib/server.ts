@@ -20,6 +20,8 @@ export interface ServerInfo {
   http_address: string;
   hub_address: string;
   hub_tls_address: string | null;
+  /** `[director] max_hops`: the hop limit of scenes without their own. */
+  max_hops: number;
 }
 
 export interface Problem {

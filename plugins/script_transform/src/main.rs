@@ -92,6 +92,58 @@ mod package_tests {
         serde_json::from_str(&read(path)).unwrap()
     }
 
+    /// The templates the editor offers (`x-flwrs-template`) fit the settings
+    /// schema, and the script runs on the schemas' events as it is.
+    #[test]
+    fn the_templates_work_together() {
+        use flwrs_plugin::schema::rules::parse_json;
+        use flwrs_script_transform::engine::Engine;
+        use flwrs_script_transform::store::{StateSettings, Store};
+        use flwrs_types::value::Value;
+
+        let schemas = json("templates/schemas.json");
+        let script = read("templates/script.lua");
+        let args = serde_json::json!({"schemas": schemas, "script": script});
+        let schema = json("schema/launch_args.json");
+        assert_eq!(
+            schema["properties"]["schemas"]["x-flwrs-template"],
+            "templates/schemas.json"
+        );
+        assert_eq!(
+            schema["properties"]["script"]["x-flwrs-template"],
+            "templates/script.lua"
+        );
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let errors: Vec<_> = validator
+            .iter_errors(&args)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let output = parse_json(&schemas["out"].to_string()).unwrap();
+        let mut engine = Engine::new(
+            &script,
+            output,
+            Default::default(),
+            Store::memory(StateSettings::default()).unwrap(),
+        )
+        .unwrap();
+        let reading = Value::Object(vec![
+            ("device".into(), Value::String("d1".into())),
+            ("temp_c".into(), Value::F64(35.0)),
+        ])
+        .into_payload()
+        .unwrap();
+        engine.process(&reading, None).unwrap();
+        let out = engine.process(&reading, None).unwrap();
+        let out = Value::from_payload(&out[0]);
+        let text = format!("{out:?}");
+        assert!(
+            text.contains("95") && text.contains("Bool(true)") && text.contains("U64(2)"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn manifest_matches_the_crate() {
         let manifest = json("manifest.json");

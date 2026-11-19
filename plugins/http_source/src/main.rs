@@ -162,7 +162,8 @@ mod package_tests {
             "openapi": {
                 "title": "OpenAPI document", "x-flwrs-order": 1,
                 "description": "The API to serve: an OpenAPI 3.1 document, as JSON or YAML text, or as an object. It must be self-contained (no external $refs). Without it, the node only answers health and readiness checks.",
-                "type": ["object", "string"], "x-flwrs-launch": { "via": "file" } },
+                "type": ["object", "string"], "x-flwrs-launch": { "via": "file" },
+                "x-flwrs-template": "templates/openapi.yaml" },
             "base_path": {
                 "title": "Base path", "x-flwrs-order": 2,
                 "description": "A prefix for every route (e.g. /v1).", "type": "string", "default": "" },
@@ -201,6 +202,19 @@ mod package_tests {
             "title": "HTTP source settings", "type": "object", "additionalProperties": false,
             "properties": props
         })
+    }
+
+    /// The template the editor offers (`x-flwrs-template`) is a document
+    /// this plugin serves as it is.
+    #[test]
+    fn the_template_is_a_working_document() {
+        let text = std::fs::read_to_string(file("templates/openapi.yaml")).unwrap();
+        let doc = flwrs_http_source::spec::parse(&Value::String(text)).unwrap();
+        let api = flwrs_http_source::spec::load(doc).unwrap();
+        let out = flwrs_http_source::convert::out_schema(Some(&api)).unwrap();
+        let out = serde_json::to_string(&flwrs_http_source::convert::to_json(&out)).unwrap();
+        assert!(out.contains("/devices/{device_id}/readings"), "{out}");
+        assert!(out.contains("temp"), "{out}");
     }
 
     #[test]

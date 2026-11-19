@@ -1,0 +1,16 @@
+{
+  "in": {
+    "fields": [
+      { "key": "device", "type": "STRING", "description": "Set Key to device to aggregate per device" },
+      { "key": "value", "type": "F64" }
+    ]
+  },
+  "out": {
+    "fields": [
+      { "key": "key", "type": "STRING", "description": "The group (the value at Key)" },
+      { "key": "count", "type": "I64" },
+      { "key": "sum", "type": "F64" },
+      { "key": "mean", "type": "F64" }
+    ]
+  }
+}

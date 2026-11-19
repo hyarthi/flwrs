@@ -40,6 +40,7 @@ pub(crate) async fn init(director: DirectorHandle) -> &'static Service {
                 max_import_bytes: limits.max_import_bytes,
                 max_import_entries: limits.max_import_entries,
             };
+            plugin::service().set_node_server_defaults(paths.spill_default, paths.plugin_threads);
             plugin::service().set_configure_env(crate::modules::configurator::Env {
                 files_dir: files.files_dir.clone(),
                 limits: crate::modules::configurator::Limits {

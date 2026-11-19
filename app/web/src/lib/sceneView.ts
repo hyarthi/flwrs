@@ -247,6 +247,14 @@ export interface Plugin {
   configured_fields: string[];
   /** Whether a node's `runtime.threads` reaches the plugin. */
   takes_threads: boolean;
+  /**
+   * What a node gets for each run-time setting it leaves out, shaped like a
+   * node's `runtime` (manifest, else built-in, else the server's). Absent:
+   * `queue.when_full` (block; drop newest on a cycle), `queue.durable` (the
+   * scene's default, else off), `max_restarts` (no limit), `threads` (the
+   * plugin decides).
+   */
+  node_defaults: Record<string, unknown>;
   has_launch_args_schema: boolean;
   /** A remote plugin definition: nothing runs here, its nodes are remote. */
   remote_only: boolean;
@@ -267,21 +275,27 @@ const part = (s: string) => encodeURIComponent(s);
 export const listPlugins = () => api<Plugin[]>('/plugins');
 export const pluginIconUrl = (id: string) => `/api/plugins/by-id/${part(id)}/ui/icon`;
 
-/** A code field's LuaCATS definitions file (text), cached per plugin version. */
-const definitionsCache = new Map<string, Promise<string | null>>();
-export function getDefinitions(pluginId: string, version: string, path: string): Promise<string | null> {
-  const key = `${pluginId}@${version}:${path}`;
-  if (!definitionsCache.has(key)) {
-    const url = `/api/plugins/by-id/${part(pluginId)}/definitions/${path.split('/').map(part).join('/')}`;
-    definitionsCache.set(
+/** A package file the launch-args schema names (text), cached per plugin version; `null` if it can't be had. */
+const schemaFileCache = new Map<string, Promise<string | null>>();
+function getSchemaFile(kind: 'definitions' | 'templates', pluginId: string, version: string, path: string): Promise<string | null> {
+  const key = `${kind}:${pluginId}@${version}:${path}`;
+  if (!schemaFileCache.has(key)) {
+    const url = `/api/plugins/by-id/${part(pluginId)}/${kind}/${path.split('/').map(part).join('/')}`;
+    schemaFileCache.set(
       key,
       fetch(url, { credentials: 'same-origin' })
         .then((r) => (r.ok ? r.text() : null))
         .catch(() => null),
     );
   }
-  return definitionsCache.get(key)!;
+  return schemaFileCache.get(key)!;
 }
+
+/** A code field's LuaCATS definitions file (`x-flwrs-code` `definitions`). */
+export const getDefinitions = (pluginId: string, version: string, path: string) => getSchemaFile('definitions', pluginId, version, path);
+
+/** A field's template (`x-flwrs-template`): what an empty field is filled with. */
+export const getTemplate = (pluginId: string, version: string, path: string) => getSchemaFile('templates', pluginId, version, path);
 
 /** The payload schemas a node of the plugin has with these launch args. */
 export const getNodeSchemas = (pluginId: string, launchArgs: unknown) =>

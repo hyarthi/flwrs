@@ -215,7 +215,8 @@
       "x-flwrs-launch": {
         "via": "file"
       },
-      "x-flwrs-order": 1
+      "x-flwrs-order": 1,
+      "x-flwrs-template": "templates/openapi.yaml"
     },
     "out_schema": {
       "description": "Set by the plugin's configurator from the document: the common request fields and paths[\"<template>\"].<method>.{path_params, query, body}.",

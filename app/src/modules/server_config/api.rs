@@ -62,6 +62,8 @@ pub(crate) struct ServerInfo {
     pub http_address: String,
     pub hub_address: String,
     pub hub_tls_address: Option<String>,
+    /// `[director] max_hops`: the hop limit of scenes that don't set their own.
+    pub max_hops: u32,
 }
 
 #[utoipa::path(get, path = "/info", operation_id = "server-info", summary = "The server, its build, and its config file's state",
@@ -90,6 +92,7 @@ async fn info() -> Json<ServerInfo> {
         http_address: format!("{}:{}", http.host(), http.port()),
         hub_address: hub.local_addr().to_string(),
         hub_tls_address: hub.tls_addr().map(|a| a.to_string()),
+        max_hops: crate::modules::director::config::DirectorConfig::read().max_hops,
     })
 }
 

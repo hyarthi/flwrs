@@ -9,6 +9,7 @@
     SvelteFlow,
     Background,
     Controls,
+    ControlButton,
     MiniMap,
     useSvelteFlow,
     type Connection,
@@ -18,6 +19,8 @@
   import '@xyflow/svelte/dist/style.css';
   import { untrack } from 'svelte';
   import X from '@lucide/svelte/icons/x';
+  import Info from '@lucide/svelte/icons/info';
+  import EditorHelp from './EditorHelp.svelte';
   import FlowNode, { type FlowNodeData } from './FlowNode.svelte';
   import FlowEdge, { type EdgeFlow, type FlowEdgeData } from './FlowEdge.svelte';
   import EdgeDialog from './EdgeDialog.svelte';
@@ -212,10 +215,18 @@
       }
       const selectedEdges = new Set(edges.filter((e) => e.selected).map((e) => e.id));
       const auto = autoPositions(list);
+      // What Svelte Flow measured stays with each node: a node without its
+      // size counts as unmeasured, which hides its edges until it's measured
+      // again (and restarts their animations: every status sample).
+      const previous = new Map(nodes.map((n) => [n.id, n]));
       nodes = list.map((n) => {
         const plugin = byId.get(n.plugin_id);
         const removed = n.change === 'removed';
+        const before = previous.get(n.id);
         return {
+          ...(before?.measured && { measured: before.measured }),
+          ...(before?.width !== undefined && { width: before.width }),
+          ...(before?.height !== undefined && { height: before.height }),
           id: n.id,
           type: 'flwrs',
           position: moving.get(n.id) ?? n.position ?? auto.get(n.id)!,
@@ -287,6 +298,7 @@
   // ---- edits ----
 
   let editingEdge = $state<string | null>(null);
+  let helpOpen = $state(false);
 
   async function moveBox(id: string, via: Position | null) {
     try {
@@ -461,6 +473,13 @@
   }
 
   function onkeydown(e: KeyboardEvent) {
+    // `?` (some keyboards and tools report it as Shift + the slash key).
+    const help = e.key === '?' || (e.code === 'Slash' && e.shiftKey);
+    if (help && mine(e.target) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      e.preventDefault();
+      helpOpen = true;
+      return;
+    }
     if (!mine(e.target) || !(e.metaKey || e.ctrlKey) || e.altKey) return;
     const key = e.key.toLowerCase();
     if (key === 'z' || key === 'y') {
@@ -619,9 +638,16 @@
         proOptions={{ hideAttribution: true }}
       >
         <Background gap={16} />
-        <Controls showLock={false} />
+        <Controls showLock={false}>
+          <ControlButton class="help-button" onclick={() => (helpOpen = true)} title="How to work with the editor (?)" aria-label="How to work with the editor">
+            <Info size={14} strokeWidth={2} />
+          </ControlButton>
+        </Controls>
         <MiniMap pannable zoomable />
       </SvelteFlow>
+      {#if helpOpen}
+        <EditorHelp onclose={() => (helpOpen = false)} />
+      {/if}
       {#if editingEdge}
         <EdgeDialog {view} edgeId={editingEdge} onclose={() => (editingEdge = null)} onopennode={(id) => { editingEdge = null; openNode(id); }} />
       {/if}
@@ -706,5 +732,10 @@
     padding: 0;
     border: 0;
     background: none;
+  }
+
+  /* Svelte Flow fills its control buttons' icons; Lucide's are outlines. */
+  .canvas :global(.help-button svg) {
+    fill: none;
   }
 </style>

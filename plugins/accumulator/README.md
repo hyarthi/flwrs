@@ -16,6 +16,8 @@ A transform that aggregates events per key, over windows: averages per device pe
 | `on_error` | `"nack"` | When `step` fails: `nack`, `nack_retry` or `drop`, as for the script transform. The state is left as it was. |
 | `limits`, `state` | | As for the script transform: Lua limits per call; state limits, `sync`, `applied_window`, `max_file_bytes`. |
 
+**Templates:** in the web UI, a new node starts with `schemas`, `init` and `step` that fit each other ([`templates/`](templates): a running count, sum and mean per key, an output for each event). They work as they are; set `key` (e.g. `device`) to aggregate per group, and add a window and `finish` for per-window outputs.
+
 ## Windows
 
 Windows run on **processing time**: when the event arrives.

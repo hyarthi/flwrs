@@ -114,6 +114,9 @@ pub(crate) struct Service {
     /// Where uploads are and a configurator's limits (set by the scene
     /// service at start-up): an upgrade runs the new package's configurator.
     configure_env: std::sync::OnceLock<crate::modules::configurator::Env>,
+    /// `[director] spill_default` and `plugin_threads` (set at start-up), for
+    /// the node defaults the API shows; unset (tests): off and none.
+    node_server_defaults: std::sync::OnceLock<(bool, Option<u32>)>,
 }
 
 /// A node an upgrade re-configured: its new config, and the run (its files
@@ -167,12 +170,42 @@ impl Service {
             director,
             lock: ChangeLock::new(),
             configure_env: std::sync::OnceLock::new(),
+            node_server_defaults: std::sync::OnceLock::new(),
         }
     }
 
     /// Where uploads are and a configurator's limits; set once at start-up.
     pub(crate) fn set_configure_env(&self, env: crate::modules::configurator::Env) {
         let _ = self.configure_env.set(env);
+    }
+
+    /// The server's part of a node's run-time defaults: `[director]
+    /// spill_default` and `plugin_threads`.
+    pub(crate) fn set_node_server_defaults(
+        &self,
+        spill_default: bool,
+        plugin_threads: Option<u32>,
+    ) {
+        let _ = self
+            .node_server_defaults
+            .set((spill_default, plugin_threads));
+    }
+
+    /// What a node of this plugin gets for each run-time setting it leaves
+    /// out (`supervisor::spec::node_defaults`).
+    pub(crate) fn node_defaults(
+        &self,
+        manifest: Option<&crate::modules::plugin::manifest::Manifest>,
+    ) -> serde_json::Value {
+        let (spill, threads) = self
+            .node_server_defaults
+            .get()
+            .copied()
+            .unwrap_or((false, None));
+        let defaults = manifest
+            .and_then(|m| crate::modules::supervisor::runtime_defaults(m).ok())
+            .unwrap_or_default();
+        crate::modules::supervisor::node_defaults(&defaults, spill, threads)
     }
 
     #[cfg(test)]

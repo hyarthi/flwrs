@@ -44,5 +44,5 @@ export const routes: RouteDef[] = [
   { pattern: '/login', component: LoginPage, title: 'Log in', bare: true },
 ];
 
-/** Where `/` goes: the scenes list for now (maybe a dashboard later). */
-export const HOME = '/scenes';
+/** Where `/` goes: the overview. */
+export const HOME = '/overview';

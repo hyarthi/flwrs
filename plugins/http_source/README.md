@@ -15,6 +15,8 @@ An HTTP server that turns requests into events. Routes, parameters and bodies co
 | `out_schema` | (derived) | The node's out schema, set by the plugin's configurator from `openapi`; read-only. |
 | `listen`, `auth`, `tls_*`, `limits`, … | | The server core's settings (shared with flwrs' other HTTP plugins): see below. |
 
+**Template:** in the web UI, an empty `openapi` starts with a sample document ([`templates/openapi.yaml`](templates/openapi.yaml): one `POST` route with a path parameter, a query parameter and a JSON body). It works as it is; edit it into your API.
+
 ### The server
 
 From `flwrs-plugin-kit`'s server core:

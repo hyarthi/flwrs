@@ -70,7 +70,8 @@
           }
         }
       },
-      "x-flwrs-order": 3
+      "x-flwrs-order": 3,
+      "x-flwrs-template": "templates/subscriptions.json"
     },
     "ack_mode": {
       "title": "Acknowledge",

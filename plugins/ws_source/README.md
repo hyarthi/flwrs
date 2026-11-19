@@ -18,6 +18,8 @@ A WebSocket server that turns messages into events. Its paths and messages come 
 | `out_schema` | (derived) | The node's out schema, set by the plugin's configurator from `asyncapi`; read-only. |
 | `listen`, `auth`, `tls_*`, `limits`, … | | The server core's settings, as for the HTTP source: auth (`none`, `bearer`, `api_key` in a header or the query, `mtls`; a non-loopback listener needs one, or `auth: none` explicitly), TLS (HTTP/1.1 upgrades; HTTP/2 extended CONNECT is untested), `limits` (`max_connections` also bounds open WebSockets: 503 beyond it), `/healthz` and `/readyz`, the header policy. |
 
+**Template:** in the web UI, an empty `asyncapi` starts with a sample document ([`templates/asyncapi.yaml`](templates/asyncapi.yaml): one channel with a path parameter and a JSON message). It works as it is; edit it into your API.
+
 Browsers can't set headers on a WebSocket: use `api_key` with `api_key_in: query` (or cookies through a proxy, or mTLS) for them.
 
 ## Connections

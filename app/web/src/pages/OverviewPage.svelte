@@ -109,8 +109,8 @@
 
   const RATES = [
     { key: 'produced', label: 'Produced', color: '--series-1' },
-    { key: 'delivered', label: 'Delivered', color: '--series-2' },
-    { key: 'dropped', label: 'Dropped', color: '--series-3' },
+    { key: 'delivered', label: 'Delivered', color: '--series-3' },
+    { key: 'dropped', label: 'Dropped', color: '--series-2' },
   ];
   const USE = [
     { key: 'queued', label: 'Queue budget', color: '--series-1' },

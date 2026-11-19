@@ -283,7 +283,7 @@
     </div>
   {/if}
 
-  <Tabs tabs={TABS} active={tab} onselect={(t) => (tab = t)} />
+  <Tabs tabs={TABS} active={tab} onselect={(t) => (tab = t)} strong />
 
   {#if !info}
     <div class="card pad muted">Loading…</div>

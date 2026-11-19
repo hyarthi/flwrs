@@ -40,6 +40,15 @@ pub(crate) struct PluginInfo {
     /// Whether the plugin takes a core count (manifest `threads`), so a
     /// node's `runtime.threads` reaches it.
     pub takes_threads: bool,
+    /// What a node of this plugin gets for each run-time setting it leaves
+    /// out, in the shape of a node's `runtime`: the manifest's
+    /// `runtime_defaults`, else the built-in defaults, with the server's
+    /// `[director] spill_default` and `plugin_threads`. Left out where there's
+    /// no single value: `queue.when_full` (block; drop newest on a cycle),
+    /// `queue.durable` (the scene's default, else off), `max_restarts` (no
+    /// limit), `threads` (the plugin decides).
+    #[schema(value_type = Object)]
+    pub node_defaults: serde_json::Value,
     /// The manifest's format version (1 or 2).
     pub manifest_version: u32,
     /// A remote plugin definition (manifest `"launch": "remote"`): nothing
@@ -78,6 +87,7 @@ impl PluginInfo {
                 .map(|c| c.fields.clone())
                 .unwrap_or_default(),
             takes_threads: manifest.as_ref().is_some_and(|m| m.threads.is_some()),
+            node_defaults: service.node_defaults(manifest.as_ref()),
             manifest_version: manifest.as_ref().map_or(0, |m| m.manifest_version),
             remote_only: manifest.as_ref().is_some_and(|m| m.is_remote_only()),
             node_schemas: {
@@ -261,23 +271,33 @@ async fn get_ui_file(
         .into_response())
 }
 
-/// The package files the launch-args schema names as `x-flwrs-code`
-/// `definitions` (LuaCATS files for editors).
-fn definitions_named(schema: &serde_json::Value, out: &mut Vec<String>) {
+/// The package files the launch-args schema names with `pick` (given each
+/// schema object): `x-flwrs-code` `definitions`, or `x-flwrs-template`.
+fn files_named(
+    schema: &serde_json::Value,
+    pick: fn(&serde_json::Map<String, serde_json::Value>) -> Option<&str>,
+    out: &mut Vec<String>,
+) {
     match schema {
         serde_json::Value::Object(map) => {
-            if let Some(path) = map
-                .get("x-flwrs-code")
-                .and_then(|c| c.get("definitions"))
-                .and_then(|d| d.as_str())
-            {
+            if let Some(path) = pick(map) {
                 out.push(path.to_string());
             }
-            map.values().for_each(|v| definitions_named(v, out));
+            map.values().for_each(|v| files_named(v, pick, out));
         }
-        serde_json::Value::Array(list) => list.iter().for_each(|v| definitions_named(v, out)),
+        serde_json::Value::Array(list) => list.iter().for_each(|v| files_named(v, pick, out)),
         _ => {}
     }
+}
+
+/// `x-flwrs-code` `definitions` (LuaCATS files for code editors).
+fn definitions_of(map: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    map.get("x-flwrs-code")?.get("definitions")?.as_str()
+}
+
+/// `x-flwrs-template` (text an editor fills an empty field with).
+fn template_of(map: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    map.get("x-flwrs-template")?.as_str()
 }
 
 #[utoipa::path(
@@ -299,10 +319,42 @@ async fn get_definitions(
     State(service): State<Svc>,
     Path((id, path)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
+    schema_file(service, &id, &path, definitions_of).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/by-id/{id}/templates/{path}",
+    operation_id = "get-plugin-template",
+    summary = "Get a field's template",
+    description = "A text file the launch-args schema names in an `x-flwrs-template`: what an editor fills the field with while it's empty. Only such files; served as `text/plain`, sandboxed, `ETag` = the package's hash.",
+    params(
+        ("id" = String, Path, description = "Plugin id"),
+        ("path" = String, Path, description = "The file's path in the package, as the schema names it"),
+    ),
+    responses(
+        (status = 200, description = "The file", content_type = "text/plain", body = String),
+        (status = 404, description = "No such plugin, or the schema names no such file", body = ErrorBody),
+    )
+)]
+async fn get_template(
+    State(service): State<Svc>,
+    Path((id, path)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    schema_file(service, &id, &path, template_of).await
+}
+
+/// A package file the plugin's launch-args schema names (`pick`), as text.
+async fn schema_file(
+    service: Svc,
+    id: &str,
+    path: &str,
+    pick: fn(&serde_json::Map<String, serde_json::Value>) -> Option<&str>,
+) -> Result<axum::response::Response, ApiError> {
     use axum::http::header;
     use axum::response::IntoResponse;
 
-    let plugin = service.get(&id).await?;
+    let plugin = service.get(id).await?;
     let not_found = || {
         api_error(
             StatusCode::NOT_FOUND,
@@ -316,12 +368,12 @@ async fn get_definitions(
         .and_then(|s| serde_json::from_str(s).ok())
         .ok_or_else(not_found)?;
     let mut named = vec![];
-    definitions_named(&schema, &mut named);
-    if !named.contains(&path) {
+    files_named(&schema, pick, &mut named);
+    if !named.iter().any(|n| n == path) {
         return Err(not_found());
     }
     // The schema's paths were checked at install (relative, no `..`).
-    let file = std::path::Path::new(&plugin.install_path).join(&path);
+    let file = std::path::Path::new(&plugin.install_path).join(path);
     let size = tokio::fs::metadata(&file)
         .await
         .map_err(|_| not_found())?
@@ -837,6 +889,7 @@ async fn replace_definition(
         plugin_settings,
         get_ui_file,
         get_definitions,
+        get_template,
         node_schemas,
         upload_plugin,
         upgrade_plugin,
@@ -881,6 +934,7 @@ impl Api {
                 "/plugins/by-id/{id}/definitions/{*path}",
                 get(get_definitions),
             )
+            .route("/plugins/by-id/{id}/templates/{*path}", get(get_template))
             .route(
                 "/plugins/by-id/{id}/node-schemas",
                 axum::routing::post(node_schemas),
@@ -1082,7 +1136,8 @@ mod tests {
         );
         let launch = r#"{"type": "object", "properties": {"script": {"type": "string",
             "x-flwrs-launch": {"via": "file"},
-            "x-flwrs-code": {"language": "lua", "params": ["payload"], "definitions": "types/api.d.lua"}}}}"#;
+            "x-flwrs-code": {"language": "lua", "params": ["payload"], "definitions": "types/api.d.lua"},
+            "x-flwrs-template": "templates/script.lua"}}}"#;
         build_zip(
             &path,
             &[
@@ -1092,6 +1147,7 @@ mod tests {
                 Item::File("schema/launch.json", launch.as_bytes()),
                 Item::File("types/api.d.lua", b"---@meta\nfunction hello() end\n"),
                 Item::File("types/other.lua", b"secret"),
+                Item::File("templates/script.lua", b"return payload\n"),
             ],
         );
         f.service.install(&path).await.unwrap();
@@ -1122,6 +1178,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other.status(), StatusCode::NOT_FOUND);
+        // Templates: the same, for the files `x-flwrs-template` names.
+        let template = app
+            .clone()
+            .oneshot(get("/plugins/by-id/coder/templates/templates/script.lua"))
+            .await
+            .unwrap();
+        assert_eq!(template.status(), StatusCode::OK);
+        assert_eq!(
+            &template.into_body().collect().await.unwrap().to_bytes()[..],
+            b"return payload\n"
+        );
+        for uri in [
+            "/plugins/by-id/coder/templates/types/api.d.lua",
+            "/plugins/by-id/coder/definitions/templates/script.lua",
+        ] {
+            let crossed = app.clone().oneshot(get(uri)).await.unwrap();
+            assert_eq!(crossed.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
 
         let schemas = app
             .oneshot(

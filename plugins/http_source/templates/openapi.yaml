@@ -1,0 +1,33 @@
+# An OpenAPI 3.1 document: each operation becomes a route, and each request
+# an event. Parameters and JSON / form bodies are checked against their
+# schemas (a request that doesn't fit gets a 400), and the node's out schema
+# is derived from them. Replace this example with your own API.
+openapi: 3.1.0
+info:
+  title: Devices
+  version: "1.0.0"
+paths:
+  /devices/{device_id}/readings:
+    parameters:
+      - name: device_id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      summary: Report a reading
+      parameters:
+        - name: source
+          in: query
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [temp]
+              properties:
+                temp: { type: number, minimum: -50, maximum: 150 }
+                at: { type: string, format: date-time }
+      responses:
+        "202": { description: Accepted }

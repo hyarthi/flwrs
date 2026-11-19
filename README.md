@@ -8,10 +8,11 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 
 > **Status:** early development; expect breaking changes. What works today:
 >
-> - the server core, the [plugin protocol](docs/protocol.md) (version 2) with its Rust SDK ([`flwrs-plugin`](https://crates.io/crates/flwrs-plugin)) and a plugin developer toolkit ([`flwrs-trellis`](https://crates.io/crates/flwrs-trellis): package, audit, test, bench), the plugin registry (package upload), and scene management over REST;
+> - the server core, the [plugin protocol](docs/protocol.md) (version 2) with its Rust SDK ([`flwrs-plugin`](https://crates.io/crates/flwrs-plugin)) and a plugin developer toolkit ([`flwrs-trellis`](https://crates.io/crates/flwrs-trellis): package, audit, test, bench), and the plugin registry (package upload);
+> - a **web UI** served by the server: a visual scene editor (drafts with undo, review and submit; node settings generated from each plugin's schema; an edge mapping editor with a live test), the live scenes list, plugin pages, an overview with live charts, and the server's own configuration; everything it does is also in the REST API;
 > - running scenes: the director launches and supervises plugins (local, or remote over TLS with tokens or client certificates), routes events through bounded queues (credit-based flow control, at-least-once delivery with acks, optionally durable on disk), applies edge mappings (dot notation and Lua), and applies edits to a running scene as a diff, restarting only what changed;
 > - scene export / import between servers, status endpoints, and telemetry export (OpenTelemetry, or local files);
-> - two base plugins (HTTP sink, ticker; Rust), plus minimal demo plugins in Python, Go, TypeScript and Java.
+> - eleven base plugins in Rust (HTTP, WebSocket and MQTT in and out, push to browsers, a ticker, Lua scripting, windowed aggregation), plus minimal demo plugins in Python, Go, TypeScript and Java.
 >
 > See the [roadmap](#roadmap) for what's missing.
 > 
@@ -24,7 +25,7 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
   - **Transform:** receives events and emits changed events.
   - **Sink:** consumes events, such as sending an HTTP request.
 - Each plugin declares a **schema** for the payloads it accepts and/or produces: typed fields such as string, number, bool, datetime, bytes, array, map and object.
-- **Scenes** are stored workflow definitions, managed through the server's REST API.
+- **Scenes** are stored workflow definitions: graphs of plugin instances (nodes) and the handovers between them (edges), built in the web UI's editor or through the REST API.
 
 ## Repository layout
 
@@ -61,6 +62,17 @@ cargo test --workspace             # all tests without nextest (one test binary 
 Binaries end up in `target/debug/` (or `target/release/`). The tests run fastest with [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`): each test is its own process, and all test binaries run at once.
 
 **Build flavours** of the server, as cargo features: `full` (the default: everything), `edge` (for mid-range edge devices: `mapping-lua` for Lua edge mappings, `otel` for OpenTelemetry export, `telemetry-file` for telemetry files, `remote` for remote plugins with tokens, `remote_id`, the TLS listener and client certificates, and `web-ui` for the web UI; no Swagger UI), and barebones, `--no-default-features` (low-end devices: none of them, a server that only runs local plugins), e.g. `cargo build -p flwrs-app --no-default-features --features edge`. Features can be added one by one too (`--no-default-features --features telemetry-file`). A server built without a feature can still import scenes that use it (Lua mappings, remote nodes), but lists them as problems and won't run them.
+
+### Building for a deployment
+
+A release build of the server, and a package of each plugin to install into it:
+
+```sh
+cargo build --release -p flwrs-app                    # full flavour → target/release/flwrs-app (web UI embedded)
+cargo trellis package plugins/http_sink --out dist/   # release build of a plugin → dist/http-sink-0.0.1-<platform>.zip
+```
+
+`--target <triple>` cross-builds either (e.g. `aarch64-unknown-linux-gnu` for a Raspberry Pi), and `--flavor edge` packages a plugin's edge flavour where it has one. Then put the server binary next to a `config.toml` (below) and start it; install the packages from the web UI's Plugins page (with `[plugins] allow_upload = true`) or with `curl` (*Plugin packages*, below).
 
 ## Running the server
 
@@ -140,7 +152,7 @@ cargo dev   # = cargo run --bin flwrs-app --target-dir target/dev -- --config co
 
 `cargo dev` builds into its own folder, `target/dev`: a plain build of the server enables other dependency features than `cargo test --workspace`, so sharing `target/debug` they'd rebuild a good part of the workspace after each other. It keeps everything the server writes at run time (database, installed plugins, node folders, uploaded files, spool files, telemetry files) under `./.data/`, which is gitignored, so runtime data never mixes with the source tree. To start over, stop the server and run `chmod -R u+w .data && rm -rf .data` (node folders' `config/` are read-only, so a plain `rm -rf` stops there).
 
-- Web UI: `http://localhost:8080/` (builds with the `web-ui` feature)
+- Web UI: `http://localhost:8080/` (builds with the `web-ui` feature): it opens on the overview; the scene editor has a help dialog (the ⓘ under the zoom buttons, or `?`)
 - REST API: `http://localhost:8080/api/scenes`
 - Swagger UI: `http://localhost:8080/swagger-ui` (opt-in: `config.dev.toml` sets `[http] swagger_ui = true`); the OpenAPI document: `http://localhost:8080/api-docs/openapi.json`
 
@@ -188,6 +200,7 @@ A **scene** is a workflow: a directed graph whose **nodes** are plugin instances
 | `GET /api/scenes/stream` | The scenes list, live (Server-Sent Events; the web UI's list): `scenes` (every scene with its node and edge counts and its check, sent first and after each change to scenes or plugins), `status` (each running scene's state and event counters, every `[scenes] stream_interval_ms`, 1 s by default). |
 | `…/scenes/by-id/{id}/draft…` | The scene's **draft**: edit the graph apart from the live one, then submit it at once (see *Drafts*, below). |
 | `POST /api/scenes/by-id/{id}/graph/batch` | Several changes to the live graph in one step, all or nothing (see *Drafts*, below). |
+| `GET /api/scenes/by-id/{id}/stream`, `…/nodes/by-id/{node_id}/logs/stream`, `PATCH …/layout`, `POST …/mapping/test` | What the web UI's scene view uses: the scene, its draft, its check and its status, live (Server-Sent Events); a node's recent logs, live; node and edge positions on the canvas (layout only, never a change to the scene); an edge mapping tried on a sample event. |
 | `DELETE /api/scenes/by-id/{id}/spool`, `…/nodes/by-id/{node_id}/spool` | Start the queues of the scene's nodes over, or one node's: the lever for corrupted, overflowing or lagging spool files. Every queued event goes, including those handed to a plugin and not acknowledged yet (they aren't delivered again), and spool files are deleted (running queues start fresh ones). For a disabled scene, that's what its durable queues kept. Also brings back a durable queue whose file couldn't be opened. Returns `purged_events`. |
 
 Invalid requests return **422** with every problem listed in `details`.
@@ -404,15 +417,17 @@ Plugins are installed into the server as **packages**: a ZIP with `manifest.json
 }
 ```
 
-The manifest names the plugin's type and version, its payload schemas (fixed, or taken from each node's settings), and a JSON Schema of a node's settings (`launch_args`). That schema also says how each setting reaches the plugin (a command-line argument, an environment variable, or a file in the node's `config/` folder), which ones are secrets, which hold code, and how a UI should present them. A local plugin runs in a folder of its own per node, where it can keep state. **The format and the launch contract are specified in [`docs/plugin-spec.md`](docs/plugin-spec.md)**, for plugin authors in any language.
+The manifest names the plugin's type and version, its payload schemas (fixed, or taken from each node's settings), and a JSON Schema of a node's settings (`launch_args`). That schema also says how each setting reaches the plugin (a command-line argument, an environment variable, or a file in the node's `config/` folder), which ones are secrets, which hold code, which have a **template** (a sample the editor fills an empty field with, e.g. an API document or a script), and how a UI should present them. A local plugin runs in a folder of its own per node, where it can keep state. **The format and the launch contract are specified in [`docs/plugin-spec.md`](docs/plugin-spec.md)**, for plugin authors in any language.
 
 **Managing plugins** (REST, documented in Swagger UI):
 
 | Request | Purpose |
 |---|---|
 | `POST /api/plugins` with multipart field `file` | Upload and register a package. Responds 201; 409 if the id exists; 422 with a list of every problem if the package is invalid. |
-| `GET /api/plugins`, `GET /api/plugins/by-id/{id}` | List or get registered plugins. |
+| `GET /api/plugins`, `GET /api/plugins/by-id/{id}` | List or get registered plugins (with `node_defaults`: what a node gets for each run-time setting it leaves out). |
 | `GET /api/plugins/by-id/{id}/launch-args-schema` | The plugin's launch-args JSON Schema. |
+| `GET …/by-id/{id}/ui/{icon\|docs}`, `…/definitions/{path}`, `…/templates/{path}` | Files the package names for editors: its icon and docs (its README), a code field's definitions (completion), a field's template. Only those files, sandboxed. |
+| `POST /api/plugins/remote`, `GET/PUT …/by-id/{id}/definition`, `GET …/by-id/{id}/export` | **Remote plugin definitions**: a plugin that runs elsewhere, described here (type, payload schemas, settings) so its nodes can be placed, wired and checked; the web UI has a wizard for them. Need the admin token or loopback, not `allow_upload` (they run nothing here). |
 | `PUT /api/plugins/by-id/{id}` with multipart `file` | Upgrade. The id and type must stay the same; refused (409) if any scene node's `launch_args` would become invalid. |
 | `DELETE /api/plugins/by-id/{id}` | Deregister and remove the files. Refused (409) while scene nodes use the plugin. |
 
@@ -441,7 +456,7 @@ Plugins are packaged and run as described in the [plugin specification](docs/plu
 
 flwrs is in early development. The main things still missing, roughly in order:
 
-1. **A set of base plugins.** Common sources, transforms and sinks (timers, MQTT, HTTP in and out, files, databases, scripting, ML inference, …), so typical workflows need no custom plugin. Today there are:
+1. **More base plugins.** Common sources, transforms and sinks, so typical workflows need no custom plugin: still missing are files, databases and ML inference, among others. Today there are:
    - the HTTP sink ([plugins/http_sink](plugins/http_sink): a request per event);
    - the ticker ([plugins/ticker](plugins/ticker): interval or cron);
    - the script transform ([plugins/script_transform](plugins/script_transform): Lua per event, keyed state kept exactly once);
@@ -453,10 +468,12 @@ flwrs is in early development. The main things still missing, roughly in order:
    - the WebSocket source ([plugins/ws_source](plugins/ws_source): an AsyncAPI 3.x document's channels, messages typed by their payload schemas);
    - the HTTP push sink ([plugins/http_push_sink](plugins/http_push_sink): events broadcast to subscribers over Server-Sent Events and long polling, with replay);
    - the WebSocket push sink ([plugins/ws_push_sink](plugins/ws_push_sink): events broadcast to connected WebSocket clients, with replay).
-2. **A web UI** for building and running scenes visually (nodes, edges, mappings, status), instead of through the REST API. In progress: the frame (served at `/` by the server, light and dark themes), login with the secret key, and the live scenes list (create, import, export, enable, delete) are in; the scene editor comes next.
-3. **Alternative storage back-ends**, such as PostgreSQL. Today scenes, nodes, edges and the plugin registry live in SQLite only (the `Database` enum in `flwrs-core` has a single variant); a shared database is also a step towards running several servers.
-4. **Running as a cluster.** The server currently runs in **single-node mode only**: one server runs every scene it has, and there's no swarming, no handover of scenes between servers, and no load balancing. Remote plugins can run on other machines, but they all connect to one hub. Running properly in a data-centre environment (in-cluster) needs scenes spread across servers, failover, and load balancing.
-5. **Profiling and optimisation.** Throughput, latency and memory are measured per plugin with `trellis bench` (each plugin's README has a *Footprint* section), so far on an Apple M2 (but needs a proper dedicated benchmark test - just playing around so far, no serious measurements yet); edge devices (an Intel NUC, a Raspberry Pi) are next. Done so far: credit handed to a source's waiting senders in order, longest-waiting first (up to 1.7× for sources whose clients outrun their credit); per-connection buffer settings for the WebSocket plugins (~130 → ~11 KiB per push-sink client); a small HTTP/2 send buffer for the server plugins (1 000 HTTP/2 SSE subscribers: ~3.7× the throughput at a fifth of the memory); trellis's own timer lateness kept out of its latency numbers. Open: batching writes to many WebSocket clients, durable queues' fixed 5 ms batching window, keyed parallelism in the script transforms, TLS handshake cost when connections churn, and the HTTP and WebSocket sources' binary sizes (18–22 MB). See `ideas/` for the designs.
+2. **Alternative storage back-ends**, such as PostgreSQL. Today scenes, nodes, edges and the plugin registry live in SQLite only (the `Database` enum in `flwrs-core` has a single variant); a shared database is also a step towards running several servers.
+3. **Running as a cluster.** The server currently runs in **single-node mode only**: one server runs every scene it has, and there's no swarming, no handover of scenes between servers, and no load balancing. Remote plugins can run on other machines, but they all connect to one hub. Running properly in a data-centre environment (in-cluster) needs scenes spread across servers, failover, and load balancing.
+4. **Profiling and optimisation.** Throughput, latency and memory are measured per plugin with `trellis bench` (each plugin's README has a *Footprint* section), so far on an Apple M2 (but needs a proper dedicated benchmark test - just playing around so far, no serious measurements yet); edge devices (an Intel NUC, a Raspberry Pi) are next. Done so far: credit handed to a source's waiting senders in order, longest-waiting first (up to 1.7× for sources whose clients outrun their credit); per-connection buffer settings for the WebSocket plugins (~130 → ~11 KiB per push-sink client); a small HTTP/2 send buffer for the server plugins (1 000 HTTP/2 SSE subscribers: ~3.7× the throughput at a fifth of the memory); trellis's own timer lateness kept out of its latency numbers. Open: batching writes to many WebSocket clients, durable queues' fixed 5 ms batching window, keyed parallelism in the script transforms, TLS handshake cost when connections churn, and the HTTP and WebSocket sources' binary sizes (18–22 MB). See `ideas/` for the designs.
+5. **The web UI, beyond a single admin.** The UI itself is in: login with the secret key, the overview (live charts while it's open), the scenes list, the scene editor (canvas, drafts with undo and review, node settings with templates, the edge mapping editor with a live test, live flow and health on the canvas), node logs and stats, plugin pages and the remote plugin wizard, and the server's configuration with guarded restarts. Next: users in a database and single sign-on (OIDC), drafts per user (today one per scene), history beyond what an open page has seen (from the telemetry files), and settings that apply without a restart.
+
+Beyond these, [`ideas/`](ideas) collects design notes for possible future work, one per idea with its status: for example event-time windows, keyed parallelism, byte-based credits, idempotency keys, TLS certificate hot reload, HTTP/3 and WebTransport, a WebSocket client source, persistent replay for the push sinks, settings that apply without a restart, and UI history from the telemetry files. They aren't commitments: each is weighed before it's built.
 
 Smaller known gaps (no Windows CI, durable delivery only within one server) are listed in [AGENTS.md](AGENTS.md), *Current state / known gaps*.
 

@@ -12,6 +12,8 @@ A transform that runs a Lua script on each event. The script can keep state per 
 | `limits` | | Per event: `max_instructions` (1 000 000), `timeout_ms` (100), `max_memory_bytes` (16 MiB). |
 | `state` | | `max_keys` (100 000), `max_value_bytes` (64 KiB), `max_bytes` (256 MiB), `sync` (`normal`, or `full`: every commit on disk before the event is acknowledged), `applied_window` (10 000: how many recent events' outputs are kept to answer a redelivery), `max_file_bytes` (1 GiB: the state file's size on disk; see *Space*). |
 
+**Templates:** in the web UI, a new node starts with a `schemas` and a `script` that fit each other ([`templates/`](templates): a temperature reading in; °F, an alert flag and a per-device count out, kept in the node's state). They work as they are; edit them into your own.
+
 ## The script
 
 ```lua

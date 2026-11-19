@@ -66,6 +66,12 @@ pre {
   outline-offset: 2px;
 }
 
+/* Fieldsets size to their content by default (min-width: min-content), so a
+   long option would push one past its container; they fit it instead. */
+fieldset {
+  min-width: 0;
+}
+
 /* Buttons: .btn (neutral), .btn.primary, .btn.danger, .btn.ghost, .btn.icon */
 .btn {
   display: inline-flex;
@@ -133,6 +139,27 @@ pre {
   background: var(--surface);
   color: var(--text);
   font: inherit;
+}
+
+/* Dropdowns: our own chevron (two gradient halves, in the theme's colour),
+   inset from the edge, instead of the native one crammed against it. */
+select.input {
+  appearance: none;
+  padding-right: calc(var(--space-3) * 2 + 10px);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+    linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+  background-position:
+    calc(100% - var(--space-3) - 5px) 50%,
+    calc(100% - var(--space-3)) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+  cursor: pointer;
+}
+
+select.input:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .input:focus {
@@ -267,6 +294,18 @@ pre {
 .notice.danger {
   border-color: transparent;
   background: var(--danger-soft);
+}
+
+/* A banner's own buttons (dismiss): black on white in light mode, white on
+   black in dark mode, so they stand out on the tinted background; on hover
+   the background shades a little towards the opposite colour. */
+.notice .btn.ghost {
+  background: var(--contrast-inverse);
+  color: var(--contrast);
+}
+
+.notice .btn.ghost:hover {
+  background: color-mix(in srgb, var(--contrast-inverse) 88%, var(--contrast));
 }
 
 .notice ul {

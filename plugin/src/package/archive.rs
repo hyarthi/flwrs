@@ -285,6 +285,18 @@ fn read_package(
             _ => errors.push(format!("{field} {path:?} is missing from the package")),
         }
     }
+    // A template for a value that isn't text is that value, as JSON.
+    for t in spec.template_fields().iter().filter(|t| !t.text) {
+        if let Some(entry) = find(&t.path).filter(|e| !e.is_dir) {
+            let text = read_text(archive, entry, &t.path)?;
+            if let Err(e) = serde_json::from_str::<serde_json::Value>(&text) {
+                errors.push(format!(
+                    "launch_args_schema {}: x-flwrs-template {:?} isn't JSON (the property isn't a string): {e}",
+                    t.pointer, t.path
+                ));
+            }
+        }
+    }
     let launch_args_schema = launch_args_schema.map(|v| v.to_string());
     let mut payload_schema = |field: &str,
                               source: &Option<super::manifest::SchemaSource>|
@@ -737,6 +749,48 @@ mod tests {
         "script": {"type": "string", "contentMediaType": "text/x-lua",
                    "x-flwrs-code": {"language": "lua", "params": ["payload"], "definitions": "types/script.d.lua"},
                    "x-flwrs-hint": 1}}}"#;
+
+    #[test]
+    fn templates_must_be_there_and_json_for_values() {
+        let launch = r#"{"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}},
+                        "x-flwrs-template": "templates/schemas.json"},
+            "script": {"type": "string", "x-flwrs-template": "templates/script.lua"}}}"#;
+        let items = |schemas: &'static [u8], script: bool| {
+            let mut items = vec![
+                Item::File("manifest.json", V2_MANIFEST.as_bytes()),
+                Item::File("bin/run", b"#!/bin/sh\n"),
+                Item::File("schema/launch.json", launch.as_bytes()),
+                Item::File("schema/in.json", IN_SCHEMA.as_bytes()),
+                Item::File("ui/icon.svg", b"<svg/>"),
+                Item::File("templates/schemas.json", schemas),
+            ];
+            if script {
+                // Text: anything goes.
+                items.push(Item::File(
+                    "templates/script.lua",
+                    b"return payload -- {not json",
+                ));
+            }
+            items
+        };
+        let (_d, r) = run(&items(br#"{"in": {"fields": []}}"#, true));
+        r.unwrap();
+        let (_d, r) = run(&items(b"in: {}", true));
+        let errors = errors_of(r);
+        assert!(
+            errors.iter().any(|e| e.contains("isn't JSON")),
+            "{errors:?}"
+        );
+        let (_d, r) = run(&items(br#"{"in": {}}"#, false));
+        let errors = errors_of(r);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("\"templates/script.lua\" is missing")),
+            "{errors:?}"
+        );
+    }
 
     #[test]
     fn version_2_package() {

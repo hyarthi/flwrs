@@ -2,6 +2,7 @@
   import { location, match, navigate, isRouterLink } from './lib/router.svelte';
   import { routes, HOME } from './routes';
   import Sidebar from './components/Sidebar.svelte';
+  import { sidebar } from './lib/sidebar.svelte';
   import Topbar from './components/Topbar.svelte';
   import NotFoundPage from './pages/NotFoundPage.svelte';
   import AccessPage from './pages/AccessPage.svelte';
@@ -63,7 +64,7 @@
 {:else if resolved?.route.bare}
   <resolved.route.component {...resolved.props} />
 {:else}
-  <div class="frame">
+  <div class="frame" class:collapsed={sidebar.collapsed}>
     <Sidebar section={resolved?.route.section} />
     <div class="main">
       <Topbar title={resolved?.route.title ?? 'Not found'} />
@@ -81,10 +82,16 @@
 {/if}
 
 <style>
+  /* The page takes whatever the sidebar leaves, as it collapses or expands. */
   .frame {
     display: grid;
-    grid-template-columns: var(--sidebar-width) 1fr;
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
     height: 100%;
+    transition: grid-template-columns var(--dur) var(--ease);
+  }
+
+  .frame.collapsed {
+    grid-template-columns: var(--sidebar-collapsed-width) minmax(0, 1fr);
   }
 
   .main {

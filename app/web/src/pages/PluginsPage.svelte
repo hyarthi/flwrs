@@ -67,10 +67,26 @@
 
   // ---- notices ----
 
-  let notice = $state<{ kind: 'ok' | 'danger'; title: string; details: string[] } | null>(null);
+  // Stacked, newest last: an upload of several packages leaves one per file.
+  interface Notice {
+    id: number;
+    kind: 'ok' | 'danger';
+    title: string;
+    details: string[];
+  }
+  let notices = $state<Notice[]>([]);
+  let nextNotice = 0;
+  function notify(kind: Notice['kind'], title: string, details: string[] = []) {
+    notices.push({ id: nextNotice++, kind, title, details });
+  }
+  const front = $derived(notices.at(-1));
+  const behind = $derived(notices.slice(-3, -1));
+  function dismiss(id: number) {
+    notices = notices.filter((n) => n.id !== id);
+  }
   function fail(title: string, e: unknown) {
     const error = e instanceof ApiError ? e : new ApiError(0, String(e));
-    notice = { kind: 'danger', title: `${title}: ${error.message}`, details: error.details };
+    notify('danger', `${title}: ${error.message}`, error.details);
   }
 
   // ---- upload ----
@@ -84,13 +100,16 @@
     if (!list.length) return;
     uploading = true;
     try {
+      // Each file on its own: one refused package doesn't stop the others.
       for (const file of list) {
-        const plugin = await uploadPlugin(file);
-        notice = { kind: 'ok', title: `Installed ${plugin.name} ${plugin.version}`, details: [] };
+        try {
+          const plugin = await uploadPlugin(file);
+          notify('ok', `Installed ${plugin.name} ${plugin.version}`);
+        } catch (e) {
+          fail(`${file.name}: upload failed`, e);
+        }
       }
       await load();
-    } catch (e) {
-      fail('Upload failed', e);
     } finally {
       uploading = false;
       if (picker) picker.value = '';
@@ -146,13 +165,23 @@
       <input bind:this={picker} type="file" accept={PACKAGE_ACCEPT} multiple hidden onchange={(e) => upload(e.currentTarget.files)} />
     {/snippet}
 
-    {#if notice}
-      <div class="notice {notice.kind}" role="status">
-        <div class="grow">
-          {notice.title}
-          {#if notice.details.length}<ul>{#each notice.details as d, i (i)}<li>{d}</li>{/each}</ul>{/if}
+    {#if front}
+      <!-- A stack of cards: the newest in front, up to two older ones peeking
+           out above it (just their edges); dismissing one shows the next. -->
+      <div class="stack" style:--behind={behind.length}>
+        {#each behind as n, i (n.id)}
+          <div class="layer notice {n.kind}" style:--depth={behind.length - i} aria-hidden="true"></div>
+        {/each}
+        <div class="front notice {front.kind}" role="status">
+          <div class="grow">
+            {front.title}
+            {#if front.details.length}<ul>{#each front.details as d, i (i)}<li>{d}</li>{/each}</ul>{/if}
+          </div>
+          {#if notices.length > 1}
+            <button class="btn ghost" type="button" onclick={() => (notices = [])}>Dismiss all ({notices.length})</button>
+          {/if}
+          <button class="btn ghost icon" type="button" aria-label="Dismiss" onclick={() => dismiss(front.id)}><X size={16} strokeWidth={2} /></button>
         </div>
-        <button class="btn ghost icon" type="button" aria-label="Dismiss" onclick={() => (notice = null)}><X size={16} strokeWidth={1.75} /></button>
       </div>
     {/if}
     {#if loadError}<div class="notice danger" role="alert">{loadError}</div>{/if}
@@ -244,7 +273,7 @@
     danger
     onconfirm={async () => {
       await deletePlugin(deleting!.id);
-      notice = { kind: 'ok', title: `Deleted ${deleting!.name}`, details: [] };
+      notify('ok', `Deleted ${deleting!.name}`);
       await load();
     }}
     onclose={() => (deleting = null)}
@@ -265,6 +294,32 @@
 
   .grow {
     flex: 1;
+  }
+
+  /* Each card behind the front one sits PEEK higher and a little narrower. */
+  .stack {
+    --peek: 8px;
+    position: relative;
+    padding-top: calc(var(--behind) * var(--peek));
+  }
+
+  .stack .notice {
+    border-color: var(--border);
+  }
+
+  .layer {
+    position: absolute;
+    inset: calc(var(--behind) * var(--peek)) 0 0;
+    padding: 0;
+    box-shadow: var(--shadow-sm);
+    transform: translateY(calc(var(--depth) * var(--peek) * -1)) scale(calc(1 - var(--depth) * 0.03));
+    transform-origin: top center;
+    transition: transform var(--dur) var(--ease);
+  }
+
+  .front {
+    position: relative;
+    box-shadow: var(--shadow);
   }
 
   .small {

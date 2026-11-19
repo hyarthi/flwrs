@@ -1,0 +1,26 @@
+# An AsyncAPI 3.0 document: the channels of its receive operations are the
+# WebSocket paths clients connect to (their addresses), and their messages'
+# payload schemas type and check what clients send (each message becomes an
+# event). Replace this example with your own API.
+asyncapi: 3.0.0
+info:
+  title: Readings
+  version: "1.0.0"
+defaultContentType: application/json
+channels:
+  readings:
+    address: /devices/{device_id}
+    parameters:
+      device_id: { description: The device sending readings }
+    messages:
+      reading:
+        payload:
+          type: object
+          required: [temp]
+          properties:
+            temp: { type: number, minimum: -50, maximum: 150 }
+            at: { type: string, format: date-time }
+operations:
+  receiveReadings:
+    action: receive
+    channel: { $ref: "#/channels/readings" }

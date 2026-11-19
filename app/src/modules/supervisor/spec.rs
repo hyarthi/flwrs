@@ -260,6 +260,60 @@ impl QueueSpec {
     }
 }
 
+/// What a node of a plugin gets for each run-time setting it leaves out
+/// (its `runtime` left empty), in the shape of `runtime`: the manifest's
+/// `runtime_defaults`, else the built-in defaults; spilling falls back to
+/// `[director] spill_default`, the core count to `[director] plugin_threads`.
+/// Left out where there's no single value: `queue.when_full` (block, or drop
+/// newest on a cycle), `queue.durable` (the scene's default, else off),
+/// `max_restarts` (no limit) and `threads` (the plugin decides).
+pub(crate) fn node_defaults(
+    manifest_defaults: &RuntimeConfig,
+    spill_default: bool,
+    plugin_threads: Option<u32>,
+) -> serde_json::Value {
+    let none = RuntimeConfig::default();
+    let queue = QueueSpec::resolve(&none, manifest_defaults);
+    let delivery = DeliverySpec::resolve(&none, manifest_defaults);
+    let timings = Timings::resolve(&none, manifest_defaults);
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let mut queue_json = serde_json::json!({
+        "capacity": queue.capacity,
+        "max_bytes": queue.max_bytes,
+        "block_timeout_ms": ms(queue.block_timeout),
+        "spill": { "enabled": queue.spill_enabled.unwrap_or(spill_default) },
+    });
+    if let Some(when_full) = queue.when_full {
+        queue_json["when_full"] = serde_json::json!(when_full);
+    }
+    if let Some(durable) = queue.durable {
+        queue_json["durable"] = serde_json::json!(durable);
+    }
+    let mut out = serde_json::json!({
+        "queue": queue_json,
+        "delivery": {
+            "max_attempts": delivery.max_attempts,
+            "retry_delay_ms": ms(delivery.retry_delay),
+        },
+        "init_timeout_ms": ms(timings.init_timeout),
+        "reconnect_timeout_ms": ms(timings.reconnect_timeout),
+        "restart_delay_ms": ms(timings.restart_delay),
+        "kill_grace_ms": ms(timings.kill_grace),
+        "shutdown_grace_ms": ms(timings.shutdown_grace),
+    });
+    if let Some(max) = timings.max_restarts {
+        out["max_restarts"] = serde_json::json!(max);
+    }
+    if let Some(threads) = manifest_defaults
+        .threads
+        .or(plugin_threads)
+        .filter(|&n| n > 0)
+    {
+        out["threads"] = serde_json::json!(threads);
+    }
+    out
+}
+
 /// One spill setting, node first, then the manifest's defaults.
 fn spill_field<T>(
     node: Option<&QueueConfig>,
@@ -557,5 +611,57 @@ impl NodeSpec {
     /// `[scene/node]`, for log lines.
     pub(crate) fn tag(&self) -> String {
         format!("[{}/{}]", self.scene_id, self.node_id)
+    }
+}
+
+#[cfg(test)]
+mod defaults_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn node_defaults_follow_the_manifest_then_the_builtins() {
+        // Nothing from the manifest: the built-in values and the server's.
+        let builtin = node_defaults(&RuntimeConfig::default(), true, Some(2));
+        assert_eq!(builtin["queue"]["capacity"], json!(DEFAULT_QUEUE_CAPACITY));
+        assert_eq!(
+            builtin["queue"]["block_timeout_ms"],
+            json!(DEFAULT_BLOCK_TIMEOUT_MS)
+        );
+        assert_eq!(builtin["queue"]["spill"]["enabled"], json!(true));
+        assert_eq!(
+            builtin["delivery"]["max_attempts"],
+            json!(DEFAULT_MAX_ATTEMPTS)
+        );
+        assert_eq!(builtin["init_timeout_ms"], json!(DEFAULT_INIT_TIMEOUT_MS));
+        assert_eq!(builtin["threads"], json!(2));
+        // No single value: left out.
+        for absent in ["when_full", "durable"] {
+            assert!(builtin["queue"].get(absent).is_none(), "{absent}");
+        }
+        assert!(builtin.get("max_restarts").is_none());
+
+        // The manifest's runtime_defaults win.
+        let manifest = RuntimeConfig::parse(&json!({
+            "queue": {"capacity": 7, "when_full": "drop_oldest", "durable": true, "spill": {"enabled": false}},
+            "delivery": {"retry_delay_ms": 250},
+            "max_restarts": 3,
+            "threads": 1
+        }))
+        .unwrap();
+        let ours = node_defaults(&manifest, true, Some(2));
+        assert_eq!(ours["queue"]["capacity"], json!(7));
+        assert_eq!(ours["queue"]["when_full"], json!("drop_oldest"));
+        assert_eq!(ours["queue"]["durable"], json!(true));
+        assert_eq!(ours["queue"]["spill"]["enabled"], json!(false));
+        assert_eq!(ours["delivery"]["retry_delay_ms"], json!(250));
+        assert_eq!(ours["max_restarts"], json!(3));
+        assert_eq!(ours["threads"], json!(1));
+        // `threads: 0` and no server value: the plugin decides.
+        assert!(
+            node_defaults(&RuntimeConfig::default(), false, Some(0))
+                .get("threads")
+                .is_none()
+        );
     }
 }

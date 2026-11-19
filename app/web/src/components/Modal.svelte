@@ -9,7 +9,18 @@
     onclose,
     children,
     size = 'md',
-  }: { title: string; onclose: () => void; children: Snippet; size?: 'sm' | 'md' | 'lg' | 'xl' } = $props();
+    fixed = false,
+  }: {
+    title: string;
+    onclose: () => void;
+    children: Snippet;
+    size?: 'sm' | 'md' | 'lg' | 'xl';
+    /**
+     * Full height, and the dialog itself doesn't scroll: the content lays
+     * out its own scrolling area (e.g. tabs above, actions below, fixed).
+     */
+    fixed?: boolean;
+  } = $props();
 
   let dialog: HTMLDialogElement;
 
@@ -21,6 +32,7 @@
 
 <dialog
   class={size}
+  class:fixed
   bind:this={dialog}
   onclose={onclose}
   onclick={(e) => {
@@ -34,7 +46,11 @@
         <X size={18} strokeWidth={1.75} />
       </button>
     </header>
-    {@render children()}
+    <!-- The title stays; only this scrolls (a `fixed` modal's content
+         arranges its own scrolling). -->
+    <div class="content">
+      {@render children()}
+    </div>
   </div>
 </dialog>
 
@@ -62,20 +78,50 @@
     width: min(440px, calc(100vw - 2 * var(--space-5)));
   }
 
+  dialog[open] {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  dialog.fixed {
+    height: calc(100vh - 2 * var(--space-6));
+  }
+
   dialog::backdrop {
     background: light-dark(#0f172a40, #00000099);
   }
 
   .body {
     display: flex;
+    flex: 1;
     flex-direction: column;
     gap: var(--space-4);
+    min-height: 0;
     padding: var(--space-4) var(--space-5) var(--space-5);
   }
 
   header {
     display: flex;
+    flex: none;
     align-items: center;
     justify-content: space-between;
+  }
+
+  .content {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: var(--space-4);
+    min-height: 0;
+    overflow-y: auto;
+    /* Room for focus rings and the scrollbar, without shifting the content. */
+    margin: 0 calc(-1 * var(--space-2));
+    padding: var(--space-1) var(--space-2);
+  }
+
+  /* A fixed modal's content lays out its own scrolling area. */
+  .fixed .content {
+    overflow: hidden;
   }
 </style>

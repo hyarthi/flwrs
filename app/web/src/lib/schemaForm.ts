@@ -34,7 +34,24 @@ export interface Schema {
   'x-flwrs-advanced'?: boolean;
   'x-flwrs-widget'?: 'duration' | 'cron' | 'file-path' | 'code';
   'x-flwrs-listen'?: boolean;
+  /** A package file an editor fills the empty field with. */
+  'x-flwrs-template'?: string;
   [key: string]: unknown;
+}
+
+/** Whether two JSON values are equal, whatever the order of object keys. */
+export function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    const list = b as unknown[];
+    return a.length === list.length && a.every((v, i) => sameJson(v, list[i]));
+  }
+  const x = a as Record<string, unknown>;
+  const y = b as Record<string, unknown>;
+  const keys = Object.keys(x);
+  return keys.length === Object.keys(y).length && keys.every((k) => k in y && sameJson(x[k], y[k]));
 }
 
 /** Follows local `$ref`s (`#/…`) against the schema's root, cycle-safe. */
@@ -64,12 +81,16 @@ export function typeOf(schema: Schema): string | undefined {
   return undefined;
 }
 
-export type Kind = 'string' | 'integer' | 'number' | 'boolean' | 'enum' | 'object' | 'list' | 'code' | 'json';
+export type Kind = 'string' | 'integer' | 'number' | 'boolean' | 'enum' | 'object' | 'list' | 'code' | 'document' | 'json';
 
 /** How the form shows a (resolved) property. */
 export function kindOf(schema: Schema): Kind {
   if (schema.enum?.length && schema.enum.every((v) => typeof v === 'string' || typeof v === 'number')) return 'enum';
   if (schema['x-flwrs-code'] || schema['x-flwrs-widget'] === 'code') return 'code';
+  // A document as an object or its text (e.g. an OpenAPI document, JSON or
+  // YAML): edited as text.
+  const types = Array.isArray(schema.type) ? schema.type : [];
+  if (types.includes('object') && types.includes('string') && !Object.keys(schema.properties ?? {}).length) return 'document';
   const type = typeOf(schema);
   switch (type) {
     case 'string':
