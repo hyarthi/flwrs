@@ -1,0 +1,37 @@
+{
+  "description": "detection / end-to-end rows",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "det": {
+        "kind": "model",
+        "model": "yolov10n.onnx",
+        "pre": {
+          "width": 640,
+          "height": 640,
+          "resize": "letterbox",
+          "pad": 114,
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "detections_e2e",
+          "output": "output0"
+        },
+        "labels": {
+          "builtin": "coco80"
+        }
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "det.frame"
+      }
+    ]
+  }
+}

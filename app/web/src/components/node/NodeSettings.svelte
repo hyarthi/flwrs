@@ -9,6 +9,7 @@
   import { untrack } from 'svelte';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import Copy from '@lucide/svelte/icons/copy';
+  import X from '@lucide/svelte/icons/x';
   import SchemaField from '../form/SchemaField.svelte';
   import { ApiError } from '../../lib/api';
   import {
@@ -131,6 +132,36 @@
     try {
       const saved = await putUpload(sceneId, node.id, safeUploadName(file.name), file);
       setArg(key, saved.name);
+    } catch (e) {
+      const error = e instanceof ApiError ? e : new ApiError(0, String(e));
+      saveErrors = { ...errors, args: new Map(errors.args).set(key, [error.message, ...error.details]) };
+    } finally {
+      uploading = null;
+    }
+  }
+
+  /** A list upload field's names. */
+  function namesOf(key: string): string[] {
+    const v = args[key];
+    return Array.isArray(v) ? v.filter((n): n is string => typeof n === 'string') : [];
+  }
+
+  /** Sets a list upload field (an empty list leaves it out). */
+  function setNames(key: string, names: string[]) {
+    setArg(key, names.length ? names : undefined);
+  }
+
+  /** Uploads files and adds them to a list field, in order. */
+  async function uploadInto(key: string, files: FileList | null | undefined) {
+    if (!files?.length) return;
+    uploading = key;
+    try {
+      const names = namesOf(key);
+      for (const file of Array.from(files)) {
+        const saved = await putUpload(sceneId, node.id, safeUploadName(file.name), file);
+        if (!names.includes(saved.name)) names.push(saved.name);
+        setNames(key, [...names]);
+      }
     } catch (e) {
       const error = e instanceof ApiError ? e : new ApiError(0, String(e));
       saveErrors = { ...errors, args: new Map(errors.args).set(key, [error.message, ...error.details]) };
@@ -531,6 +562,34 @@
                   <span class="hint">Set by the plugin’s configurator from the other settings.</span>
                   {#each fieldErrors(field.key) as e, i (i)}<span class="error">{e}</span>{/each}
                 </div>
+              {:else if field.uploadList}
+                <div class="field">
+                  <label for={`up-${field.key}`}>{labelOf(field.key, field.schema)}{field.required ? ' *' : ''} <span class="badge">files</span></label>
+                  {#if namesOf(field.key).length}
+                    <ul class="files">
+                      {#each namesOf(field.key) as name (name)}
+                        <li>
+                          <span class="grow">{name}{#if !uploads.some((u) => u.name === name)} <span class="badge danger">missing</span>{/if}</span>
+                          <button class="btn ghost icon" type="button" title="Remove" aria-label={`Remove ${name}`} onclick={() => setNames(field.key, namesOf(field.key).filter((n) => n !== name))}><X size={14} strokeWidth={1.75} /></button>
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                  <div class="row">
+                    <select id={`up-${field.key}`} class="input grow" value="" onchange={(e) => { const name = e.currentTarget.value; e.currentTarget.value = ''; if (name) setNames(field.key, [...namesOf(field.key), name]); }}>
+                      <option value="">Add an uploaded file</option>
+                      {#each uploads.filter((u) => !namesOf(field.key).includes(u.name)) as upload (upload.name)}
+                        <option value={upload.name}>{upload.name}</option>
+                      {/each}
+                    </select>
+                    <label class="btn">
+                      {uploading === field.key ? 'Uploading…' : 'Upload…'}
+                      <input type="file" multiple hidden disabled={uploading !== null} onchange={(e) => uploadInto(field.key, e.currentTarget.files)} />
+                    </label>
+                  </div>
+                  {#if field.schema.description}<span class="hint">{field.schema.description}</span>{/if}
+                  {#each fieldErrors(field.key) as e, i (i)}<span class="error">{e}</span>{/each}
+                </div>
               {:else if field.upload}
                 <div class="field">
                   <label for={`up-${field.key}`}>{labelOf(field.key, field.schema)}{field.required ? ' *' : ''} <span class="badge">file</span></label>
@@ -652,6 +711,28 @@
   .grow {
     flex: 1;
     min-width: 0;
+  }
+
+  .files {
+    display: flex;
+    flex-direction: column;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+
+  .files li {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-1) var(--space-1) var(--space-2);
+    font-size: var(--text-sm);
+  }
+
+  .files li + li {
+    border-top: 1px solid var(--border);
   }
 
   section {

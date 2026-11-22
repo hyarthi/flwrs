@@ -1,0 +1,44 @@
+{
+  "description": "detection / YOLO raw grid with objectness",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "det": {
+        "kind": "model",
+        "model": "yolox_s.onnx",
+        "pre": {
+          "width": 640,
+          "height": 640,
+          "resize": "letterbox",
+          "pad": 114,
+          "color": "bgr",
+          "dtype": "f32",
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "yolo",
+          "output": "output",
+          "channels_first": false,
+          "classes": 80,
+          "objectness": true,
+          "grid": [
+            8,
+            16,
+            32
+          ]
+        },
+        "labels": {
+          "builtin": "coco80"
+        }
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "det.frame"
+      }
+    ]
+  }
+}

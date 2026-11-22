@@ -1,0 +1,33 @@
+{
+  "description": "pose / single-person",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "pose": {
+        "kind": "model",
+        "model": "movenet_single.onnx",
+        "pre": {
+          "width": 192,
+          "height": 192,
+          "resize": "letterbox",
+          "color": "rgb",
+          "dtype": "i32",
+          "layout": "nhwc"
+        },
+        "decode": {
+          "type": "movenet",
+          "output": "output_0",
+          "multi": false
+        }
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "pose.frame"
+      }
+    ]
+  }
+}

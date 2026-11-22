@@ -1,0 +1,61 @@
+{
+  "description": "detection / GFL distribution",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "det": {
+        "kind": "model",
+        "model": "nanodet.onnx",
+        "pre": {
+          "width": 416,
+          "height": 416,
+          "resize": "letterbox",
+          "color": "bgr",
+          "dtype": "f32",
+          "mean": [
+            103.53,
+            116.28,
+            123.675
+          ],
+          "std": [
+            57.375,
+            57.12,
+            58.395
+          ],
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "gfl",
+          "cls": [
+            "792",
+            "814",
+            "836"
+          ],
+          "reg": [
+            "795",
+            "817",
+            "839"
+          ],
+          "strides": [
+            8,
+            16,
+            32
+          ],
+          "reg_max": 7
+        },
+        "min_confidence": 0.35,
+        "labels": {
+          "builtin": "coco80"
+        }
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "det.frame"
+      }
+    ]
+  }
+}

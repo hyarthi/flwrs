@@ -1,0 +1,62 @@
+{
+  "fields": [
+    { "key": "event", "description": "What happened: detections (the objects seen in a frame), or a rule's kind (line_crossing, zone, loitering, counting)", "type": "STRING" },
+    { "key": "frame_time", "description": "When the frame was captured", "type": "DATETIME" },
+    { "key": "frame_seq", "description": "Frame number since the plugin started, from 1", "type": "U64" },
+    { "key": "width", "description": "Frame width, pixels", "type": "U32" },
+    { "key": "height", "description": "Frame height, pixels", "type": "U32" },
+    {
+      "key": "objects",
+      "description": "The objects, boxes and keypoints normalised to the frame (0..1)",
+      "type": "ARRAY",
+      "nested_type_definition": {
+        "type": "OBJECT",
+        "object_fields": [
+          { "key": "class_id", "description": "Class index in the model's labels", "type": "U32" },
+          { "key": "class_name", "description": "Class label (empty without labels)", "type": "STRING" },
+          { "key": "confidence", "description": "Score, 0..1", "type": "F32" },
+          { "key": "tracker_id", "description": "Track id (0 without a tracker)", "type": "U64" },
+          { "key": "source", "description": "The graph node that found it", "type": "STRING" },
+          {
+            "key": "box",
+            "description": "x1, y1 (top left), x2, y2 (bottom right), 0..1",
+            "type": "OBJECT",
+            "object_fields": [
+              { "key": "x1", "type": "F32" },
+              { "key": "y1", "type": "F32" },
+              { "key": "x2", "type": "F32" },
+              { "key": "y2", "type": "F32" }
+            ]
+          },
+          {
+            "key": "keypoints",
+            "description": "Keypoints in the model's order, 0..1, with their score",
+            "type": "ARRAY",
+            "nested_type_definition": {
+              "type": "OBJECT",
+              "object_fields": [
+                { "key": "x", "type": "F32" },
+                { "key": "y", "type": "F32" },
+                { "key": "confidence", "type": "F32" }
+              ]
+            }
+          },
+          {
+            "key": "classes",
+            "description": "Classifier results on this object (e.g. a gesture): top-k",
+            "type": "ARRAY",
+            "nested_type_definition": {
+              "type": "OBJECT",
+              "object_fields": [
+                { "key": "source", "type": "STRING" },
+                { "key": "class_id", "type": "U32" },
+                { "key": "class_name", "type": "STRING" },
+                { "key": "confidence", "type": "F32" }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

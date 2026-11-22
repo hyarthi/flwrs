@@ -1,0 +1,86 @@
+{
+  "description": "pose / top-down (detector + SimCC)",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "det": {
+        "kind": "model",
+        "model": "yolov10n.onnx",
+        "pre": {
+          "width": 640,
+          "height": 640,
+          "resize": "letterbox",
+          "pad": 114,
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "detections_e2e",
+          "output": "output0"
+        },
+        "min_confidence": 0.4,
+        "labels": {
+          "builtin": "coco80"
+        }
+      },
+      "pose": {
+        "kind": "model",
+        "model": "rtmpose_s.onnx",
+        "pre": {
+          "width": 192,
+          "height": 256,
+          "resize": "stretch",
+          "color": "rgb",
+          "dtype": "f32",
+          "mean": [
+            123.675,
+            116.28,
+            103.53
+          ],
+          "std": [
+            58.395,
+            57.12,
+            57.375
+          ],
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "simcc",
+          "x": "simcc_x",
+          "y": "simcc_y",
+          "split": 2.0
+        }
+      },
+      "pose_roi": {
+        "kind": "crop",
+        "classes": [
+          0
+        ],
+        "scale": 1.25,
+        "aspect": 0.75
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "det.frame"
+      },
+      {
+        "from": "camera.frame",
+        "to": "pose_roi.frame"
+      },
+      {
+        "from": "det.objects",
+        "to": "pose_roi.objects"
+      },
+      {
+        "from": "pose_roi.regions",
+        "to": "pose.frame"
+      }
+    ]
+  }
+}

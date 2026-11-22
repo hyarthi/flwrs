@@ -1,0 +1,1 @@
+DROP TABLE scene_node_configure_warnings;

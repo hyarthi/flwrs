@@ -189,14 +189,17 @@ impl NodeRules {
     }
 
     /// The uploaded files a node's `launch_args` name: (field, upload name,
-    /// whether the field is a secret).
+    /// whether the field is a secret); a list field gives one per name.
     pub(crate) fn uploads_referenced(&self, args: &Value) -> Vec<(String, String, bool)> {
         self.spec
             .fields()
             .filter(|f| f.upload)
-            .filter_map(|f| {
-                let name = args.get(&f.name)?.as_str()?;
-                Some((f.name.clone(), name.to_string(), f.secret))
+            .flat_map(|f| {
+                args.get(&f.name)
+                    .map(|v| f.upload_names(v))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|name| (f.name.clone(), name.to_string(), f.secret))
             })
             .collect()
     }
@@ -308,7 +311,10 @@ mod tests {
             "script": {"type": "string", "x-flwrs-launch": {"via": "file"},
                        "x-flwrs-code": {"language": "lua", "params": ["payload", "meta"]}},
             "api_key": {"type": "string", "writeOnly": true, "x-flwrs-launch": {"via": "env"}},
-            "pem": {"type": "string", "writeOnly": true, "x-flwrs-launch": {"via": "file"}}
+            "pem": {"type": "string", "writeOnly": true, "x-flwrs-launch": {"via": "file"}},
+            "model": {"type": "string", "x-flwrs-launch": {"via": "file", "source": "upload"}},
+            "labels": {"type": "array", "items": {"type": "string"},
+                       "x-flwrs-launch": {"via": "file", "source": "upload"}}
         }});
         let out = r#"{"fields": [{"key": "x", "type": "STRING"}]}"#;
         NodeRules::of(&plugin(manifest, schema, Some(out))).unwrap()
@@ -386,5 +392,18 @@ mod tests {
             json!({"api_key": "k", "pem": "p"})
         );
         assert!(!r.secrets_set(&Value::Null)["/api_key"]);
+    }
+
+    #[test]
+    fn uploads_are_listed_one_per_name() {
+        let r = rules();
+        let args = json!({"model": "m.onnx", "labels": ["a.txt", "b.txt"], "script": "x"});
+        let named: Vec<_> = r
+            .uploads_referenced(&args)
+            .into_iter()
+            .map(|(field, name, _)| format!("{field}:{name}"))
+            .collect();
+        assert_eq!(named, ["labels:a.txt", "labels:b.txt", "model:m.onnx"]);
+        assert!(r.uploads_referenced(&json!({"labels": []})).is_empty());
     }
 }

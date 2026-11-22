@@ -1,0 +1,42 @@
+{
+  "description": "face detection / prior grid + landmarks",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "faces": {
+        "kind": "model",
+        "model": "yunet.onnx",
+        "pre": {
+          "width": 640,
+          "height": 640,
+          "resize": "letterbox",
+          "color": "bgr",
+          "dtype": "f32",
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "yunet",
+          "strides": [
+            8,
+            16,
+            32
+          ],
+          "keypoints": 5,
+          "iou": 0.3
+        },
+        "min_confidence": 0.6,
+        "labels": [
+          "face"
+        ]
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "faces.frame"
+      }
+    ]
+  }
+}

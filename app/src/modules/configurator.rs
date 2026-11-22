@@ -375,5 +375,87 @@ pub(crate) async fn store_files(
         .await
         .map_err(|e| e.to_string())?;
     }
+    store_warnings(conn, node_id, configured)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// How many runs' warnings are kept per node (live, the draft, and a few
+/// states its undo history may return to).
+const WARNING_RUNS_KEPT: i64 = 8;
+
+/// The key a run's warnings are stored under: the node's launch args after
+/// the run (as the node stores them), canonical JSON hashed.
+pub(crate) fn warnings_key(launch_args: &Value) -> String {
+    sha256::digest(crate::modules::scene::service::draft::canonical(launch_args).to_string())
+}
+
+/// Records a run's warnings (none: nothing kept for these settings), for
+/// `check`. Live and the draft share the rows: each finds its settings' run.
+async fn store_warnings(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    configured: &Configured,
+) -> Result<(), sqlx::Error> {
+    let key = warnings_key(&configured.launch_args);
+    if configured.warnings.is_empty() {
+        sqlx::query(
+            "DELETE FROM scene_node_configure_warnings WHERE node_id = $1 AND args_key = $2",
+        )
+        .bind(node_id)
+        .bind(&key)
+        .execute(&mut *conn)
+        .await?;
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO scene_node_configure_warnings (node_id, args_key, warnings, run_time) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (node_id, args_key) DO UPDATE SET warnings = excluded.warnings, \
+             run_time = excluded.run_time",
+    )
+    .bind(node_id)
+    .bind(&key)
+    .bind(serde_json::to_string(&configured.warnings).expect("strings serialize"))
+    .bind(chrono::Local::now())
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(
+        "DELETE FROM scene_node_configure_warnings WHERE node_id = $1 AND args_key NOT IN \
+         (SELECT args_key FROM scene_node_configure_warnings WHERE node_id = $1 \
+          ORDER BY run_time DESC LIMIT $2)",
+    )
+    .bind(node_id)
+    .bind(WARNING_RUNS_KEPT)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The warnings of the run that produced these launch args, with its time.
+pub(crate) async fn warnings(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    launch_args: &Value,
+) -> Result<Option<(Vec<String>, chrono::DateTime<chrono::Local>)>, sqlx::Error> {
+    let row: Option<(String, chrono::DateTime<chrono::Local>)> = sqlx::query_as(
+        "SELECT warnings, run_time FROM scene_node_configure_warnings \
+         WHERE node_id = $1 AND args_key = $2",
+    )
+    .bind(node_id)
+    .bind(warnings_key(launch_args))
+    .fetch_optional(conn)
+    .await?;
+    Ok(row.map(|(text, time)| (serde_json::from_str(&text).unwrap_or_default(), time)))
+}
+
+/// Drops the warnings of nodes that are in neither the live graph nor a draft.
+pub(crate) async fn forget_warnings(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM scene_node_configure_warnings WHERE node_id NOT IN \
+         (SELECT id FROM scene_nodes UNION SELECT id FROM scene_draft_nodes)",
+    )
+    .execute(conn)
+    .await?;
     Ok(())
 }

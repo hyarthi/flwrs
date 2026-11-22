@@ -444,12 +444,14 @@ impl Service {
         self.collect_garbage(&mut conn).await
     }
 
-    /// Removes stored files no row names. The caller holds the service lock
+    /// Removes stored files no row names (and gone nodes' configurator
+    /// warnings). The caller holds the service lock
     /// (so no upload is between its rename and its row).
     pub(super) async fn collect_garbage(
         &self,
         conn: &mut sqlx::SqliteConnection,
     ) -> Result<(), ServiceError> {
+        configurator::forget_warnings(conn).await?;
         let keep: HashSet<String> = query_sqlite::stored_files(conn)
             .await?
             .into_iter()

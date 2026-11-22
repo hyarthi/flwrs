@@ -702,6 +702,18 @@ impl Service {
                     ));
                 }
             }
+            // The warnings of the configurator run that produced these settings.
+            if configured_here
+                && let Some((warnings, time)) =
+                    configurator::warnings(conn, &node.id, &node.config.launch_args).await?
+            {
+                let time = time.format("%Y-%m-%d %H:%M:%S");
+                check.warnings.extend(
+                    warnings
+                        .into_iter()
+                        .map(|w| format!("{label}: configurator (run {time}): {w}")),
+                );
+            }
             // A core count the plugin wouldn't get.
             if node.config.runtime.threads.is_some_and(|n| n > 0) {
                 if node.config.launch != crate::modules::node_config::LaunchMode::Local {
@@ -1526,7 +1538,7 @@ impl Service {
                 .collect::<Vec<_>>()
         })?;
         for warning in &configured.warnings {
-            log::info!("Scene service: node [{node_id}]: configurator: {warning}");
+            log::debug!("Scene service: node [{node_id}]: configurator: {warning}");
         }
         Ok(configured)
     }

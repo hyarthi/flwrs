@@ -20,6 +20,7 @@ members = [
     "plugins/ws_source",
     "plugins/http_push_sink",
     "plugins/ws_push_sink",
+    "plugins/cv_source",
     "e2e",
     "trellis",
 ]
@@ -138,6 +139,15 @@ yaml_serde = "0.10.7"
 roas-asyncapi = { version = "0.5.2", default-features = false, features = ["v3_0", "v3_1"] }
 enumset = "1.1.13"
 x509-parser = "0.18.1"
+
+# Computer vision (cv source): ONNX Runtime (pinned: a release candidate, its
+# API moves between them; the build downloads the runtime, over rustls with
+# ring, so no native TLS) and tract (pure Rust, for devices ONNX Runtime
+# doesn't support).
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-rustls", "copy-dylibs", "api-31"] }
+tract-onnx = "0.23.10"
+# Test images for the cv source's real-model checks (ignored tests).
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 
 # testing
 tempfile = "3.27.0"

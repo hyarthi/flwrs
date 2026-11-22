@@ -1,0 +1,38 @@
+{
+  "description": "detection / DETR-style queries (transformers.js export)",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "det": {
+        "kind": "model",
+        "model": "yolo26n.onnx",
+        "pre": {
+          "width": 640,
+          "height": 640,
+          "resize": "stretch",
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "detr",
+          "logits": "logits",
+          "boxes": "pred_boxes",
+          "activation": "sigmoid"
+        },
+        "labels": {
+          "builtin": "coco80"
+        }
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "det.frame"
+      }
+    ]
+  }
+}

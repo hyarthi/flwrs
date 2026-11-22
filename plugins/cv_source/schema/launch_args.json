@@ -1,0 +1,1014 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Vision source settings",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "graph"
+  ],
+  "properties": {
+    "graph": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "nodes": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$"
+          },
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/source"
+              },
+              {
+                "$ref": "#/$defs/model"
+              },
+              {
+                "$ref": "#/$defs/crop"
+              },
+              {
+                "$ref": "#/$defs/filter"
+              }
+            ]
+          }
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "from": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*\\.[a-z_]+$"
+              },
+              "to": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*\\.[a-z_]+$"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ]
+          }
+        }
+      },
+      "required": [
+        "nodes"
+      ],
+      "title": "Model graph",
+      "description": "The models and how they link: nodes (source, model, crop, filter) with typed ports, and links from an output to an input (<node>.<port>). A crop node's regions linked to a model's frame run the model once per region.",
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "graph.json"
+      },
+      "x-flwrs-order": 1
+    },
+    "files": {
+      "title": "Files",
+      "description": "The files the graph names: models (.onnx), label lists, charsets. Upload them to the node; a graph refers to each by its name.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "x-flwrs-launch": {
+        "via": "file",
+        "source": "upload",
+        "alias": "file"
+      },
+      "x-flwrs-order": 2
+    },
+    "execution": {
+      "title": "Execution",
+      "description": "Where the models run (runtime, device, provider, fallback). A model node's own execution overrides it field by field.",
+      "$ref": "#/$defs/execution",
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "execution.json"
+      },
+      "x-flwrs-order": 3,
+      "x-flwrs-advanced": true
+    },
+    "out_schema": {
+      "title": "Event schema",
+      "description": "The payload schema of the events (default: the plugin's detections schema).",
+      "type": "object",
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "out_schema.json"
+      },
+      "x-flwrs-order": 4,
+      "x-flwrs-advanced": true
+    }
+  },
+  "$defs": {
+    "pre": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "width": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8192
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8192
+        },
+        "resize": {
+          "enum": [
+            "stretch",
+            "letterbox",
+            "cover"
+          ]
+        },
+        "pad": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "color": {
+          "enum": [
+            "rgb",
+            "bgr"
+          ]
+        },
+        "dtype": {
+          "enum": [
+            "f32",
+            "i32",
+            "u8"
+          ]
+        },
+        "scale": {
+          "type": "number"
+        },
+        "mean": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "std": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "layout": {
+          "enum": [
+            "nchw",
+            "nhwc"
+          ]
+        }
+      },
+      "required": [
+        "width",
+        "height",
+        "resize",
+        "color",
+        "dtype",
+        "layout"
+      ]
+    },
+    "decoder": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "classify"
+            },
+            "output": {
+              "type": "string"
+            },
+            "softmax": {
+              "type": "boolean"
+            },
+            "topk": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 5
+            }
+          },
+          "required": [
+            "type",
+            "output",
+            "softmax"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "yolo"
+            },
+            "output": {
+              "type": "string"
+            },
+            "channels_first": {
+              "type": "boolean"
+            },
+            "classes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "objectness": {
+              "type": "boolean"
+            },
+            "keypoints": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "grid": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "iou": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "required": [
+            "type",
+            "output",
+            "channels_first",
+            "classes"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "detections_e2e"
+            },
+            "output": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "detr"
+            },
+            "logits": {
+              "type": "string"
+            },
+            "boxes": {
+              "type": "string"
+            },
+            "activation": {
+              "enum": [
+                "sigmoid",
+                "softmax_no_object",
+                "none"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "logits",
+            "boxes",
+            "activation"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "gfl"
+            },
+            "cls": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "reg": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "strides": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "reg_max": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "iou": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "required": [
+            "type",
+            "cls",
+            "reg",
+            "strides",
+            "reg_max"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "ssd_anchors"
+            },
+            "boxes": {
+              "type": "string"
+            },
+            "scores": {
+              "type": "string"
+            },
+            "strides": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "minItems": 1
+            },
+            "keypoints": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "iou": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "required": [
+            "type",
+            "boxes",
+            "scores",
+            "strides",
+            "keypoints"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "yunet"
+            },
+            "strides": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "minItems": 1
+            },
+            "keypoints": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "iou": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "required": [
+            "type",
+            "strides",
+            "keypoints"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "movenet"
+            },
+            "output": {
+              "type": "string"
+            },
+            "multi": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "output",
+            "multi"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "rtmo"
+            },
+            "dets": {
+              "type": "string"
+            },
+            "keypoints": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "dets",
+            "keypoints"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "simcc"
+            },
+            "x": {
+              "type": "string"
+            },
+            "y": {
+              "type": "string"
+            },
+            "split": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "x",
+            "y",
+            "split"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "heatmap"
+            },
+            "output": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "landmarks"
+            },
+            "output": {
+              "type": "string"
+            },
+            "points": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "dims": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "visibility_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "presence": {
+              "type": "string"
+            },
+            "presence_sigmoid": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "output",
+            "points",
+            "dims"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "semantic"
+            },
+            "output": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "dense_map"
+            },
+            "output": {
+              "type": "string"
+            },
+            "threshold": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "type",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "ocr_det"
+            },
+            "output": {
+              "type": "string"
+            },
+            "threshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "min_area": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "output",
+            "threshold",
+            "min_area"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "ctc"
+            },
+            "output": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "embedding"
+            },
+            "output": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "output"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "raw"
+            },
+            "outputs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            }
+          },
+          "required": [
+            "type",
+            "outputs"
+          ]
+        }
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "source"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "model"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The ONNX file: the name of a file uploaded to the node"
+        },
+        "input_name": {
+          "type": "string"
+        },
+        "pre": {
+          "$ref": "#/$defs/pre"
+        },
+        "tensor_input": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "dims": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 3
+            },
+            "normalize": {
+              "enum": [
+                "none",
+                "box",
+                "wrist"
+              ]
+            },
+            "keypoints": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "required": [
+            "dims"
+          ]
+        },
+        "decode": {
+          "$ref": "#/$defs/decoder"
+        },
+        "min_confidence": {
+          "description": "The confidence cutoff: results below it are dropped as soon as the decoder knows their confidence, so nothing downstream sees them (default: 0.25 for detectors, 0 for the others). Not for decoders whose results have no confidence (semantic, dense_map, embedding, raw).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "execution": {
+          "description": "Where this model runs; each field set here overrides the plugin's execution setting.",
+          "$ref": "#/$defs/execution"
+        },
+        "labels": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "builtin": {
+                  "enum": [
+                    "coco80",
+                    "imagenet1k"
+                  ]
+                }
+              },
+              "required": [
+                "builtin"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "file": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "model_metadata": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_metadata"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "hf_config": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "hf_config"
+              ]
+            }
+          ]
+        },
+        "charset": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "file": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "file"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "model_metadata": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_metadata"
+              ]
+            }
+          ]
+        },
+        "sampling": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "every_n_frames": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "every_n_frames"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "per_track": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "refresh_frames": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  }
+                }
+              },
+              "required": [
+                "per_track"
+              ]
+            }
+          ]
+        },
+        "keypoint_layout": {
+          "description": "What the keypoints are (names and skeleton).",
+          "enum": [
+            "coco17",
+            "blazepose33",
+            "hand21",
+            "wholebody133",
+            "face5",
+            "face6"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "model",
+        "decode"
+      ]
+    },
+    "crop": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "crop"
+        },
+        "classes": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "max": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 8
+        },
+        "center_keypoint": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "size_keypoints": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "rotate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "from": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "to": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "angle": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "from",
+            "to",
+            "angle"
+          ]
+        },
+        "scale": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 1
+        },
+        "shift_y": {
+          "type": "number"
+        },
+        "square": {
+          "type": "boolean"
+        },
+        "aspect": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "filter"
+        },
+        "classes": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "min_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Where models run. Unset fields fall back to the plugin's setting, then to the build's first runtime, the CPU, and no fallback.",
+      "properties": {
+        "runtime": {
+          "description": "The inference runtime: ort (ONNX Runtime) or tract (pure Rust, CPU only).",
+          "enum": [
+            "ort",
+            "tract"
+          ]
+        },
+        "device": {
+          "description": "The kind of device: cpu (default), gpu or npu (a neural engine). Nodes a device's provider can't take run on the CPU.",
+          "enum": [
+            "cpu",
+            "gpu",
+            "npu"
+          ]
+        },
+        "provider": {
+          "description": "The ONNX Runtime execution provider: coreml, cuda, tensorrt, directml, openvino, webgpu, xnnpack, qnn, or a full ...ExecutionProvider name (default: the first the device offers).",
+          "type": "string",
+          "minLength": 1
+        },
+        "provider_options": {
+          "description": "The provider's options, e.g. {\"ModelFormat\": \"MLProgram\"} for CoreML.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "allow_fallback": {
+          "description": "A model that won't load or run on its device runs on the CPU instead, with a warning. Off: that's an error, and the node doesn't start.",
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

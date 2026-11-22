@@ -16,8 +16,8 @@ const LAUNCH_SCHEMA: &str = r#"{"type": "object", "additionalProperties": false,
     "out_schema": {"type": "object"},
     "descriptor": {"type": "string", "x-flwrs-launch": {"via": "file", "source": "upload"}}}}"#;
 
-/// The configurator: `spec` "fail…" fails; "files" also returns a file. The
-/// out schema has one field named after `spec`, described as
+/// The configurator: `spec` "fail…" fails; "warn…" adds a warning; "files"
+/// also returns a file. The out schema has one field named after `spec`, described as
 /// `<version>|<the uploaded doc>|<its pid>` (each run differs).
 fn script(version: &str) -> String {
     format!(
@@ -28,7 +28,9 @@ doc=""
 [ -f config/doc.yaml ] && doc=$(cat config/doc.yaml)
 files='{{}}'
 if [ "$spec" = files ]; then printf 'bin' > descriptor.pb; files='{{"descriptor": "descriptor.pb"}}'; fi
-printf '{{"values": {{"out_schema": {{"fields": [{{"key": "%s", "type": "STRING", "description": "{version}|%s|%s"}}]}}}}, "files": %s}}' "$spec" "$doc" "$$" "$files" > response.json
+warnings='[]'
+case "$spec" in warn*) warnings='["spec says warn"]';; esac
+printf '{{"values": {{"out_schema": {{"fields": [{{"key": "%s", "type": "STRING", "description": "{version}|%s|%s"}}]}}}}, "files": %s, "warnings": %s}}' "$spec" "$doc" "$$" "$files" "$warnings" > response.json
 "#
     )
 }
@@ -153,6 +155,62 @@ async fn runs_on_save_and_only_when_the_settings_change() {
             .unwrap_err(),
     );
     assert!(e[0].contains("set by the plugin's configurator"), "{e:?}");
+}
+
+#[tokio::test]
+async fn check_shows_the_warnings_of_the_run_behind_the_settings() {
+    let (f, scene) = setup().await;
+    let warned = |c: SceneCheck| {
+        c.warnings
+            .into_iter()
+            .filter(|w| w.contains("configurator (run "))
+            .collect::<Vec<_>>()
+    };
+    let node = f
+        .node(&scene.id, PLUGIN, json!({"launch_args": {"spec": "warn"}}))
+        .await;
+    let found = warned(f.service.check(&scene.id).await.unwrap());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("spec says warn"), "{found:?}");
+    // Kept settings keep their run's warnings.
+    f.service
+        .update_node(
+            &scene.id,
+            &node.id,
+            node_input(PLUGIN, json!({"launch_args": {"spec": "warn"}})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(warned(f.service.check(&scene.id).await.unwrap()).len(), 1);
+    // A draft run: the draft shows its own run, live still its own.
+    f.service
+        .reconfigure_node_in(Store::Draft, &scene.id, &node.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        warned(f.service.check_draft(&scene.id).await.unwrap()).len(),
+        1
+    );
+    assert_eq!(warned(f.service.check(&scene.id).await.unwrap()).len(), 1);
+    f.service.discard_draft(&scene.id).await.unwrap();
+    // A run without warnings: none shown.
+    f.service
+        .update_node(
+            &scene.id,
+            &node.id,
+            node_input(PLUGIN, json!({"launch_args": {"spec": "b"}})),
+        )
+        .await
+        .unwrap();
+    assert!(warned(f.service.check(&scene.id).await.unwrap()).is_empty());
+    // Gone with the node.
+    f.service.delete_node(&scene.id, &node.id).await.unwrap();
+    let mut conn = f.service.conn().await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scene_node_configure_warnings")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
 }
 
 #[tokio::test]

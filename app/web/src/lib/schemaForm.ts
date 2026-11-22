@@ -118,6 +118,8 @@ export interface Field {
   secret: boolean;
   /** `"source": "upload"`: the value names one of the node's uploads. */
   upload: boolean;
+  /** An upload field holding a list of names (an array of strings). */
+  uploadList: boolean;
   /** Set by the plugin's configurator (local nodes). */
   configured: boolean;
   advanced: boolean;
@@ -135,6 +137,7 @@ export function topFields(root: Schema, configured: string[]): { group: string |
       required: required.has(key),
       secret: schema.writeOnly === true,
       upload: schema['x-flwrs-launch']?.source === 'upload',
+      uploadList: schema['x-flwrs-launch']?.source === 'upload' && schema.type === 'array',
       configured: configured.includes(key),
       advanced: schema['x-flwrs-advanced'] === true,
       group: schema['x-flwrs-group'] ?? null,

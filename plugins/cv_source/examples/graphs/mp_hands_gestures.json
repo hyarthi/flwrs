@@ -1,0 +1,117 @@
+{
+  "description": "hands + gestures / MediaPipe palm → hand landmarks → a gesture classifier on the landmarks (a tensor link)",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "palm": {
+        "kind": "model",
+        "model": "mp_palm.onnx",
+        "pre": {
+          "width": 192,
+          "height": 192,
+          "resize": "letterbox",
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "layout": "nhwc"
+        },
+        "decode": {
+          "type": "ssd_anchors",
+          "boxes": "Identity",
+          "scores": "Identity_1",
+          "strides": [
+            8,
+            16,
+            16,
+            16
+          ],
+          "keypoints": 7,
+          "iou": 0.3
+        },
+        "min_confidence": 0.5,
+        "labels": [
+          "palm"
+        ]
+      },
+      "hand": {
+        "kind": "model",
+        "model": "mp_hand.onnx",
+        "pre": {
+          "width": 224,
+          "height": 224,
+          "resize": "stretch",
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "layout": "nhwc"
+        },
+        "decode": {
+          "type": "landmarks",
+          "output": "Identity",
+          "points": 21,
+          "dims": 3,
+          "presence": "Identity_1"
+        }
+      },
+      "hand_roi": {
+        "kind": "crop",
+        "rotate": {
+          "from": 0,
+          "to": 2,
+          "angle": 90.0
+        },
+        "scale": 2.6,
+        "shift_y": -0.5,
+        "square": true
+      },
+      "gesture": {
+        "kind": "model",
+        "model": "gesture_classifier.onnx",
+        "tensor_input": {
+          "dims": 3,
+          "normalize": "wrist"
+        },
+        "decode": {
+          "type": "classify",
+          "output": "Identity",
+          "softmax": true,
+          "topk": 1
+        },
+        "labels": [
+          "none",
+          "closed_fist",
+          "open_palm",
+          "pointing_up",
+          "thumb_down",
+          "thumb_up",
+          "victory",
+          "i_love_you"
+        ]
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "palm.frame"
+      },
+      {
+        "from": "camera.frame",
+        "to": "hand_roi.frame"
+      },
+      {
+        "from": "palm.objects",
+        "to": "hand_roi.objects"
+      },
+      {
+        "from": "hand_roi.regions",
+        "to": "hand.frame"
+      },
+      {
+        "from": "hand.objects",
+        "to": "gesture.objects"
+      }
+    ]
+  }
+}

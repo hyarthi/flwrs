@@ -1,0 +1,47 @@
+{
+  "description": "classification / ImageNet",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "cls": {
+        "kind": "model",
+        "model": "mobilenet_v2.onnx",
+        "pre": {
+          "width": 224,
+          "height": 224,
+          "resize": "cover",
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "mean": [
+            0.485,
+            0.456,
+            0.406
+          ],
+          "std": [
+            0.229,
+            0.224,
+            0.225
+          ],
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "classify",
+          "output": "output",
+          "softmax": true
+        },
+        "labels": {
+          "builtin": "imagenet1k"
+        }
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "cls.frame"
+      }
+    ]
+  }
+}

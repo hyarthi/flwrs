@@ -176,7 +176,7 @@ pub(crate) enum Target {
 // ---- content hashes ----
 
 /// JSON with object keys sorted, at every level.
-fn canonical(value: &Value) -> Value {
+pub(crate) fn canonical(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();

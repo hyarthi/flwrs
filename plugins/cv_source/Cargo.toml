@@ -1,0 +1,45 @@
+[package]
+name = "flwrs-cv-source"
+description = "flwrs source plugin that runs computer-vision models on a camera or video and emits events."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# The engine (graph, pre-processing, decoders) is a library too, so a
+# transform-style ML plugin can reuse it later.
+[lib]
+name = "flwrs_cv_source"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flwrs-cv-source"
+path = "src/main.rs"
+
+[features]
+default = ["ort"]
+# Inference runtimes (at least one).
+ort = ["dep:ort"]
+tract = ["dep:tract-onnx"]
+
+[dependencies]
+flwrs-plugin = { workspace = true, features = ["cli", "tls"] } # TLS for remote use
+tokio.workspace = true
+clap.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ort = { workspace = true, optional = true }
+tract-onnx = { workspace = true, optional = true }
+
+[dev-dependencies]
+jsonschema.workspace = true # the launch-args schema against the CLI and the examples
+flwrs-plugin = { workspace = true, features = ["package"] }
+flwrs-trellis.workspace = true # tests/trellis.rs: audit
+image.workspace = true # real-model checks: test images
+tempfile.workspace = true

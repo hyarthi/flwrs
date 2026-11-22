@@ -1,0 +1,20 @@
+{
+  "manifest_version": 2,
+  "id": "cv-source",
+  "name": "Vision source",
+  "version": "0.0.1",
+  "type": "SOURCE",
+  "description": "Runs computer-vision models on a camera or video and emits what they see as events.",
+  "executable": "bin/flwrs-cv-source",
+  "launch_args_schema": "schema/launch_args.json",
+  "launch_args_style": "flags",
+  "threads": { "via": "arg", "name": "threads" },
+  "payload_schemas": {
+    "out": { "from_launch_args": "/out_schema", "default": "schema/out.json" }
+  },
+  "ui": {
+    "icon": "ui/cv.svg",
+    "categories": ["Inputs", "Vision"],
+    "docs": "README.md"
+  }
+}

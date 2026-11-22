@@ -1,0 +1,40 @@
+{
+  "description": "pose / multi-person one-stage",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "pose": {
+        "kind": "model",
+        "model": "yolov8n_pose.onnx",
+        "pre": {
+          "width": 640,
+          "height": 640,
+          "resize": "letterbox",
+          "pad": 114,
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "yolo",
+          "output": "output0",
+          "channels_first": true,
+          "classes": 1,
+          "keypoints": 17
+        },
+        "labels": {
+          "model_metadata": "names"
+        }
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "pose.frame"
+      }
+    ]
+  }
+}

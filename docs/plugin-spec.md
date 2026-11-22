@@ -114,7 +114,7 @@ On a top-level property only: `{"via": "arg" | "env" | "file", "alias"?, "file_n
 - **Names.** `alias` replaces the default name: `--<property with _ as ->` for arguments and files, `<PROPERTY_IN_UPPER_SNAKE>` for environment variables. Flags may use letters, digits and `-`, and can't be a bootstrap argument (`id`, `host`, `port`, `log-level`, `token`). Environment variable names must match `^[A-Z_][A-Z0-9_]*$` and can't start with `FLWRS_`, `LD_` or `DYLD_` or be one that changes how programs run (`PATH`, `HOME`, `PYTHONPATH`, `NODE_OPTIONS`, `JAVA_TOOL_OPTIONS`, …). No two settings may use the same flag, variable or file name.
 - **Values.** Strings are passed as they are, numbers and booleans as their JSON text. Objects and arrays MUST be delivered as files (`"via": "file"`), as JSON.
 - **Files.** A string is written as its UTF-8 bytes, anything else as JSON. The file is named `file_name`, else the property name plus an extension from `contentMediaType` (`text/x-lua` → `.lua`, `application/json` → `.json`, `application/yaml` → `.yaml`, `application/x-pem-file` → `.pem`, `text/plain` → `.txt`, …), else `.json` for objects and arrays, else no extension. File names: letters, digits, `.`, `_` and `-`, 1 to 100 characters, not starting with `.`.
-- **Uploads.** With `"source": "upload"` (a string property, `"via": "file"`), the value is the name of a file uploaded to the node through the scene API; the plugin gets the path of that file in `config/`.
+- **Uploads.** With `"source": "upload"` (a string property, `"via": "file"`), the value is the name of a file uploaded to the node through the scene API; the plugin gets the path of that file in `config/`. On an array of strings (`"type": "array", "items": {"type": "string"}`), the value is a list of such names: each file is linked into `config/` under its name, and the plugin gets the flag once per file, in the list's order (`--model config/a.onnx --model config/b.onnx`; nothing for an empty list). Names are unique within `config/`: the same name twice, in one list or in two fields, is refused.
 - Properties the schema doesn't declare (if it allows them) are delivered by the defaults.
 
 **Limits**, checked when a node is saved and the same on every platform, so a scene runs anywhere: the whole command line (as Windows quotes it) under 30 000 characters, and each environment variable's value under 30 000. Long values belong in files.
@@ -170,8 +170,8 @@ Some settings follow from others: an HTTP source's out schema from the OpenAPI d
      "errors": [] }
    ```
    - `values`: the configured fields' values. Only fields from `fields`, and not those delivered as uploaded files.
-   - `files`: for configured fields that are uploads (`"source": "upload"`): a path inside the folder to a file it wrote. The server stores the file as one of the node's uploads, under its file name, and sets the field to that name.
-   - `warnings` are logged. Any `errors` (or a non-zero exit, or no `response.json`) refuse the change, and the user sees the `errors` (or the program's last lines of stderr).
+   - `files`: for configured fields that are uploads (`"source": "upload"`): a path inside the folder to a file it wrote, or for a list field a list of paths (file names unique). The server stores each file as one of the node's uploads, under its file name, and sets the field to that name (a list field to the list of names).
+   - `warnings` are kept with the node and shown by the scene's check (as warnings: they don't stop a scene), for as long as the node has the settings that run produced; a later run replaces them. Any `errors` (or a non-zero exit, or no `response.json`) refuse the change, and the user sees the `errors` (or the program's last lines of stderr).
 5. The server checks the result: only the requested fields, files inside the folder, regular, and within `[scenes] max_upload_bytes`, and the node's settings with the configured values in place against the launch-args schema and the delivery rules. A configurator that takes longer than `[plugins] configure_timeout_ms` (30 s) is stopped, and `response.json` may hold at most `[plugins] configure_max_response_bytes` (1 MiB).
 
 A configurator must be deterministic for the same input and must not depend on the network: it runs whenever the server needs the result, possibly on another day. It's code from the package, like the plugin, run by the server with the same trust. `flwrs-trellis configure` runs one the way the server does, and `*.configure.toml` test files check it ([trellis](../trellis/README.md)).
@@ -206,7 +206,7 @@ A remote node whose plugin has a configurator can name an **endpoint** on the re
   "files": { "openapi.json": "eyJvcGVuYXBpIjo…" } }
 ```
 
-**The answer** is `200` (any 2xx) with the contract's `response.json`, except that a returned file is a URL the server downloads (with the same credentials and TLS settings):
+**The answer** is `200` (any 2xx) with the contract's `response.json`, except that a returned file is a URL the server downloads (with the same credentials and TLS settings), `{"name", "url"}`, or a list of them for a list field:
 
 ```json
 { "values": { "out_schema": { "fields": [ … ] } },

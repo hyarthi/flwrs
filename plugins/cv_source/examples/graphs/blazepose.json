@@ -1,0 +1,105 @@
+{
+  "description": "pose / detector + landmarks with rotated ROI (MediaPipe)",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "person": {
+        "kind": "model",
+        "model": "mp_person.onnx",
+        "pre": {
+          "width": 224,
+          "height": 224,
+          "resize": "letterbox",
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "mean": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "std": [
+            0.5,
+            0.5,
+            0.5
+          ],
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "ssd_anchors",
+          "boxes": "Identity:0",
+          "scores": "Identity_1:0",
+          "strides": [
+            8,
+            16,
+            32,
+            32,
+            32
+          ],
+          "keypoints": 4,
+          "iou": 0.3
+        },
+        "min_confidence": 0.55,
+        "labels": [
+          "person"
+        ]
+      },
+      "pose": {
+        "kind": "model",
+        "model": "mp_pose.onnx",
+        "pre": {
+          "width": 256,
+          "height": 256,
+          "resize": "stretch",
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "layout": "nhwc"
+        },
+        "decode": {
+          "type": "landmarks",
+          "output": "Identity",
+          "points": 33,
+          "dims": 5,
+          "visibility_index": 3,
+          "presence": "Identity_1"
+        }
+      },
+      "pose_roi": {
+        "kind": "crop",
+        "center_keypoint": 0,
+        "size_keypoints": [
+          0,
+          1
+        ],
+        "rotate": {
+          "from": 0,
+          "to": 1,
+          "angle": 90.0
+        },
+        "scale": 1.25,
+        "square": true
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "person.frame"
+      },
+      {
+        "from": "camera.frame",
+        "to": "pose_roi.frame"
+      },
+      {
+        "from": "person.objects",
+        "to": "pose_roi.objects"
+      },
+      {
+        "from": "pose_roi.regions",
+        "to": "pose.frame"
+      }
+    ]
+  }
+}

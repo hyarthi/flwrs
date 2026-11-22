@@ -15,7 +15,8 @@
 //!   into the temporary folder.
 //! - It writes `response.json`: `{"values": {field: value}, "files": {field:
 //!   "path in the folder"}, "warnings": [...], "errors": [...]}` and exits 0.
-//!   A file becomes a node upload; its field is set to the file's name.
+//!   A file becomes a node upload; its field is set to the file's name. A
+//!   list upload field takes a list of paths and is set to their names.
 //!
 //! The result is checked: only requested fields, files only for upload
 //! fields, and the merged launch args against the launch-args rules.
@@ -75,9 +76,28 @@ pub struct PluginRef {
 #[serde(deny_unknown_fields, default)]
 pub struct Response {
     pub values: Map<String, Value>,
-    pub files: BTreeMap<String, String>,
+    /// Field → the path of its file in the folder (a list for a list
+    /// upload field).
+    pub files: BTreeMap<String, OneOrMany<String>>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+}
+
+/// One value, or a list (a list upload field's files).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T> OneOrMany<T> {
+    fn into_parts(self) -> (bool, Vec<T>) {
+        match self {
+            OneOrMany::One(v) => (false, vec![v]),
+            OneOrMany::Many(vs) => (true, vs),
+        }
+    }
 }
 
 /// What to run, and on what.
@@ -151,7 +171,7 @@ pub struct RemoteFile {
 #[serde(deny_unknown_fields, default)]
 pub struct RemoteResponse {
     pub values: Map<String, Value>,
-    pub files: BTreeMap<String, RemoteFile>,
+    pub files: BTreeMap<String, OneOrMany<RemoteFile>>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
 }
@@ -176,7 +196,10 @@ pub fn remote_request(inv: &Invocation, send_secrets: bool) -> Result<RemoteRequ
             ConfigContent::Data(bytes) => bytes.clone(),
             ConfigContent::Upload(name) => {
                 let secret = inv.spec.fields().any(|f| {
-                    f.secret && f.upload && base.get(&f.name).and_then(Value::as_str) == Some(name)
+                    f.secret
+                        && base
+                            .get(&f.name)
+                            .is_some_and(|v| f.upload_names(v).contains(&name.as_str()))
                 });
                 if secret && !send_secrets {
                     continue;
@@ -228,27 +251,43 @@ pub fn remote_result(
         .map_err(|e| vec![format!("a temporary folder: {e}")])?;
     let mut files = BTreeMap::new();
     let mut problems = vec![];
-    for (field, file) in response.files {
-        if let Err(e) = check_file_name(&file.name) {
-            problems.push(format!("files.{field}: the name {:?}: {e}", file.name));
-            continue;
+    let mut folders = 0;
+    for (field, returned) in response.files {
+        let (list, returned) = returned.into_parts();
+        let mut paths = vec![];
+        for file in returned {
+            if let Err(e) = check_file_name(&file.name) {
+                problems.push(format!("files.{field}: the name {:?}: {e}", file.name));
+                continue;
+            }
+            // One folder per file, so two files may share a name (the check
+            // then says which).
+            let relative = format!("f{folders}/{}", file.name);
+            let folder = dir.path().join(format!("f{folders}"));
+            folders += 1;
+            if let Err(e) = std::fs::create_dir(&folder) {
+                problems.push(format!("files.{field}: {e}"));
+                continue;
+            }
+            if let Err(e) = download(
+                &file.url,
+                &folder.join(&file.name),
+                inv.limits.max_file_bytes,
+            ) {
+                problems.push(format!("files.{field}: downloading {}: {e}", file.url));
+                continue;
+            }
+            paths.push(relative);
         }
-        // One folder per field, so two fields' files may share a name.
-        let folder = dir.path().join(format!("f{}", files.len()));
-        if let Err(e) = std::fs::create_dir(&folder) {
-            problems.push(format!("files.{field}: {e}"));
-            continue;
-        }
-        if let Err(e) = download(
-            &file.url,
-            &folder.join(&file.name),
-            inv.limits.max_file_bytes,
-        ) {
-            problems.push(format!("files.{field}: downloading {}: {e}", file.url));
-            continue;
-        }
-        let relative = format!("f{}/{}", files.len(), file.name);
-        files.insert(field, relative);
+        let paths = if list {
+            OneOrMany::Many(paths)
+        } else {
+            match paths.pop() {
+                Some(p) => OneOrMany::One(p),
+                None => continue,
+            }
+        };
+        files.insert(field, paths);
     }
     if !problems.is_empty() {
         return Err(problems);
@@ -488,11 +527,10 @@ fn check(
         }
     }
     let mut files = vec![];
-    for (field, path) in response.files {
-        let upload = inv
-            .spec
-            .field(&field)
-            .is_some_and(|f| f.upload && f.via == Via::File);
+    for (field, paths) in response.files {
+        let spec_field = inv.spec.field(&field);
+        let upload = spec_field.is_some_and(|f| f.upload && f.via == Via::File);
+        let list_field = spec_field.is_some_and(|f| f.upload_list);
         if !fields.contains(&field) {
             problems.push(format!(
                 "the configurator returned a file for {field:?}, which isn't one of its fields"
@@ -509,24 +547,48 @@ fn check(
             problems.push(format!("{field:?} has both a value and a file"));
             continue;
         }
-        match returned_file(dir.path(), &path, inv.limits) {
-            Err(e) => problems.push(format!("files.{field}: {e}")),
-            Ok(full) => {
-                let name = full
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if let Err(e) = check_file_name(&name) {
-                    problems.push(format!("files.{field}: the name {name:?}: {e}"));
-                    continue;
+        let (list, paths) = paths.into_parts();
+        if list != list_field {
+            problems.push(if list_field {
+                format!("{field:?} is a list of files: return a list of paths")
+            } else {
+                format!("{field:?} is one file: return one path, not a list")
+            });
+            continue;
+        }
+        let mut names = vec![];
+        for path in paths {
+            match returned_file(dir.path(), &path, inv.limits) {
+                Err(e) => problems.push(format!("files.{field}: {e}")),
+                Ok(full) => {
+                    let name = full
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if let Err(e) = check_file_name(&name) {
+                        problems.push(format!("files.{field}: the name {name:?}: {e}"));
+                        continue;
+                    }
+                    if names.contains(&Value::String(name.clone())) {
+                        problems.push(format!("files.{field}: two files named {name:?}"));
+                        continue;
+                    }
+                    names.push(Value::String(name.clone()));
+                    files.push(ConfiguredFile {
+                        field: field.clone(),
+                        name,
+                        path: full,
+                    });
                 }
-                values.insert(field.clone(), Value::String(name.clone()));
-                files.push(ConfiguredFile {
-                    field,
-                    name,
-                    path: full,
-                });
             }
+        }
+        let value = if list {
+            Value::Array(names)
+        } else {
+            names.pop().unwrap_or(Value::Null)
+        };
+        if !value.is_null() {
+            values.insert(field, value);
         }
     }
     let mut launch_args = match base {
@@ -582,7 +644,7 @@ mod tests {
                 "manifest_version": 2, "id": "p", "name": "P", "version": "1.0.0", "type": "SOURCE",
                 "executable": "bin/run", "launch_args_schema": "schema/launch_args.json",
                 "payload_schemas": {"out": {"from_launch_args": "/out_schema"}},
-                "configurator": {"executable": "bin/configure", "fields": ["out_schema", "descriptor"]}
+                "configurator": {"executable": "bin/configure", "fields": ["out_schema", "descriptor", "protos"]}
             }))
             .unwrap();
             let schema = json!({
@@ -592,7 +654,9 @@ mod tests {
                     "token": {"type": "string", "writeOnly": true, "x-flwrs-launch": {"via": "env", "alias": "TOKEN"}},
                     "doc": {"type": "string", "x-flwrs-launch": {"via": "file", "source": "upload"}},
                     "out_schema": {"type": "object"},
-                    "descriptor": {"type": "string", "x-flwrs-launch": {"via": "file", "source": "upload"}}
+                    "descriptor": {"type": "string", "x-flwrs-launch": {"via": "file", "source": "upload"}},
+                    "protos": {"type": "array", "items": {"type": "string"},
+                               "x-flwrs-launch": {"via": "file", "source": "upload"}}
                 }
             });
             Self {
@@ -657,6 +721,35 @@ mod tests {
     }
 
     #[test]
+    fn a_list_field_gets_a_list_of_files() {
+        let f = Fixture::new(
+            r#"mkdir -p a b && printf 1 > a/one.proto && printf 2 > b/two.proto
+               echo '{"files": {"protos": ["a/one.proto", "b/two.proto"]}}' > response.json"#,
+        );
+        let c = f.run(json!({"spec": "x"})).unwrap();
+        assert_eq!(c.values["protos"], json!(["one.proto", "two.proto"]));
+        let names: Vec<_> = c
+            .files
+            .iter()
+            .map(|f| (f.field.as_str(), f.name.as_str()))
+            .collect();
+        assert_eq!(names, [("protos", "one.proto"), ("protos", "two.proto")]);
+        assert_eq!(c.launch_args["protos"], json!(["one.proto", "two.proto"]));
+        // The field's shape decides: a list for a list field, one path otherwise;
+        // names are unique.
+        let errors = |script: &str| Fixture::new(script).run(json!({"spec": "x"})).unwrap_err();
+        let e = errors(r#"printf 1 > a; echo '{"files": {"protos": "a"}}' > response.json"#);
+        assert!(e[0].contains("a list of files"), "{e:?}");
+        let e = errors(r#"printf 1 > a; echo '{"files": {"descriptor": ["a"]}}' > response.json"#);
+        assert!(e[0].contains("one file"), "{e:?}");
+        let e = errors(
+            r#"mkdir -p a b && printf 1 > a/x && printf 2 > b/x
+               echo '{"files": {"protos": ["a/x", "b/x"]}}' > response.json"#,
+        );
+        assert!(e[0].contains("two files named"), "{e:?}");
+    }
+
+    #[test]
     fn failures_and_wrong_answers_are_refused() {
         let errors = |script: &str| Fixture::new(script).run(json!({"spec": "x"})).unwrap_err();
         let e = errors(r#"echo '{"errors": ["the spec has no paths"]}' > response.json; exit 1"#);
@@ -706,7 +799,7 @@ mod tests {
             .decode(&request.files["doc.yaml"])
             .unwrap();
         assert_eq!(doc, b"openapi: 3.1.0");
-        assert_eq!(request.fields, ["out_schema", "descriptor"]);
+        assert_eq!(request.fields, ["out_schema", "descriptor", "protos"]);
         // Opted in: the secret goes too.
         assert_eq!(
             remote_request(&inv, true).unwrap().launch_args["token"],

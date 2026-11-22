@@ -9,7 +9,8 @@
 //! - `writeOnly: true` on a top-level property: a secret (delivered by `env`
 //!   or `file`, never on the command line).
 //! - `x-flwrs-launch` on a top-level property: `{"via": "arg" | "env" | "file",
-//!   "alias"?, "file_name"?, "source"?: "upload"}`.
+//!   "alias"?, "file_name"?, "source"?: "upload"}`. An upload field is a
+//!   string (one file's name) or an array of strings (a list of files).
 //! - `x-flwrs-code` on a string property: `{"language", "params", "definitions"?, "signature"?}`.
 //! - UI hints: `x-flwrs-group`, `x-flwrs-order`, `x-flwrs-advanced`, `x-flwrs-widget`.
 //! - `x-flwrs-template` on a property: a file in the package that an editor
@@ -111,10 +112,26 @@ pub struct LaunchField {
     pub target: String,
     /// The name in `config/` (`File`, not for uploads).
     pub file_name: Option<String>,
-    /// The value names a file uploaded to the node (`File`).
+    /// The value names a file uploaded to the node (`File`): a string, or
+    /// with `upload_list` an array of names.
     pub upload: bool,
+    /// An upload field holding a list of names (`"type": "array"` of strings).
+    pub upload_list: bool,
     /// `writeOnly: true`.
     pub secret: bool,
+}
+
+impl LaunchField {
+    /// The upload names `value` holds (an upload field's value; nothing for
+    /// other fields, or values of the wrong shape).
+    pub fn upload_names<'v>(&self, value: &'v Value) -> Vec<&'v str> {
+        match value {
+            _ if !self.upload => vec![],
+            Value::String(name) => vec![name.as_str()],
+            Value::Array(names) => names.iter().filter_map(Value::as_str).collect(),
+            _ => vec![],
+        }
+    }
 }
 
 /// A code field (`x-flwrs-code`).
@@ -461,7 +478,7 @@ impl LaunchSpec {
         for f in &plan.files {
             if !names.insert(f.name.as_str()) {
                 errors.push(format!(
-                    "two launch_args fields deliver a file named {:?} in config/",
+                    "launch_args deliver two files named {:?} in config/",
                     f.name
                 ));
             }
@@ -875,9 +892,10 @@ fn field(name: &str, prop: &Value) -> Result<LaunchField, Vec<String>> {
             false
         }
     };
-    if upload && (via != Via::File || structured) {
+    let upload_list = upload && types == ["array"] && string_items(prop);
+    if upload && (via != Via::File || (structured && !upload_list)) {
         errors.push(format!(
-            "{at}: \"source\": \"upload\" needs \"via\": \"file\" and a string property (the upload's name)"
+            "{at}: \"source\": \"upload\" needs \"via\": \"file\" and a string property (the upload's name) or an array of strings (a list of uploads)"
         ));
     }
     let alias = match launch.get("alias") {
@@ -927,11 +945,19 @@ fn field(name: &str, prop: &Value) -> Result<LaunchField, Vec<String>> {
             target,
             file_name,
             upload,
+            upload_list,
             secret,
         })
     } else {
         Err(errors)
     }
+}
+
+/// An array property whose items are strings.
+fn string_items(prop: &Map<String, Value>) -> bool {
+    prop.get("items")
+        .and_then(Value::as_object)
+        .is_some_and(|items| types(items) == ["string"])
 }
 
 /// A field the schema doesn't declare (when it allows extra properties):
@@ -946,6 +972,7 @@ fn undeclared(key: &str, value: &Value) -> Result<LaunchField, String> {
         target: flag,
         file_name: structured.then(|| format!("{key}.json")),
         upload: false,
+        upload_list: false,
         secret: false,
     })
 }
@@ -999,14 +1026,37 @@ fn deliver(
             let t = text(value).ok_or("objects and arrays can only be delivered as files")?;
             plan.env.push((field.target.clone(), t));
         }
-        Via::File => {
-            let (name, content) = if field.upload {
-                let name = value
-                    .as_str()
-                    .ok_or("must be the name of a file uploaded to the node")?;
+        Via::File if field.upload => {
+            // Each upload is linked into config/ by its name; the plugin gets
+            // the flag once per file (none for an empty list).
+            let names: Vec<&str> = match value {
+                Value::String(name) if !field.upload_list => vec![name],
+                Value::Array(names) if field.upload_list => names
+                    .iter()
+                    .map(|n| {
+                        n.as_str()
+                            .ok_or("must be a list of names of files uploaded to the node")
+                    })
+                    .collect::<Result<_, _>>()?,
+                _ if field.upload_list => {
+                    return Err("must be a list of names of files uploaded to the node".into());
+                }
+                _ => return Err("must be the name of a file uploaded to the node".into()),
+            };
+            for name in names {
                 check_file_name(name).map_err(|e| format!("upload name {name:?}: {e}"))?;
-                (name.to_string(), ConfigContent::Upload(name.to_string()))
-            } else {
+                plan.argv.extend([
+                    flag.clone(),
+                    config_dir.join(name).to_string_lossy().into_owned(),
+                ]);
+                plan.files.push(ConfigFile {
+                    name: name.to_string(),
+                    content: ConfigContent::Upload(name.to_string()),
+                });
+            }
+        }
+        Via::File => {
+            let (name, content) = {
                 let bytes = match value {
                     Value::Object(_) | Value::Array(_) => {
                         let mut json =
@@ -1458,6 +1508,84 @@ mod tests {
         assert!(errors[0].contains("REGION"), "{errors:?}");
         // a long value in a file is fine
         assert!(spec.check(&json!({"script": long})).is_empty());
+    }
+
+    #[test]
+    fn plans_a_list_of_uploads() {
+        let schema = json!({"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+            "models": {"type": "array", "items": {"type": "string"},
+                       "x-flwrs-launch": {"via": "file", "source": "upload", "alias": "model"}},
+            "ca": {"type": "string", "x-flwrs-launch": {"via": "file", "source": "upload"}}
+        }});
+        let (spec, report) = LaunchSpec::new(&manifest(2), Some(&schema));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let models = spec.field("models").unwrap();
+        assert!(models.upload && models.upload_list);
+        assert_eq!(
+            models.upload_names(&json!(["a.onnx", "b.onnx"])),
+            ["a.onnx", "b.onnx"]
+        );
+        let p = |name: &str| {
+            Path::new("/n/config")
+                .join(name)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let plan = spec
+            .plan(
+                &json!({"models": ["a.onnx", "b.onnx"]}),
+                Path::new("/n/config"),
+            )
+            .unwrap();
+        assert_eq!(
+            plan.argv,
+            [
+                "--model".to_string(),
+                p("a.onnx"),
+                "--model".into(),
+                p("b.onnx")
+            ]
+        );
+        assert_eq!(
+            plan.files,
+            [
+                ConfigFile {
+                    name: "a.onnx".into(),
+                    content: ConfigContent::Upload("a.onnx".into())
+                },
+                ConfigFile {
+                    name: "b.onnx".into(),
+                    content: ConfigContent::Upload("b.onnx".into())
+                }
+            ]
+        );
+        // An empty list delivers nothing.
+        let plan = spec
+            .plan(&json!({"models": []}), Path::new("/n/config"))
+            .unwrap();
+        assert!(plan.argv.is_empty() && plan.files.is_empty());
+        // The same name twice, in the list or with another field; bad shapes.
+        let config = Path::new("/n/config");
+        let twice = spec.plan(&json!({"models": ["a.pem", "a.pem"]}), config);
+        assert!(twice.unwrap_err()[0].contains("two files named \"a.pem\""));
+        let shared = spec.plan(&json!({"models": ["a.pem"], "ca": "a.pem"}), config);
+        assert!(shared.unwrap_err()[0].contains("two files named"));
+        assert!(spec.plan(&json!({"models": "a.onnx"}), config).is_err());
+        assert!(spec.plan(&json!({"models": ["../x"]}), config).is_err());
+        assert!(spec.plan(&json!({"ca": ["a.pem"]}), config).is_err());
+        // Only strings: an array of objects can't be uploads.
+        let bad = json!({"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+            "models": {"type": "array", "items": {"type": "object"},
+                       "x-flwrs-launch": {"via": "file", "source": "upload"}}
+        }});
+        let (_, report) = LaunchSpec::new(&manifest(2), Some(&bad));
+        assert!(
+            report.errors[0].contains("an array of strings"),
+            "{:?}",
+            report.errors
+        );
     }
 
     #[test]

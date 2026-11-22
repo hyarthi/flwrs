@@ -35,7 +35,7 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 | `app/` | `flwrs-app` | The flwrs server, and its web UI (`app/web/`: Svelte + Vite, built and embedded by the server's build). |
 | `plugin/` | `flwrs-plugin` | Plugin protocol definition (`schema/*.proto`) and the reference Rust SDK: wire framing, `Source`/`Transform`/`Sink` traits and runners. |
 | `types/` | `flwrs-types` | Types shared by the server and plugins: the typed value tree, dot paths and the Lua sandbox (unpublished). |
-| `plugins/` | — | Base plugin library. Currently `http_sink`, `ticker`, `script_transform`, `accumulator`, `mqtt_sink`, `mqtt_source`, `ws_sink`, `http_source`, `ws_source`, `http_push_sink` and `ws_push_sink` (Rust), and `kit` (code they share: the HTTP server core, the push sinks' broadcast core). Plugins in other languages can live here too. |
+| `plugins/` | — | Base plugin library. Currently `http_sink`, `ticker`, `script_transform`, `accumulator`, `mqtt_sink`, `mqtt_source`, `ws_sink`, `http_source`, `ws_source`, `http_push_sink`, `ws_push_sink` and an early `cv_source` (Rust), and `kit` (code they share: the HTTP server core, the push sinks' broadcast core). Plugins in other languages can live here too. |
 | `e2e/` | `flwrs-e2e` | End-to-end tests: the real server and plugin packages built from the workspace, installed and wired through the REST API, with real clients (HTTP → MQTT → SSE). |
 | `examples/plugins/` | — | Minimal, unsupported demo plugins (HTTP sinks in Python, Go, TypeScript and Java). |
 | `trellis/` | `flwrs-trellis` | Developer toolkit for plugins (any language): `package`, `audit` (protocol conformance), `test`, `bench`. `cargo trellis <command>` in this repo. |

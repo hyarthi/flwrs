@@ -1,0 +1,3 @@
+# flwrs-trellis settings (cargo trellis audit plugins/cv_source)
+[audit]
+launch_args = "tests/trellis/minimal.json"

@@ -1,0 +1,34 @@
+{
+  "description": "pose / multi-person one-stage (6)",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "pose": {
+        "kind": "model",
+        "model": "movenet_multi.onnx",
+        "pre": {
+          "width": 256,
+          "height": 256,
+          "resize": "letterbox",
+          "color": "rgb",
+          "dtype": "i32",
+          "layout": "nhwc"
+        },
+        "decode": {
+          "type": "movenet",
+          "output": "output_0",
+          "multi": true
+        },
+        "min_confidence": 0.2
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "pose.frame"
+      }
+    ]
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "description": "pose / multi-person one-stage",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "kind": "source"
+      },
+      "pose": {
+        "kind": "model",
+        "model": "rtmo_s.onnx",
+        "pre": {
+          "width": 640,
+          "height": 640,
+          "resize": "letterbox",
+          "pad": 114,
+          "color": "rgb",
+          "dtype": "f32",
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "rtmo",
+          "dets": "dets",
+          "keypoints": "keypoints"
+        },
+        "min_confidence": 0.3
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "pose.frame"
+      }
+    ]
+  }
+}
