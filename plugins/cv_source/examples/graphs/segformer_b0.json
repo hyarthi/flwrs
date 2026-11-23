@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "seg": {
-        "kind": "model",
+        "type": "model",
         "model": "segformer_b0.onnx",
         "pre": {
           "width": 512,

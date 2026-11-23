@@ -29,3 +29,9 @@ flwrs-trellis.workspace = true # tests/trellis.rs: audit and behaviour tests
 jsonschema.workspace = true
 tempfile.workspace = true
 futures-util.workspace = true
+
+[[test]]
+name = "bench"
+path = "tests/bench.rs"
+# On request only: cargo test -p flwrs-ws-sink --release --test bench -- --ignored --nocapture
+test = false

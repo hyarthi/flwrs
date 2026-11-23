@@ -17,6 +17,7 @@ path = "src/main.rs"
 [[bin]]
 name = "flwrs-ws-source-config"
 path = "src/bin/config.rs"
+test = false # no unit tests of its own
 
 [dependencies]
 flwrs-plugin = { workspace = true, features = ["cli", "tls"] }
@@ -44,3 +45,13 @@ flwrs-trellis.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 tempfile.workspace = true
+
+[lib]
+# No doc examples to run: rustdoc would still take seconds per crate.
+doctest = false
+
+[[test]]
+name = "bench"
+path = "tests/bench.rs"
+# On request only: cargo test -p flwrs-ws-source --release --test bench -- --ignored --nocapture
+test = false

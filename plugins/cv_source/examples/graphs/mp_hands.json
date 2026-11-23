@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "palm": {
-        "kind": "model",
+        "type": "model",
         "model": "mp_palm.onnx",
         "pre": {
           "width": 192,
@@ -36,7 +36,7 @@
         ]
       },
       "hand": {
-        "kind": "model",
+        "type": "model",
         "model": "mp_hand.onnx",
         "pre": {
           "width": 224,
@@ -56,7 +56,7 @@
         }
       },
       "hand_roi": {
-        "kind": "crop",
+        "type": "crop",
         "rotate": {
           "from": 0,
           "to": 2,

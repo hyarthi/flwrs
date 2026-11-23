@@ -1,1 +1,1 @@
-{ "graph": { "nodes": { "camera": { "kind": "source" } } } }
+{ "graph": { "nodes": { "camera": { "type": "source" } } } }

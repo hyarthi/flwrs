@@ -1,6 +1,6 @@
 # cargo-nextest (https://nexte.st): runs every test as its own process, across
-# all test binaries at once. `cargo nextest run --workspace`; doctests aren't
-# covered: `cargo test --workspace --doc` runs them.
+# all test binaries at once. `cargo nextest run --workspace`. Benchmarks and
+# the real-model check are `test = false` targets, built and run on request.
 
 [profile.default]
 # No retries: a flaky test should show as one, not pass on a second try.

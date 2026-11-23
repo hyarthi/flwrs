@@ -3,7 +3,7 @@
 //! its own check of `runtime_defaults` against its runtime settings.
 
 pub(crate) use flwrs_plugin::package::{
-    LaunchSpec, Manifest, PluginType, current_platform, is_valid_id, validate_launch_args,
+    LaunchSpec, Manifest, PluginType, current_platform, off_platform_values, is_valid_id, validate_launch_args,
 };
 
 /// The server's extra manifest check (`package::ExtraCheck`): `runtime_defaults`

@@ -16,6 +16,8 @@ pub struct Keypoint {
 /// A detected object.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Object {
+    /// Its track, from a tracker node (`None`: not tracked, or not confirmed).
+    pub tracker_id: Option<u64>,
     pub class_id: u32,
     /// From the model's labels, if it has them.
     pub class_name: Option<String>,
@@ -102,7 +104,9 @@ impl Results {
             PortType::Text => Results::Text(None),
             PortType::Vector => Results::Vector(vec![]),
             PortType::Tensor => Results::Tensor(vec![]),
-            PortType::Objects | PortType::Frame | PortType::Regions => Results::Objects(vec![]),
+            PortType::Objects | PortType::Frame | PortType::Regions | PortType::Events => {
+                Results::Objects(vec![])
+            }
         }
     }
 

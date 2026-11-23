@@ -8,3 +8,15 @@ trellis = "run --quiet --package flwrs-trellis --"
 # crates turn on extras in shared dependencies), and in one folder each would
 # rebuild flwrs-plugin and everything above it after the other.
 dev = "run --bin flwrs-app --target-dir target/dev -- --config config.dev.toml"
+
+# The vision source's debug mode with its window, optimised, in its own target
+# folder: `cargo cv-debug --settings node.json --files models/ --camera`.
+cv-debug = "run --package flwrs-cv-source --bin flwrs-cv-source --release --features debug-window --target-dir target/cv-debug -- debug"
+
+# On macOS, debug info otherwise stays in object files beside the binaries:
+# they pile up in target/debug/deps (hundreds of thousands), and the OS's check
+# of a new executable takes time proportional to the files in its folder
+# (0.3 s in an empty one, 30 s among 640 000). Packed debug info (.dSYM) leaves
+# none. Targets that don't support a value ignore it.
+[profile.dev]
+split-debuginfo = "packed"

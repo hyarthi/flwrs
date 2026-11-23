@@ -15,7 +15,7 @@ pub mod manifest;
 pub use archive::{ExtraCheck, Limits, Package, PackageError, extract_and_validate, validate};
 pub use launch::{
     CONFIG_DIR, CodeField, ConfigContent, ConfigFile, LaunchField, LaunchPlan, LaunchSpec,
-    ListenField, SchemaReport, Via, validate_launch_args,
+    ListenField, SchemaReport, Via, off_platform_values, validate_launch_args,
 };
 pub use manifest::{
     Configurator, FromLaunchArgs, LaunchArgsStyle, MANIFEST_FILE, MANIFEST_VERSION, Manifest,

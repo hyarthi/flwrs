@@ -2,7 +2,7 @@
 //! pairs a skeleton joins.
 
 /// A layout: point names (by index) and skeleton edges.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeypointLayout {
     pub name: &'static str,
     pub points: Vec<String>,

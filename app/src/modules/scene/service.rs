@@ -739,6 +739,9 @@ impl Service {
             }
             // Uploaded files its launch args name (a local node gets them).
             if node.config.launch == crate::modules::node_config::LaunchMode::Local {
+                for warning in rules.off_platform(&node.config.launch_args) {
+                    check.warnings.push(format!("{label}: {warning}"));
+                }
                 let uploads = query_sqlite::list_uploads(conn, store, &node.id).await?;
                 for (field, name, _) in rules.uploads_referenced(&node.config.launch_args) {
                     if !uploads.iter().any(|u| u.name == name) {

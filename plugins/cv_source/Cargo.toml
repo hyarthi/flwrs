@@ -13,6 +13,8 @@ workspace = true
 # The engine (graph, pre-processing, decoders) is a library too, so a
 # transform-style ML plugin can reuse it later.
 [lib]
+# No doc examples to run: rustdoc would still take seconds per crate.
+doctest = false
 name = "flwrs_cv_source"
 path = "src/lib.rs"
 
@@ -21,13 +23,20 @@ name = "flwrs-cv-source"
 path = "src/main.rs"
 
 [features]
-default = ["ort"]
+default = ["ort", "camera-nokhwa", "lua"]
 # Inference runtimes (at least one).
 ort = ["dep:ort"]
 tract = ["dep:tract-onnx"]
+# macOS: nokhwa as the fallback camera backend.
+camera-nokhwa = ["dep:nokhwa"]
+# Lua rule nodes (vendored Lua 5.4).
+lua = ["dep:flwrs-types", "flwrs-types/lua"]
+# The debug mode's window (without it, the debug mode prints to the console).
+debug-window = ["dep:winit", "dep:softbuffer"]
 
 [dependencies]
 flwrs-plugin = { workspace = true, features = ["cli", "tls"] } # TLS for remote use
+flwrs-types = { workspace = true, optional = true }
 tokio.workspace = true
 clap.workspace = true
 log.workspace = true
@@ -36,10 +45,38 @@ serde_json.workspace = true
 thiserror.workspace = true
 ort = { workspace = true, optional = true }
 tract-onnx = { workspace = true, optional = true }
+image.workspace = true # still images (PNG; a folder input)
+zune-jpeg.workspace = true
+zune-core.workspace = true
+yuvutils-rs.workspace = true
+winit = { workspace = true, optional = true }
+softbuffer = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nokhwa = { workspace = true, optional = true }
+objc2.workspace = true
+block2.workspace = true
+dispatch2.workspace = true
+objc2-foundation.workspace = true
+objc2-av-foundation.workspace = true
+objc2-core-media.workspace = true
+objc2-core-video.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+windows-core.workspace = true
 
 [dev-dependencies]
 jsonschema.workspace = true # the launch-args schema against the CLI and the examples
 flwrs-plugin = { workspace = true, features = ["package"] }
 flwrs-trellis.workspace = true # tests/trellis.rs: audit
-image.workspace = true # real-model checks: test images
 tempfile.workspace = true
+
+[[test]]
+name = "real_models"
+path = "tests/real_models.rs"
+# On request only: cargo test -p flwrs-cv-source --release --test real_models -- --ignored --nocapture
+test = false

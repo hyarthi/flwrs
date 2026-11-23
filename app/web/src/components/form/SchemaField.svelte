@@ -15,7 +15,8 @@
   import CodeEditor from './CodeEditor.svelte';
   import ObjectList from './ObjectList.svelte';
   import type { Scope } from '../../lib/lua/types';
-  import { constraintHint, kindOf, labelOf, resolve, sameJson, typeOf, type Json, type Schema } from '../../lib/schemaForm';
+  import { getContext } from 'svelte';
+  import { PLATFORM_CONTEXT, appliesOn, constraintHint, kindOf, labelOf, resolve, sameJson, typeOf, variantsOf, type Json, type Schema } from '../../lib/schemaForm';
 
   let {
     root,
@@ -45,7 +46,10 @@
     templateOf?: (schema: Schema) => string | undefined;
   } = $props();
 
+  const platformOf = getContext<(() => string | null) | undefined>(PLATFORM_CONTEXT);
   const kind = $derived(kindOf(schema));
+  /** A `oneOf` told apart by a `const` field: a choice, then its fields. */
+  const variants = $derived(variantsOf(root, schema));
   const hint = $derived(constraintHint(schema));
   // What leaving the field empty means: the default's actual value, in the
   // placeholder (inputs), the label (checkboxes), the first option (lists of
@@ -114,6 +118,16 @@
   });
   /** An object's properties in their declared order, where the schema gives it. */
   const childKeys = $derived((schema['x-order'] as string[] | undefined) ?? Object.keys(schema.properties ?? {}));
+  const chosen = $derived(
+    variants?.options.find((o) => o.value === object[variants.tag]) ?? null,
+  );
+  /** Whether to show a child: it applies here, or already has a value to clear. */
+  function shows(key: string, child: Schema) {
+    return object[key] !== undefined || appliesOn(child, platformOf?.() ?? null);
+  }
+  function offPlatform(child: Schema) {
+    return appliesOn(child, platformOf?.() ?? null) ? null : `Only used on ${child['x-flwrs-platforms']!.join(', ')}.`;
+  }
   const multiline = $derived(
     !!schema.contentMediaType ||
       (schema.maxLength ?? 0) > 200 ||
@@ -208,29 +222,59 @@
   {/if}
 {/snippet}
 
-{#if objectItems}
-  <ObjectList {root} items={objectItems} {value} {label} description={schema.description} {required} {disabled} {onchange} tools={templateButton} />
-{:else if kind === 'object'}
-  <fieldset class="group" {disabled}>
-    <legend>{label}{required ? ' *' : ''} {@render templateButton()}</legend>
-    {#if schema.description}<p class="hint">{schema.description}</p>{/if}
-    {#each childKeys as key (key)}
+{#snippet children(of: Schema, keys: string[], skip: string | null)}
+  {#each keys.filter((k) => k !== skip) as key (key)}
+    {@const child = resolve(root, (of.properties ?? {})[key] ?? {})}
+    {#if shows(key, child)}
       <SchemaField
         {root}
-        schema={resolve(root, (schema.properties ?? {})[key] ?? {})}
+        schema={child}
         name={key}
         value={object[key]}
-        required={schema.required?.includes(key)}
+        required={of.required?.includes(key)}
         {disabled}
         errors={errors.filter((e) => e.includes(`/${key}`))}
         {codeScope}
         {templateOf}
         onchange={(v) => setChild(key, v)}
       />
-    {/each}
-    {#each errors.filter((e) => !Object.keys(schema.properties ?? {}).some((k) => e.includes(`/${k}`))) as e, i (i)}
-      <p class="error">{e}</p>
-    {/each}
+      {#if offPlatform(child)}<p class="hint">{offPlatform(child)}</p>{/if}
+    {/if}
+  {/each}
+  {#each errors.filter((e) => !Object.keys(of.properties ?? {}).some((k) => e.includes(`/${k}`))) as e, i (i)}
+    <p class="error">{e}</p>
+  {/each}
+{/snippet}
+
+{#if variants}
+  <fieldset class="group" {disabled}>
+    <legend>{label}{required ? ' *' : ''}</legend>
+    {#if schema.description}<p class="hint">{schema.description}</p>{/if}
+    <div class="field">
+      <label for={id}>Type</label>
+      <select {id} class="input" {disabled} value={chosen?.value ?? ''} onchange={(e) => {
+        const picked = e.currentTarget.value;
+        onchange(picked === '' ? undefined : { [variants.tag]: picked });
+      }}>
+        {#if !required || !chosen}<option value="">—</option>{/if}
+        {#each variants.options as option (option.value)}
+          <option value={option.value}>{option.label}</option>
+        {/each}
+      </select>
+    </div>
+    {#if chosen}
+      {@render children(chosen.schema, Object.keys(chosen.schema.properties ?? {}), variants.tag)}
+    {:else}
+      {#each errors as e, i (i)}<p class="error">{e}</p>{/each}
+    {/if}
+  </fieldset>
+{:else if objectItems}
+  <ObjectList {root} items={objectItems} {value} {label} description={schema.description} {required} {disabled} {onchange} tools={templateButton} />
+{:else if kind === 'object'}
+  <fieldset class="group" {disabled}>
+    <legend>{label}{required ? ' *' : ''} {@render templateButton()}</legend>
+    {#if schema.description}<p class="hint">{schema.description}</p>{/if}
+    {@render children(schema, childKeys, null)}
   </fieldset>
 {:else if kind === 'boolean'}
   <div class="field">

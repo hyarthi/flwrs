@@ -32,3 +32,13 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 flwrs-plugin = { workspace = true, features = ["cli", "tls", "package"] }
 flwrs-trellis.workspace = true
+
+[lib]
+# No doc examples to run: rustdoc would still take seconds per crate.
+doctest = false
+
+[[test]]
+name = "bench"
+path = "tests/bench.rs"
+# On request only: cargo test -p flwrs-http-push-sink --release --test bench -- --ignored --nocapture
+test = false

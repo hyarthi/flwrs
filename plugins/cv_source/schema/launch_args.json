@@ -30,6 +30,15 @@
               },
               {
                 "$ref": "#/$defs/filter"
+              },
+              {
+                "$ref": "#/$defs/tracker"
+              },
+              {
+                "$ref": "#/$defs/rule"
+              },
+              {
+                "$ref": "#/$defs/lua"
               }
             ]
           }
@@ -60,12 +69,22 @@
         "nodes"
       ],
       "title": "Model graph",
-      "description": "The models and how they link: nodes (source, model, crop, filter) with typed ports, and links from an output to an input (<node>.<port>). A crop node's regions linked to a model's frame run the model once per region.",
+      "description": "The models and how they link: nodes (source, model, crop, filter, tracker, rule, lua) with typed ports, and links from an output to an input (<node>.<port>). A crop node's regions linked to a model's frame run the model once per region.",
       "x-flwrs-launch": {
         "via": "file",
         "file_name": "graph.json"
       },
       "x-flwrs-order": 1
+    },
+    "input": {
+      "title": "Input",
+      "description": "Where frames come from: a camera (built-in, USB, CSI, virtual), a folder of images, or an MJPEG file. Left out: the plugin loads its graph and reads no frames.",
+      "$ref": "#/$defs/input",
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "input.json"
+      },
+      "x-flwrs-order": 2
     },
     "files": {
       "title": "Files",
@@ -80,7 +99,7 @@
         "source": "upload",
         "alias": "file"
       },
-      "x-flwrs-order": 2
+      "x-flwrs-order": 3
     },
     "execution": {
       "title": "Execution",
@@ -90,7 +109,7 @@
         "via": "file",
         "file_name": "execution.json"
       },
-      "x-flwrs-order": 3,
+      "x-flwrs-order": 4,
       "x-flwrs-advanced": true
     },
     "out_schema": {
@@ -101,7 +120,7 @@
         "via": "file",
         "file_name": "out_schema.json"
       },
-      "x-flwrs-order": 4,
+      "x-flwrs-order": 5,
       "x-flwrs-advanced": true
     }
   },
@@ -646,19 +665,19 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "kind": {
+        "type": {
           "const": "source"
         }
       },
       "required": [
-        "kind"
+        "type"
       ]
     },
     "model": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "kind": {
+        "type": {
           "const": "model"
         },
         "model": {
@@ -851,7 +870,7 @@
         }
       },
       "required": [
-        "kind",
+        "type",
         "model",
         "decode"
       ]
@@ -860,7 +879,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "kind": {
+        "type": {
           "const": "crop"
         },
         "classes": {
@@ -934,14 +953,14 @@
         }
       },
       "required": [
-        "kind"
+        "type"
       ]
     },
     "filter": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "kind": {
+        "type": {
           "const": "filter"
         },
         "classes": {
@@ -969,7 +988,7 @@
         }
       },
       "required": [
-        "kind"
+        "type"
       ]
     },
     "execution": {
@@ -985,7 +1004,7 @@
           ]
         },
         "device": {
-          "description": "The kind of device: cpu (default), gpu or npu (a neural engine). Nodes a device's provider can't take run on the CPU.",
+          "description": "The type of device: cpu (default), gpu or npu (a neural engine). Nodes a device's provider can't take run on the CPU.",
           "enum": [
             "cpu",
             "gpu",
@@ -1009,6 +1028,550 @@
           "type": "boolean"
         }
       }
+    },
+    "input": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "title": "Camera",
+          "properties": {
+            "type": {
+              "const": "camera"
+            },
+            "device": {
+              "type": "string",
+              "description": "An index, a device id or path, or part of the camera's name. Left out: the first camera"
+            },
+            "width": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "fps": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
+            },
+            "format": {
+              "enum": [
+                "auto",
+                "mjpeg",
+                "yuyv",
+                "uyvy",
+                "nv12"
+              ],
+              "default": "auto",
+              "description": "The pixel format asked of the camera"
+            },
+            "backend": {
+              "enum": [
+                "auto",
+                "native",
+                "nokhwa"
+              ],
+              "default": "auto",
+              "description": "Capture code. auto: AVFoundation, then nokhwa if that fails.",
+              "x-flwrs-advanced": true,
+              "x-flwrs-platforms": [
+                "macos"
+              ]
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "title": "Image folder",
+          "properties": {
+            "type": {
+              "const": "images"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A node file's name, or a path on this machine"
+            },
+            "fps": {
+              "type": "number",
+              "minimum": 0.1,
+              "maximum": 1000,
+              "description": "Frames per second. Left out: every frame, none dropped"
+            },
+            "loop": {
+              "type": "boolean",
+              "default": false,
+              "description": "Start over at the end"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "title": "MJPEG file",
+          "properties": {
+            "type": {
+              "const": "mjpeg"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A node file's name, or a path on this machine"
+            },
+            "fps": {
+              "type": "number",
+              "minimum": 0.1,
+              "maximum": 1000,
+              "description": "Frames per second. Left out: every frame, none dropped"
+            },
+            "loop": {
+              "type": "boolean",
+              "default": false,
+              "description": "Start over at the end"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        }
+      ]
+    },
+    "tracker": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "tracker"
+        },
+        "high_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.5
+        },
+        "low_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.1
+        },
+        "new_track_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.6
+        },
+        "min_iou": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.2
+        },
+        "min_iou_low": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.5
+        },
+        "min_hits": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        },
+        "max_lost_s": {
+          "type": "number",
+          "minimum": 0,
+          "default": 1.0
+        },
+        "class_aware": {
+          "type": "boolean",
+          "default": true
+        },
+        "smooth_keypoints": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "min_cutoff": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "default": 1.5
+            },
+            "beta": {
+              "type": "number",
+              "minimum": 0,
+              "default": 0.02
+            }
+          }
+        },
+        "control": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Run the detector on control frames only: the tracker carries the objects over the next tracker_frames, and models on tracked regions run on every frame",
+          "properties": {
+            "tracker_frames": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 300,
+              "default": 5
+            },
+            "background": {
+              "type": "boolean",
+              "default": true,
+              "description": "Run the detector on its own thread"
+            },
+            "min_visible": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.5,
+              "description": "The share of a pose's keypoints that must be visible for it to steer the box"
+            },
+            "max_missed": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 3,
+              "description": "Control frames in a row that may miss a track before it ends"
+            },
+            "box_smoothing": {
+              "type": "number",
+              "minimum": 1,
+              "default": 3.0,
+              "description": "How gently a detection corrects the box: 1 follows it closely, higher keeps the bounds steadier"
+            }
+          }
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "rule"
+        },
+        "name": {
+          "type": "string"
+        },
+        "rule": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "const": "line_crossing"
+                },
+                "line": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "minItems": 2,
+                    "maxItems": 2
+                  },
+                  "minItems": 2,
+                  "description": "Points in normalised frame coordinates (0..1, y down)"
+                },
+                "direction": {
+                  "enum": [
+                    "both",
+                    "in",
+                    "out"
+                  ],
+                  "default": "both"
+                }
+              },
+              "required": [
+                "type",
+                "line"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "const": "zone"
+                },
+                "zone": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "minItems": 2,
+                    "maxItems": 2
+                  },
+                  "minItems": 3,
+                  "description": "Points in normalised frame coordinates (0..1, y down)"
+                },
+                "on": {
+                  "enum": [
+                    "both",
+                    "enter",
+                    "exit"
+                  ],
+                  "default": "both"
+                }
+              },
+              "required": [
+                "type",
+                "zone"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "const": "loitering"
+                },
+                "zone": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "minItems": 2,
+                    "maxItems": 2
+                  },
+                  "minItems": 3,
+                  "description": "Points in normalised frame coordinates (0..1, y down)"
+                },
+                "seconds": {
+                  "type": "number",
+                  "exclusiveMinimum": 0
+                }
+              },
+              "required": [
+                "type",
+                "zone",
+                "seconds"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "const": "counting"
+                },
+                "zone": {
+                  "type": "array",
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "number",
+                      "minimum": 0,
+                      "maximum": 1
+                    },
+                    "minItems": 2,
+                    "maxItems": 2
+                  },
+                  "minItems": 3,
+                  "description": "Points in normalised frame coordinates (0..1, y down)"
+                },
+                "above": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "below": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "const": "track"
+                },
+                "on": {
+                  "enum": [
+                    "both",
+                    "started",
+                    "ended"
+                  ],
+                  "default": "both"
+                },
+                "min_age_s": {
+                  "type": "number",
+                  "minimum": 0,
+                  "default": 0
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "const": "label_changed"
+                },
+                "from": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "const": "score_above"
+                },
+                "threshold": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "from": {
+                  "type": "string"
+                },
+                "class": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    {
+                      "type": "string"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "type",
+                "threshold"
+              ]
+            }
+          ]
+        },
+        "input": {
+          "enum": [
+            "objects",
+            "classes"
+          ],
+          "default": "objects"
+        },
+        "classes": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "anchor": {
+          "enum": [
+            "bottom_center",
+            "center",
+            "top_center"
+          ],
+          "default": "bottom_center"
+        },
+        "debounce_s": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "cooldown_s": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        },
+        "hysteresis": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0
+        }
+      },
+      "required": [
+        "type",
+        "rule"
+      ]
+    },
+    "lua": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "lua"
+        },
+        "name": {
+          "type": "string"
+        },
+        "script": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Body of function(frame, objects, tracks, state): returns nothing, an event, or a list of events"
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_instructions": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_memory_bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      },
+      "required": [
+        "type",
+        "script"
+      ]
     }
   }
 }

@@ -114,6 +114,7 @@ mod tests {
 
     fn obj(class_id: u32, confidence: f32, bbox: [f32; 4], kps: &[(f32, f32)]) -> Object {
         Object {
+            tracker_id: None,
             class_id,
             class_name: Some(["person", "dog"][class_id as usize % 2].into()),
             confidence,

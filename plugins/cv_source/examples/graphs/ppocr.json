@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "text": {
-        "kind": "model",
+        "type": "model",
         "model": "ppocr_det.onnx",
         "pre": {
           "width": 640,
@@ -35,7 +35,7 @@
         }
       },
       "read": {
-        "kind": "model",
+        "type": "model",
         "model": "ppocr_rec.onnx",
         "pre": {
           "width": 320,
@@ -66,7 +66,7 @@
         }
       },
       "read_roi": {
-        "kind": "crop",
+        "type": "crop",
         "scale": 1.0
       }
     },

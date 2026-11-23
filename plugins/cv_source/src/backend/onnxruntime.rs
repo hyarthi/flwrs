@@ -61,14 +61,14 @@ fn provider_name(short: &str) -> String {
 
 /// `gpu (CoreMLExecutionProvider, Apple)`.
 fn describe(d: &ort::device::Device) -> String {
-    let kind = match d.hardware_device().ty() {
+    let device_type = match d.hardware_device().ty() {
         DeviceType::CPU => "cpu",
         DeviceType::GPU => "gpu",
         DeviceType::NPU => "npu",
         DeviceType::FPGA => "fpga",
     };
     let vendor = d.hardware_device().vendor().unwrap_or_default();
-    format!("{kind} ({}, {vendor})", d.ep().unwrap_or_default())
+    format!("{device_type} ({}, {vendor})", d.ep().unwrap_or_default())
 }
 
 pub fn load(path: &Path, options: &Options) -> Result<OrtModel, String> {
@@ -80,14 +80,14 @@ pub fn load(path: &Path, options: &Options) -> Result<OrtModel, String> {
     // execution provider doesn't prevent that; selecting the device does.
     // Nodes a non-CPU provider can't take still run on the CPU.
     let provider = options.provider.as_deref().map(provider_name);
-    let kind = match options.device {
+    let device_type = match options.device {
         Device::Cpu => DeviceType::CPU,
         Device::Gpu => DeviceType::GPU,
         Device::Npu => DeviceType::NPU,
     };
     let fits = |d: &ort::device::Device| {
         let ep = d.ep().unwrap_or_default();
-        d.hardware_device().ty() == kind
+        d.hardware_device().ty() == device_type
             && match &provider {
                 Some(p) => ep == p,
                 // On the CPU, ONNX Runtime's own provider unless one is named.

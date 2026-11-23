@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 /// A plugin's rules for its nodes.
 pub(crate) struct NodeRules {
     validator: Option<jsonschema::Validator>,
+    /// The launch-args schema, for what the validator can't say.
+    schema: Option<Value>,
     pub spec: LaunchSpec,
     in_schema: Option<SchemaDefinition>,
     out_schema: Option<SchemaDefinition>,
@@ -80,6 +82,7 @@ impl NodeRules {
             in_schema: parse(in_schema, "in")?,
             out_schema: parse(out_schema, "out")?,
             validator,
+            schema,
             spec,
         })
     }
@@ -87,6 +90,24 @@ impl NodeRules {
     /// JSON Schema, conversion rules and limits of a local node's `launch_args`.
     pub(crate) fn validate_launch_args(&self, args: &Value) -> Vec<String> {
         validate_launch_args(self.validator.as_ref(), &self.spec, args)
+    }
+
+    /// Settings a local node has that do nothing on this server's platform
+    /// (`x-flwrs-platforms`).
+    pub(crate) fn off_platform(&self, args: &Value) -> Vec<String> {
+        let Some(schema) = &self.schema else {
+            return vec![];
+        };
+        let platform = super::manifest::current_platform();
+        super::manifest::off_platform_values(schema, args, &platform)
+            .into_iter()
+            .map(|(pointer, for_)| {
+                format!(
+                    "launch_args{pointer} only applies on {} (this server is {platform})",
+                    for_.join(", ")
+                )
+            })
+            .collect()
     }
 
     /// A node launched as `launch` can't use this plugin: a remote plugin

@@ -1,0 +1,57 @@
+{
+  "description": "pose / multi-person one-stage",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "type": "source"
+      },
+      "pose": {
+        "type": "model",
+        "model": "yolov8n_pose.onnx",
+        "pre": {
+          "width": 640,
+          "height": 640,
+          "resize": "letterbox",
+          "pad": 114,
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "yolo",
+          "output": "output0",
+          "channels_first": true,
+          "classes": 1,
+          "keypoints": 17
+        },
+        "labels": {
+          "model_metadata": "names"
+        },
+        "keypoint_layout": "coco17"
+      },
+      "people": {
+        "type": "tracker",
+        "smooth_keypoints": {}
+      },
+      "hand_raised": {
+        "type": "lua",
+        "script": "local out = {}\nfor _, o in ipairs(objects) do\n  if o.tracker_id then\n    for _, side in ipairs({\"left\", \"right\"}) do\n      local wrist, shoulder = o.kp[side .. \"_wrist\"], o.kp[side .. \"_shoulder\"]\n      local up = pose.visible(wrist) and pose.visible(shoulder) and wrist.y < shoulder.y\n      local key = o.tracker_id .. \":\" .. side\n      if once(key, held(key, up, 0.4), 1.0) then\n        out[#out + 1] = {event = \"hand_raised\", action = side, tracker_id = o.tracker_id, class_name = o.class_name}\n      end\n    end\n  end\nend\nreturn out\n"
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "pose.frame"
+      },
+      {
+        "from": "pose.objects",
+        "to": "people.objects"
+      },
+      {
+        "from": "people.objects",
+        "to": "hand_raised.objects"
+      }
+    ]
+  }
+}

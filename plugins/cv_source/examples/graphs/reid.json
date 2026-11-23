@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "det": {
-        "kind": "model",
+        "type": "model",
         "model": "yolov10n.onnx",
         "pre": {
           "width": 640,
@@ -28,7 +28,7 @@
         }
       },
       "embed": {
-        "kind": "model",
+        "type": "model",
         "model": "youtu_reid.onnx",
         "pre": {
           "width": 128,
@@ -55,7 +55,7 @@
         }
       },
       "embed_roi": {
-        "kind": "crop",
+        "type": "crop",
         "classes": [
           0
         ],

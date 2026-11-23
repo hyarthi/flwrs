@@ -155,6 +155,7 @@ mod tests {
 
     fn obj(class_id: u32, confidence: f32, bbox: [f32; 4]) -> Object {
         Object {
+            tracker_id: None,
             class_id,
             class_name: None,
             confidence,

@@ -55,7 +55,6 @@ cargo build --workspace            # everything
 cargo build -p flwrs-app           # server only
 cargo build -p flwrs-http-sink     # HTTP sink plugin only
 cargo nextest run --workspace      # all tests, in parallel (cargo-nextest; settings in .config/nextest.toml)
-cargo test --workspace --doc       # doctests (nextest doesn't run them)
 cargo test --workspace             # all tests without nextest (one test binary after another)
 ```
 

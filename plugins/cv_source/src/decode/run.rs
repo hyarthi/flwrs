@@ -9,6 +9,7 @@ use crate::tensor::Outputs;
 
 fn object(class_id: u32, class_name: Option<String>, confidence: f32, bbox: [f32; 4]) -> Object {
     Object {
+        tracker_id: None,
         class_id,
         class_name,
         confidence,

@@ -36,3 +36,8 @@ sysinfo.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 webpki-roots.workspace = true
+
+[[bin]]
+name = "flwrs-trellis"
+path = "src/main.rs"
+test = false # no unit tests of its own

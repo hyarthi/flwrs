@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "person": {
-        "kind": "model",
+        "type": "model",
         "model": "mp_person.onnx",
         "pre": {
           "width": 224,
@@ -47,7 +47,7 @@
         ]
       },
       "pose": {
-        "kind": "model",
+        "type": "model",
         "model": "mp_pose.onnx",
         "pre": {
           "width": 256,
@@ -68,7 +68,7 @@
         }
       },
       "pose_roi": {
-        "kind": "crop",
+        "type": "crop",
         "center_keypoint": 0,
         "size_keypoints": [
           0,

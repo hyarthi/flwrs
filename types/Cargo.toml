@@ -25,3 +25,7 @@ mlua = { workspace = true, optional = true }
 default = []
 # The Lua 5.4 sandbox (vendored Lua: needs a C compiler for the target).
 lua = ["dep:mlua"]
+
+[lib]
+# No doc examples to run: rustdoc would still take seconds per crate.
+doctest = false

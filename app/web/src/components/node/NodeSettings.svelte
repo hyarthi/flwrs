@@ -6,12 +6,13 @@
   // settings, and for remote nodes their identity and authentication.
   // Problems (a refused save's, else the draft check's) show next to their
   // fields.
-  import { untrack } from 'svelte';
+  import { setContext, untrack } from 'svelte';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import Copy from '@lucide/svelte/icons/copy';
   import X from '@lucide/svelte/icons/x';
   import SchemaField from '../form/SchemaField.svelte';
   import { ApiError } from '../../lib/api';
+  import { getPluginSettings } from '../../lib/plugins';
   import {
     clone,
     getPath,
@@ -21,6 +22,7 @@
     setPath,
     sortErrors,
     topFields,
+    PLATFORM_CONTEXT,
     type FieldErrors,
     type Schema,
   } from '../../lib/schemaForm';
@@ -94,7 +96,12 @@
 
   const secrets = $derived(untrack(() => node.launch_args_secrets));
   const configured = $derived(launch === 'local' ? (plugin?.configured_fields ?? []) : []);
-  const groups = $derived(schema ? topFields(schema, configured) : []);
+  // The server's platform: a remote node runs elsewhere, so nothing's hidden.
+  let serverPlatform = $state<string | null>(null);
+  getPluginSettings().then((s) => (serverPlatform = s.platform)).catch(() => {});
+  const nodePlatform = $derived(launch === 'local' ? serverPlatform : null);
+  setContext(PLATFORM_CONTEXT, () => nodePlatform);
+  const groups = $derived(schema ? topFields(schema, configured, nodePlatform, args) : []);
 
   // ---- errors ----
 

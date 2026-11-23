@@ -7,6 +7,10 @@ use flwrs_plugin::source::runner::{SourceRunner, SourceRunnerConfig};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // The debug mode has no hub, so none of the bootstrap arguments.
+    if std::env::args().nth(1).as_deref() == Some("debug") {
+        return flwrs_cv_source::debug::main(std::env::args().skip(1));
+    }
     let args = Args::parse();
     // `--threads` (optional, from the server) sizes the runtime.
     match flwrs_plugin::rt::runtime(args.bootstrap.threads) {
@@ -58,7 +62,7 @@ async fn run(args: Args) -> ExitCode {
     };
     let source = plugin::VisionSource {
         settings,
-        plan: std::sync::Mutex::new(plan),
+        plan: std::sync::Arc::new(std::sync::Mutex::new(plan)),
         warnings,
         sink: None,
     };
@@ -235,17 +239,74 @@ mod package_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The `input` setting: what the schema and the plugin take and refuse.
+    #[test]
+    fn inputs_are_checked() {
+        let schema = jsonschema::validator_for(&json("schema/launch_args.json")).unwrap();
+        let graph = json("examples/graphs/yolov10n.json")["graph"].clone();
+        let dir = tempfile::tempdir().unwrap();
+        let graph_file = dir.path().join("graph.json");
+        std::fs::write(&graph_file, graph.to_string()).unwrap();
+        let model = "config/yolov10n.onnx";
+        let check = |input: serde_json::Value| {
+            let file = dir.path().join("input.json");
+            std::fs::write(&file, input.to_string()).unwrap();
+            let args = <Args as clap::Parser>::try_parse_from([
+                "cv",
+                "--id",
+                "n",
+                "--port",
+                "1",
+                "--graph",
+                graph_file.to_str().unwrap(),
+                "--file",
+                model,
+                "--input",
+                file.to_str().unwrap(),
+            ])
+            .unwrap();
+            let by_schema = schema.is_valid(&serde_json::json!({
+                "graph": graph, "files": ["yolov10n.onnx"], "input": input
+            }));
+            (by_schema, args.settings().is_ok())
+        };
+        for good in [
+            serde_json::json!({"type": "camera"}),
+            serde_json::json!({"type": "camera", "device": "FaceTime", "width": 1280, "height": 720, "fps": 30, "format": "nv12", "backend": "native"}),
+            serde_json::json!({"type": "images", "path": "frames", "fps": 5, "loop": true}),
+            serde_json::json!({"type": "mjpeg", "path": "clip.mjpeg"}),
+        ] {
+            assert_eq!(check(good.clone()), (true, true), "{good}");
+        }
+        for bad in [
+            serde_json::json!({"type": "rtsp"}),
+            serde_json::json!({"type": "camera", "width": 0, "height": 720}),
+            serde_json::json!({"type": "camera", "fps": 0}),
+            serde_json::json!({"type": "camera", "format": "h264"}),
+            serde_json::json!({"type": "images"}),
+            serde_json::json!({"type": "mjpeg", "path": "a", "fps": 0}),
+            serde_json::json!({"type": "camera", "extra": 1}),
+        ] {
+            assert_eq!(check(bad.clone()), (false, false), "{bad}");
+        }
+        // Beyond what a schema can say.
+        assert_eq!(
+            check(serde_json::json!({"type": "camera", "width": 640})),
+            (true, false)
+        );
+    }
+
     /// The schema refuses what the plugin would.
     #[test]
     fn the_schema_refuses_bad_graphs() {
         let schema = jsonschema::validator_for(&json("schema/launch_args.json")).unwrap();
         for bad in [
             serde_json::json!({}),
-            serde_json::json!({"graph": {"nodes": {"Camera": {"kind": "source"}}}}),
-            serde_json::json!({"graph": {"nodes": {"c": {"kind": "camera"}}}}),
-            serde_json::json!({"graph": {"nodes": {"m": {"kind": "model", "model": "a.onnx",
+            serde_json::json!({"graph": {"nodes": {"Camera": {"type": "source"}}}}),
+            serde_json::json!({"graph": {"nodes": {"c": {"type": "camera"}}}}),
+            serde_json::json!({"graph": {"nodes": {"m": {"type": "model", "model": "a.onnx",
                 "decode": {"type": "classify", "output": "o", "softmax": true, "extra": 1}}}}}),
-            serde_json::json!({"graph": {"nodes": {"c": {"kind": "source"}}, "links": [{"from": "c", "to": "d.frame"}]}}),
+            serde_json::json!({"graph": {"nodes": {"c": {"type": "source"}}, "links": [{"from": "c", "to": "d.frame"}]}}),
         ] {
             assert!(!schema.is_valid(&bad), "{bad}");
         }

@@ -13,6 +13,9 @@
 //!   string (one file's name) or an array of strings (a list of files).
 //! - `x-flwrs-code` on a string property: `{"language", "params", "definitions"?, "signature"?}`.
 //! - UI hints: `x-flwrs-group`, `x-flwrs-order`, `x-flwrs-advanced`, `x-flwrs-widget`.
+//! - `x-flwrs-platforms` on any property: the platforms it applies to (`macos`,
+//!   `linux-aarch64`, ...). Editors hide it elsewhere, and a value set there
+//!   is a scene-check warning; it's never refused.
 //! - `x-flwrs-template` on a property: a file in the package that an editor
 //!   fills an empty field with (a starting point, e.g. a sample API document
 //!   or script): its text for a property that may be a string, else the JSON
@@ -89,6 +92,7 @@ const HINTS: &[&str] = &[
     "x-flwrs-order",
     "x-flwrs-advanced",
     "x-flwrs-widget",
+    "x-flwrs-platforms",
 ];
 const WIDGETS: &[&str] = &["duration", "cron", "file-path", "code"];
 
@@ -732,8 +736,147 @@ fn check_hint(hint: &str, value: &Value) -> Result<(), String> {
             Some(w) if WIDGETS.contains(&w) => Ok(()),
             _ => Err(format!("must be one of {}", WIDGETS.join(", "))),
         },
+        "x-flwrs-platforms" => {
+            let ok = value.as_array().is_some_and(|items| {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|p| p.as_str().is_some_and(is_platform_name))
+            });
+            if ok {
+                Ok(())
+            } else {
+                Err("must be a non-empty list of platforms: an OS (`macos`) or `<os>-<arch>` (`linux-aarch64`)".into())
+            }
+        }
         _ => Ok(()),
     }
+}
+
+/// An OS (`macos`) or `<os>-<arch>` (`linux-x86_64`), as Rust names them.
+fn is_platform_name(name: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    };
+    match name.split_once('-') {
+        Some((os, arch)) => part(os) && part(arch),
+        None => part(name),
+    }
+}
+
+/// Whether `x-flwrs-platforms`' list covers `platform` (`<os>-<arch>`).
+fn covers(list: &[Value], platform: &str) -> bool {
+    let os = platform.split('-').next().unwrap_or(platform);
+    list.iter()
+        .filter_map(Value::as_str)
+        .any(|p| p == platform || p == os)
+}
+
+/// The values in `args` set on properties that don't apply on `platform`
+/// (`x-flwrs-platforms`): each one's JSON pointer and the platforms it's for.
+/// A `oneOf` / `anyOf` branch counts when its `const` properties match.
+pub fn off_platform_values(
+    schema: &Value,
+    args: &Value,
+    platform: &str,
+) -> Vec<(String, Vec<String>)> {
+    fn branch_matches(root: &Value, branch: &Value, value: &Value) -> bool {
+        let branch = follow(root, branch);
+        branch
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_none_or(|props| {
+                props.iter().all(|(name, p)| {
+                    follow(root, p)
+                        .get("const")
+                        .is_none_or(|c| value.get(name) == Some(c))
+                })
+            })
+    }
+    fn follow<'a>(root: &'a Value, mut node: &'a Value) -> &'a Value {
+        for _ in 0..MAX_REF_HOPS {
+            match node
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|r| r.strip_prefix('#'))
+                .and_then(|p| root.pointer(p))
+            {
+                Some(target) => node = target,
+                None => break,
+            }
+        }
+        node
+    }
+    struct Visit<'a> {
+        root: &'a Value,
+        platform: &'a str,
+        out: Vec<(String, Vec<String>)>,
+    }
+    impl Visit<'_> {
+        fn node(&mut self, node: &Value, value: &Value, pointer: &str, depth: usize) {
+            if depth > MAX_VISIT_DEPTH {
+                return;
+            }
+            let root = self.root;
+            let node = follow(root, node);
+            if let (Some(props), Some(object)) = (
+                node.get("properties").and_then(Value::as_object),
+                value.as_object(),
+            ) {
+                for (name, prop) in props {
+                    let Some(child) = object.get(name).filter(|v| !v.is_null()) else {
+                        continue;
+                    };
+                    let at = format!("{pointer}/{}", escape(name));
+                    let list = prop
+                        .get("x-flwrs-platforms")
+                        .or_else(|| follow(root, prop).get("x-flwrs-platforms"))
+                        .and_then(Value::as_array);
+                    match list {
+                        Some(list) if !covers(list, self.platform) => {
+                            let names = list
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect();
+                            self.out.push((at, names));
+                        }
+                        _ => self.node(prop, child, &at, depth + 1),
+                    }
+                }
+            }
+            for key in ["oneOf", "anyOf", "allOf"] {
+                for branch in node
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if key == "allOf" || branch_matches(root, branch, value) {
+                        self.node(branch, value, pointer, depth + 1);
+                    }
+                }
+            }
+            if let (Some(items), Some(list)) = (node.get("items"), value.as_array()) {
+                for (i, item) in list.iter().enumerate() {
+                    self.node(items, item, &format!("{pointer}/{i}"), depth + 1);
+                }
+            }
+        }
+    }
+    const MAX_REF_HOPS: usize = 16;
+    const MAX_VISIT_DEPTH: usize = 32;
+    let mut visit = Visit {
+        root: schema,
+        platform,
+        out: vec![],
+    };
+    visit.node(schema, args, "", 0);
+    visit.out.sort();
+    visit.out.dedup();
+    visit.out
 }
 
 /// `x-flwrs-template`: the path of a package file. A property that may be a
@@ -1761,5 +1904,53 @@ mod tests {
         let required =
             jsonschema::validator_for(&json!({"type": "object", "required": ["a"]})).unwrap();
         assert!(!validate_launch_args(Some(&required), &spec, &Value::Null).is_empty());
+    }
+
+    #[test]
+    fn platform_hints_are_checked_and_found() {
+        for good in [json!(["macos"]), json!(["linux-aarch64", "windows"])] {
+            assert!(check_hint("x-flwrs-platforms", &good).is_ok(), "{good}");
+        }
+        for bad in [
+            json!([]),
+            json!("macos"),
+            json!([1]),
+            json!(["Mac OS"]),
+            json!(["a-b-c"]),
+        ] {
+            assert!(check_hint("x-flwrs-platforms", &bad).is_err(), "{bad}");
+        }
+        let schema = json!({
+            "properties": {
+                "input": { "$ref": "#/$defs/input" },
+                "tune": { "type": "integer", "x-flwrs-platforms": ["linux-aarch64"] }
+            },
+            "$defs": { "input": { "oneOf": [
+                { "properties": {
+                    "type": { "const": "camera" },
+                    "backend": { "type": "string", "x-flwrs-platforms": ["macos"] }
+                } },
+                { "properties": {
+                    "type": { "const": "file" },
+                    "backend": { "type": "string" }
+                } }
+            ] } }
+        });
+        let camera = json!({"input": {"type": "camera", "backend": "x"}, "tune": 1});
+        assert_eq!(
+            off_platform_values(&schema, &camera, "linux-x86_64"),
+            vec![
+                ("/input/backend".to_string(), vec!["macos".to_string()]),
+                ("/tune".to_string(), vec!["linux-aarch64".to_string()]),
+            ]
+        );
+        assert_eq!(
+            off_platform_values(&schema, &camera, "macos-aarch64"),
+            vec![("/tune".to_string(), vec!["linux-aarch64".to_string()])]
+        );
+        // The other branch's `backend` has no restriction; unset is fine too.
+        let file = json!({"input": {"type": "file", "backend": "x"}});
+        assert!(off_platform_values(&schema, &file, "linux-x86_64").is_empty());
+        assert!(off_platform_values(&schema, &json!({}), "linux-x86_64").is_empty());
     }
 }

@@ -1,0 +1,118 @@
+{
+  "description": "YOLOv10n on control frames, a tracker between them, RTMPose-s on each tracked crop on every frame, and a Lua hand-raised rule",
+  "graph": {
+    "nodes": {
+      "camera": {
+        "type": "source"
+      },
+      "det": {
+        "type": "model",
+        "model": "yolov10n.onnx",
+        "pre": {
+          "width": 640,
+          "height": 640,
+          "resize": "letterbox",
+          "pad": 114,
+          "color": "rgb",
+          "dtype": "f32",
+          "scale": 0.0039215686,
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "detections_e2e",
+          "output": "output0"
+        },
+        "min_confidence": 0.4,
+        "labels": {
+          "builtin": "coco80"
+        }
+      },
+      "persons": {
+        "type": "filter",
+        "classes": [
+          0
+        ]
+      },
+      "people": {
+        "type": "tracker",
+        "smooth_keypoints": {},
+        "control": {
+          "tracker_frames": 5,
+          "background": true
+        }
+      },
+      "pose_roi": {
+        "type": "crop",
+        "classes": [
+          0
+        ],
+        "scale": 1.25,
+        "aspect": 0.75,
+        "max": 4
+      },
+      "pose": {
+        "type": "model",
+        "model": "rtmpose_s.onnx",
+        "pre": {
+          "width": 192,
+          "height": 256,
+          "resize": "stretch",
+          "color": "rgb",
+          "dtype": "f32",
+          "mean": [
+            123.675,
+            116.28,
+            103.53
+          ],
+          "std": [
+            58.395,
+            57.12,
+            57.375
+          ],
+          "layout": "nchw"
+        },
+        "decode": {
+          "type": "simcc",
+          "x": "simcc_x",
+          "y": "simcc_y",
+          "split": 2.0
+        },
+        "keypoint_layout": "coco17"
+      },
+      "hand_raised": {
+        "type": "lua",
+        "script": "local out = {}\nfor _, o in ipairs(objects) do\n  local p = o.tracker_id and o.children.pose and o.children.pose[1]\n  if p then\n    for _, side in ipairs({\"left\", \"right\"}) do\n      local wrist, shoulder = p.kp[side .. \"_wrist\"], p.kp[side .. \"_shoulder\"]\n      local up = pose.visible(wrist) and pose.visible(shoulder) and wrist.y < shoulder.y\n      local key = o.tracker_id .. \":\" .. side\n      if once(key, held(key, up, 0.4), 1.0) then\n        out[#out + 1] = {event = \"hand_raised\", action = side, tracker_id = o.tracker_id, class_name = o.class_name}\n      end\n    end\n  end\nend\nreturn out\n"
+      }
+    },
+    "links": [
+      {
+        "from": "camera.frame",
+        "to": "det.frame"
+      },
+      {
+        "from": "det.objects",
+        "to": "persons.objects"
+      },
+      {
+        "from": "persons.objects",
+        "to": "people.objects"
+      },
+      {
+        "from": "camera.frame",
+        "to": "pose_roi.frame"
+      },
+      {
+        "from": "people.objects",
+        "to": "pose_roi.objects"
+      },
+      {
+        "from": "pose_roi.regions",
+        "to": "pose.frame"
+      },
+      {
+        "from": "people.objects",
+        "to": "hand_raised.objects"
+      }
+    ]
+  }
+}

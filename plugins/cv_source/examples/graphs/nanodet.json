@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "det": {
-        "kind": "model",
+        "type": "model",
         "model": "nanodet.onnx",
         "pre": {
           "width": 416,

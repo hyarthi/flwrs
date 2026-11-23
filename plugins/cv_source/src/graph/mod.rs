@@ -29,6 +29,8 @@ pub enum PortType {
     Vector,
     /// Raw tensors.
     Tensor,
+    /// Rule events.
+    Events,
 }
 
 impl PortType {
@@ -42,6 +44,7 @@ impl PortType {
             PortType::Text => "text",
             PortType::Vector => "vector",
             PortType::Tensor => "tensor",
+            PortType::Events => "events",
         }
     }
 }
@@ -73,9 +76,20 @@ impl Ports {
                 inputs: vec![("frame", PortType::Frame), ("objects", PortType::Objects)],
                 outputs: out(PortType::Regions),
             },
-            NodeConfig::Filter(_) => Ports {
+            NodeConfig::Filter(_) | NodeConfig::Tracker(_) => Ports {
                 inputs: vec![("objects", PortType::Objects)],
                 outputs: out(PortType::Objects),
+            },
+            NodeConfig::Rule(r) => Ports {
+                inputs: match r.input {
+                    config::RuleInput::Objects => vec![("objects", PortType::Objects)],
+                    config::RuleInput::Classes => vec![("classes", PortType::Classes)],
+                },
+                outputs: out(PortType::Events),
+            },
+            NodeConfig::Lua(_) => Ports {
+                inputs: vec![("objects", PortType::Objects)],
+                outputs: out(PortType::Events),
             },
         }
     }

@@ -18,3 +18,8 @@ reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
+
+[lib]
+# No doc examples to run: rustdoc would still take seconds per crate.
+doctest = false
+test = false # the tests are in tests/

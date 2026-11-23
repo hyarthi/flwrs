@@ -6,10 +6,13 @@
 #[cfg(not(any(feature = "ort", feature = "tract")))]
 compile_error!("flwrs-cv-source needs an inference runtime: enable the `ort` or `tract` feature");
 
+pub mod analytics;
 pub mod backend;
+pub mod debug;
 pub mod decode;
 pub mod frame;
 pub mod graph;
+pub mod ingest;
 pub mod keypoints;
 pub mod labels;
 pub mod model;

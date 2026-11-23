@@ -34,6 +34,7 @@ export interface PluginSettings {
   allow_upload: boolean;
   admin_token_required: boolean;
   max_upload_bytes: number;
+  platform: string;
 }
 
 export interface PluginUse {

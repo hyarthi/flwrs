@@ -1,7 +1,9 @@
 //! Checking a graph: ids, ports, link types, every input linked once, no
 //! cycles, for-each scopes. Every problem is reported, with its node or link.
 
-use super::config::{GraphConfig, Link, NodeConfig};
+use super::config::{
+    GraphConfig, Link, NodeConfig, RuleConfig, RuleInput, RuleType, Sampling, TrackerConfig,
+};
 use super::{PortType, Ports};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -194,6 +196,7 @@ pub fn check(graph: &GraphConfig) -> Result<Checked, Vec<String>> {
             ));
         }
     }
+    problems.extend(placement_problems(graph, &scope));
     if problems.is_empty() {
         Ok(Checked { order, scope })
     } else {
@@ -254,12 +257,6 @@ fn own_problems(node: &NodeConfig) -> Vec<String> {
                     }
                 }
             }
-            if let Some(super::config::Sampling::PerTrack { .. }) = m.sampling {
-                problems.push(
-                    "sampling.per_track needs object tracking, which this version doesn't have yet"
-                        .into(),
-                );
-            }
             if let Some(e) = &m.execution {
                 problems.extend(e.problems());
             }
@@ -283,8 +280,251 @@ fn own_problems(node: &NodeConfig) -> Vec<String> {
                 problems.push("min_confidence must be between 0 and 1".into());
             }
         }
+        NodeConfig::Tracker(t) => problems.extend(tracker_problems(t)),
+        NodeConfig::Rule(r) => problems.extend(rule_problems(r)),
+        NodeConfig::Lua(l) => {
+            if l.script.trim().is_empty() {
+                problems.push("script is empty".into());
+            }
+            #[cfg(feature = "lua")]
+            {
+                let params: Vec<String> = crate::analytics::script::PARAMS
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect();
+                if let Err(e) = flwrs_types::lua::check_syntax("script", &l.script, &params) {
+                    problems.push(e);
+                }
+            }
+            #[cfg(not(feature = "lua"))]
+            problems.push("this build has no Lua (feature lua)".into());
+        }
     }
     problems
+}
+
+fn tracker_problems(t: &TrackerConfig) -> Vec<String> {
+    let mut out = vec![];
+    for (name, v) in [
+        ("high_confidence", t.high_confidence),
+        ("low_confidence", t.low_confidence),
+        ("new_track_confidence", t.new_track_confidence),
+        ("min_iou", t.min_iou),
+        ("min_iou_low", t.min_iou_low),
+    ] {
+        if !(0.0..=1.0).contains(&v) {
+            out.push(format!("{name} must be between 0 and 1"));
+        }
+    }
+    if t.low_confidence > t.high_confidence {
+        out.push("low_confidence can't be above high_confidence".into());
+    }
+    if t.new_track_confidence < t.high_confidence {
+        out.push("new_track_confidence can't be below high_confidence".into());
+    }
+    if t.min_hits == 0 {
+        out.push("min_hits must be at least 1".into());
+    }
+    if !(t.max_lost_s >= 0.0 && t.max_lost_s.is_finite()) {
+        out.push("max_lost_s must be 0 or more".into());
+    }
+    if let Some(c) = &t.control {
+        if c.tracker_frames > 300 {
+            out.push("control.tracker_frames must be at most 300".into());
+        }
+        if !(0.0..=1.0).contains(&c.min_visible) {
+            out.push("control.min_visible must be between 0 and 1".into());
+        }
+        if !(c.box_smoothing >= 1.0 && c.box_smoothing.is_finite()) {
+            out.push("control.box_smoothing must be 1 or more".into());
+        }
+        if c.max_missed == 0 {
+            out.push("control.max_missed must be at least 1".into());
+        }
+    }
+    if let Some(s) = &t.smooth_keypoints
+        && !(s.min_cutoff > 0.0 && s.min_cutoff.is_finite() && s.beta >= 0.0 && s.beta.is_finite())
+    {
+        out.push("smooth_keypoints: min_cutoff must be above 0 and beta 0 or more".into());
+    }
+    out
+}
+
+fn shape_problems(name: &str, points: &[[f32; 2]], least: usize) -> Vec<String> {
+    let mut out = vec![];
+    if points.len() < least {
+        out.push(format!("{name} needs at least {least} points"));
+    }
+    if points.iter().flatten().any(|v| !(0.0..=1.0).contains(v)) {
+        out.push(format!("{name}: points are normalised, 0 to 1"));
+    }
+    out
+}
+
+fn rule_problems(r: &RuleConfig) -> Vec<String> {
+    let mut out = vec![];
+    for (name, v) in [
+        ("debounce_s", r.debounce_s),
+        ("cooldown_s", r.cooldown_s),
+        ("hysteresis", r.hysteresis),
+    ] {
+        if !(v >= 0.0 && v.is_finite()) {
+            out.push(format!("{name} must be 0 or more"));
+        }
+    }
+    let classes_input = r.input == RuleInput::Classes;
+    match &r.rule {
+        RuleType::LineCrossing { line, .. } => out.extend(shape_problems("line", line, 2)),
+        RuleType::Zone { zone, .. } => out.extend(shape_problems("zone", zone, 3)),
+        RuleType::Loitering { zone, seconds } => {
+            out.extend(shape_problems("zone", zone, 3));
+            if !(*seconds > 0.0 && seconds.is_finite()) {
+                out.push("seconds must be above 0".into());
+            }
+        }
+        RuleType::Counting { zone, above, below } => {
+            if let Some(z) = zone {
+                out.extend(shape_problems("zone", z, 3));
+            }
+            if above.is_none() && below.is_none() {
+                out.push("counting needs above, below or both".into());
+            }
+        }
+        RuleType::Track { min_age_s, .. } => {
+            if !(*min_age_s >= 0.0 && min_age_s.is_finite()) {
+                out.push("min_age_s must be 0 or more".into());
+            }
+        }
+        RuleType::LabelChanged { from } => {
+            if classes_input && from.is_some() {
+                out.push("from is for rules on objects".into());
+            }
+        }
+        RuleType::ScoreAbove {
+            threshold, from, ..
+        } => {
+            if !(0.0..=1.0).contains(threshold) {
+                out.push("threshold must be between 0 and 1".into());
+            }
+            if classes_input && from.is_some() {
+                out.push("from is for rules on objects".into());
+            }
+        }
+    }
+    if classes_input
+        && !matches!(
+            r.rule,
+            RuleType::LabelChanged { .. } | RuleType::ScoreAbove { .. }
+        )
+    {
+        out.push("input classes is for label_changed and score_above".into());
+    }
+    out
+}
+
+/// Whether the objects reaching `id`'s `objects` input come from a tracker
+/// (through filters).
+fn tracked_input(graph: &GraphConfig, id: &str) -> bool {
+    let mut at = id.to_string();
+    for _ in 0..=graph.nodes.len() {
+        let Some(from) = graph
+            .links
+            .iter()
+            .find(|l| l.to == format!("{at}.objects"))
+            .and_then(|l| l.from.split_once('.'))
+            .map(|(n, _)| n)
+        else {
+            return false;
+        };
+        match graph.nodes.get(from) {
+            Some(NodeConfig::Tracker(_)) => return true,
+            Some(NodeConfig::Filter(_)) => at = from.to_string(),
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// What only works on nodes run once per frame, or on tracked objects.
+fn placement_problems(
+    graph: &GraphConfig,
+    scope: &BTreeMap<String, Option<String>>,
+) -> Vec<String> {
+    let mut out = vec![];
+    let per_region = |id: &str| scope.get(id).is_some_and(Option::is_some);
+    for (id, node) in &graph.nodes {
+        match node {
+            NodeConfig::Tracker(_) | NodeConfig::Rule(_) | NodeConfig::Lua(_) if per_region(id) => {
+                out.push(format!(
+                    "nodes.{id}: a {} node runs once per frame, not per region",
+                    node.type_name()
+                ));
+            }
+            NodeConfig::Tracker(t) if t.control.is_some() => {
+                // Through filters, to the model that detects.
+                let mut at = id.clone();
+                let detector = loop {
+                    let from = graph
+                        .links
+                        .iter()
+                        .find(|l| l.to == format!("{at}.objects"))
+                        .and_then(|l| l.from.split_once('.'))
+                        .map(|(n, _)| n);
+                    match from.and_then(|n| graph.nodes.get(n).map(|x| (n, x))) {
+                        Some((n, NodeConfig::Filter(_))) => at = n.to_string(),
+                        Some((n, NodeConfig::Model(m))) => break Some((n, m)),
+                        _ => break None,
+                    }
+                };
+                match detector {
+                    None => out.push(format!(
+                        "nodes.{id}: control needs a model feeding this tracker (directly or through filters)"
+                    )),
+                    Some((n, m)) => {
+                        if m.pre.is_none() {
+                            out.push(format!("nodes.{id}: control needs a detector that runs on the frame; {n} takes objects"));
+                        }
+                        if m.sampling.is_some() {
+                            out.push(format!("nodes.{n}: control frames decide when it runs, so it can't have sampling"));
+                        }
+                    }
+                }
+            }
+            NodeConfig::Rule(r) if r.input == RuleInput::Objects => {
+                let needs_tracks = !matches!(r.rule, RuleType::Counting { .. });
+                if needs_tracks && !tracked_input(graph, id) {
+                    out.push(format!(
+                        "nodes.{id}: this rule follows objects over time, so its objects must come from a tracker node"
+                    ));
+                }
+                let from = match &r.rule {
+                    RuleType::LabelChanged { from } | RuleType::ScoreAbove { from, .. } => {
+                        from.as_deref()
+                    }
+                    _ => None,
+                };
+                if let Some(from) = from
+                    && !matches!(graph.nodes.get(from), Some(NodeConfig::Model(_)))
+                {
+                    out.push(format!("nodes.{id}: from: there's no model node {from}"));
+                }
+            }
+            NodeConfig::Model(m) => {
+                if let Some(Sampling::PerTrack { .. }) = m.sampling {
+                    let crop = scope.get(id).cloned().flatten();
+                    let on_tracks = m.tensor_input.is_none()
+                        && crop.as_deref().is_some_and(|c| tracked_input(graph, c));
+                    if !on_tracks {
+                        out.push(format!(
+                            "nodes.{id}: sampling.per_track is for models run on the regions of tracked objects (a crop node fed by a tracker)"
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -293,7 +533,7 @@ mod tests {
     use serde_json::{Value, json};
 
     fn model(decode: Value) -> Value {
-        json!({"kind": "model", "model": "m.onnx",
+        json!({"type": "model", "model": "m.onnx",
             "pre": {"width": 8, "height": 8, "resize": "stretch", "color": "rgb", "dtype": "f32", "layout": "nchw"},
             "decode": decode})
     }
@@ -324,8 +564,8 @@ mod tests {
     #[test]
     fn a_detector_and_a_classifier_per_object_pass_in_order() {
         let (_, checked) = parse(&json!({"nodes": {
-                "camera": {"kind": "source"}, "det": detector(),
-                "crop": {"kind": "crop"}, "cls": classifier()},
+                "camera": {"type": "source"}, "det": detector(),
+                "crop": {"type": "crop"}, "cls": classifier()},
             "links": [
                 {"from": "camera.frame", "to": "det.frame"},
                 {"from": "camera.frame", "to": "crop.frame"},
@@ -341,7 +581,7 @@ mod tests {
     #[test]
     fn link_problems_are_all_reported() {
         let p = problems(json!({"nodes": {
-                "camera": {"kind": "source"}, "det": detector(), "cls": classifier()},
+                "camera": {"type": "source"}, "det": detector(), "cls": classifier()},
             "links": [
                 {"from": "camera.frame", "to": "det.frame"},
                 {"from": "camera.frame", "to": "det.frame"},
@@ -371,7 +611,7 @@ mod tests {
             "exactly one source node (it has 0)",
         );
         has(
-            json!({"nodes": {"a": {"kind": "source"}, "b": {"kind": "source"}}}),
+            json!({"nodes": {"a": {"type": "source"}, "b": {"type": "source"}}}),
             "it has 2",
         );
     }
@@ -379,7 +619,7 @@ mod tests {
     #[test]
     fn cycles_are_refused() {
         has(
-            json!({"nodes": {"camera": {"kind": "source"}, "f": {"kind": "filter"}, "g": {"kind": "filter"}},
+            json!({"nodes": {"camera": {"type": "source"}, "f": {"type": "filter"}, "g": {"type": "filter"}},
                 "links": [{"from": "f.objects", "to": "g.objects"}, {"from": "g.objects", "to": "f.objects"}]}),
             "a cycle through f, g",
         );
@@ -402,18 +642,18 @@ mod tests {
             json!({"from": "x.objects", "to": "z.objects"}),
         ]);
         // Two for-each scopes side by side, z downstream of one of them.
-        let nodes = json!({"camera": {"kind": "source"}, "det": detector(),
-            "a": {"kind": "crop"}, "b": {"kind": "crop"}, "x": detector(), "y": detector(),
-            "z": {"kind": "filter"}});
+        let nodes = json!({"camera": {"type": "source"}, "det": detector(),
+            "a": {"type": "crop"}, "b": {"type": "crop"}, "x": detector(), "y": detector(),
+            "z": {"type": "filter"}});
         let (_, checked) = parse(&json!({"nodes": nodes, "links": links})).unwrap();
         assert_eq!(checked.scope["z"].as_deref(), Some("a"));
         assert_eq!(checked.scope["y"].as_deref(), Some("b"));
         // (Mixing two scopes needs a node with several inputs of those
-        // kinds: rule and emit nodes, later.)
+        // types: rule and emit nodes, later.)
         // Cropping regions again.
         has(
-            json!({"nodes": {"camera": {"kind": "source"}, "det": detector(), "a": {"kind": "crop"},
-                    "x": detector(), "c": {"kind": "crop"}},
+            json!({"nodes": {"camera": {"type": "source"}, "det": detector(), "a": {"type": "crop"},
+                    "x": detector(), "c": {"type": "crop"}},
                 "links": [{"from": "camera.frame", "to": "det.frame"},
                     {"from": "camera.frame", "to": "a.frame"}, {"from": "det.objects", "to": "a.objects"},
                     {"from": "a.regions", "to": "x.frame"},
@@ -429,7 +669,7 @@ mod tests {
         let mut bad_pre = detector();
         bad_pre["pre"]["width"] = json!(0);
         let p = problems(
-            json!({"nodes": {"camera": {"kind": "source"}, "Bad": {"kind": "filter", "min_confidence": 2},
+            json!({"nodes": {"camera": {"type": "source"}, "Bad": {"type": "filter", "min_confidence": 2},
             "both": both, "pre": bad_pre,
             "ctc": model(json!({"type": "ctc", "output": "o"})),
             "thr": model(json!({"type": "yolo", "output": "o", "channels_first": true, "classes": 0, "iou": 1.5}))}}),
@@ -449,11 +689,11 @@ mod tests {
             );
         }
         has(
-            json!({"nodes": {"camera": {"kind": "camera"}}}),
+            json!({"nodes": {"camera": {"type": "camera"}}}),
             "unknown variant `camera`",
         );
         has(
-            json!({"nodes": {"camera": {"kind": "source", "fps": 30}}}),
+            json!({"nodes": {"camera": {"type": "source", "fps": 30}}}),
             "unknown field `fps`",
         );
     }
@@ -466,7 +706,7 @@ mod tests {
             m.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            json!({"nodes": {"camera": {"kind": "source"}, "det": detector(), "roi": {"kind": "crop"}, "m": m},
+            json!({"nodes": {"camera": {"type": "source"}, "det": detector(), "roi": {"type": "crop"}, "m": m},
                 "links": [{"from": "camera.frame", "to": "det.frame"}, {"from": "camera.frame", "to": "roi.frame"},
                           {"from": "det.objects", "to": "roi.objects"}, {"from": "roi.regions", "to": "m.frame"}]})
         };
@@ -477,7 +717,7 @@ mod tests {
         );
         assert!(
             problems(on_regions(json!({"sampling": {"per_track": {}}})))
-                .contains("needs object tracking")
+                .contains("sampling.per_track is for models run on the regions of tracked objects")
         );
         assert!(
             problems(on_regions(
@@ -499,7 +739,7 @@ mod tests {
         let graph = |decode: Value, cutoff: Value| {
             let mut m = model(decode);
             m["min_confidence"] = cutoff;
-            json!({"nodes": {"camera": {"kind": "source"}, "m": m}, "links": [{"from": "camera.frame", "to": "m.frame"}]})
+            json!({"nodes": {"camera": {"type": "source"}, "m": m}, "links": [{"from": "camera.frame", "to": "m.frame"}]})
         };
         let yolo = json!({"type": "yolo", "output": "o", "channels_first": true, "classes": 2});
         assert!(parse(&graph(yolo.clone(), json!(0.5))).is_ok());
@@ -526,7 +766,7 @@ mod tests {
     fn uploads_are_listed() {
         let mut m = classifier();
         m["labels"] = json!({"file": "labels.txt"});
-        let (graph, _) = parse(&json!({"nodes": {"camera": {"kind": "source"}, "m": m},
+        let (graph, _) = parse(&json!({"nodes": {"camera": {"type": "source"}, "m": m},
             "links": [{"from": "camera.frame", "to": "m.frame"}]}))
         .unwrap();
         assert_eq!(super::super::uploads(&graph), ["labels.txt", "m.onnx"]);

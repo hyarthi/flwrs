@@ -143,6 +143,9 @@ pub(crate) struct PluginSettings {
     pub admin_token_required: bool,
     /// The largest package upload (bytes).
     pub max_upload_bytes: u64,
+    /// This server's platform in manifest notation (`macos-aarch64`), for
+    /// editors honouring `x-flwrs-platforms`.
+    pub platform: String,
 }
 
 #[utoipa::path(
@@ -158,6 +161,7 @@ async fn plugin_settings(State(service): State<Svc>) -> Json<PluginSettings> {
         allow_upload: c.allow_upload,
         admin_token_required: c.admin_token.is_some(),
         max_upload_bytes: c.max_upload_bytes,
+        platform: super::manifest::current_platform(),
     })
 }
 

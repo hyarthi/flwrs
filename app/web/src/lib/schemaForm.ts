@@ -16,6 +16,7 @@ export interface Schema {
   properties?: Record<string, Schema>;
   required?: string[];
   items?: Schema;
+  oneOf?: Schema[];
   minimum?: number;
   maximum?: number;
   exclusiveMinimum?: number;
@@ -34,6 +35,8 @@ export interface Schema {
   'x-flwrs-advanced'?: boolean;
   'x-flwrs-widget'?: 'duration' | 'cron' | 'file-path' | 'code';
   'x-flwrs-listen'?: boolean;
+  /** The platforms the property applies to (`macos`, `linux-aarch64`). */
+  'x-flwrs-platforms'?: string[];
   /** A package file an editor fills the empty field with. */
   'x-flwrs-template'?: string;
   [key: string]: unknown;
@@ -110,6 +113,43 @@ export function kindOf(schema: Schema): Kind {
   }
 }
 
+/** The context key of the platform a form's node runs on (a getter; `null`: unknown, nothing hidden). */
+export const PLATFORM_CONTEXT = 'flwrs.platform';
+
+/** Whether a property applies on `platform` (`<os>-<arch>`); unknown = yes. */
+export function appliesOn(schema: Schema, platform: string | null): boolean {
+  const list = schema['x-flwrs-platforms'];
+  if (!platform || !list?.length) return true;
+  return list.includes(platform) || list.includes(platform.split('-')[0]);
+}
+
+export interface Variant {
+  value: string;
+  label: string;
+  schema: Schema;
+}
+
+/** A `oneOf` of objects told apart by one `const` string property, as a choice and its fields. */
+export function variantsOf(root: Schema, schema: Schema): { tag: string; options: Variant[] } | null {
+  if (!schema.oneOf?.length) return null;
+  const branches = schema.oneOf.map((b) => resolve(root, b));
+  if (!branches.every((b) => b.properties)) return null;
+  const tag = Object.keys(branches[0].properties!).find((key) =>
+    branches.every((b) => {
+      const p = b.properties![key];
+      return p && typeof resolve(root, p).const === 'string';
+    }),
+  );
+  if (!tag) return null;
+  return {
+    tag,
+    options: branches.map((b) => {
+      const value = resolve(root, b.properties![tag]).const as string;
+      return { value, label: b.title ?? value, schema: b };
+    }),
+  };
+}
+
 export interface Field {
   key: string;
   schema: Schema;
@@ -127,9 +167,18 @@ export interface Field {
 }
 
 /** The top-level properties as form fields, in groups, in order. */
-export function topFields(root: Schema, configured: string[]): { group: string | null; advanced: boolean; fields: Field[] }[] {
+export function topFields(
+  root: Schema,
+  configured: string[],
+  platform: string | null = null,
+  values: Record<string, unknown> = {},
+): { group: string | null; advanced: boolean; fields: Field[] }[] {
   const required = new Set(root.required ?? []);
-  const fields: Field[] = Object.entries(root.properties ?? {}).map(([key, raw]) => {
+  // A value already set stays visible, so it can be seen and cleared.
+  const entries = Object.entries(root.properties ?? {}).filter(
+    ([key, raw]) => values[key] !== undefined || appliesOn(resolve(root, raw), platform),
+  );
+  const fields: Field[] = entries.map(([key, raw]) => {
     const schema = resolve(root, raw);
     return {
       key,

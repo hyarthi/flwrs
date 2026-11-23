@@ -13,6 +13,8 @@ workspace = true
 # The state store and the Lua host are a library too: the accumulator
 # (plugins/accumulator) builds on them.
 [lib]
+# No doc examples to run: rustdoc would still take seconds per crate.
+doctest = false
 name = "flwrs_script_transform"
 path = "src/lib.rs"
 

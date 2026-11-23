@@ -1,6 +1,6 @@
 {
   "fields": [
-    { "key": "event", "description": "What happened: detections (the objects seen in a frame), or a rule's kind (line_crossing, zone, loitering, counting)", "type": "STRING" },
+    { "key": "event", "description": "What happened: detections (the objects seen in a frame), or a rule's type (line_crossing, zone, loitering, counting)", "type": "STRING" },
     { "key": "frame_time", "description": "When the frame was captured", "type": "DATETIME" },
     { "key": "frame_seq", "description": "Frame number since the plugin started, from 1", "type": "U64" },
     { "key": "width", "description": "Frame width, pixels", "type": "U32" },

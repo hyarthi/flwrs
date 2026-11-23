@@ -57,7 +57,7 @@ impl Runtime {
     }
 }
 
-/// A kind of device a model runs on.
+/// A type of device a model runs on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Device {

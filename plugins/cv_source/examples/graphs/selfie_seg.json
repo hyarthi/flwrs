@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "seg": {
-        "kind": "model",
+        "type": "model",
         "model": "selfie_seg.onnx",
         "pre": {
           "width": 256,

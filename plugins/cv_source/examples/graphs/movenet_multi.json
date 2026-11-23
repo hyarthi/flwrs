@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "pose": {
-        "kind": "model",
+        "type": "model",
         "model": "movenet_multi.onnx",
         "pre": {
           "width": 256,

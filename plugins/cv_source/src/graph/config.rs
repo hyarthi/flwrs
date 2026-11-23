@@ -3,10 +3,10 @@
 //! ```json
 //! {
 //!   "nodes": {
-//!     "camera": {"kind": "source"},
-//!     "palm":   {"kind": "model", "model": "palm.onnx", "pre": {…}, "decode": {"type": "ssd_anchors", …}},
-//!     "roi":    {"kind": "crop", "rotate": {"from": 0, "to": 2, "angle": 90}, "scale": 2.6, "square": true},
-//!     "hand":   {"kind": "model", "model": "hand.onnx", "pre": {…}, "decode": {"type": "landmarks", …}}
+//!     "camera": {"type": "source"},
+//!     "palm":   {"type": "model", "model": "palm.onnx", "pre": {…}, "decode": {"type": "ssd_anchors", …}},
+//!     "roi":    {"type": "crop", "rotate": {"from": 0, "to": 2, "angle": 90}, "scale": 2.6, "square": true},
+//!     "hand":   {"type": "model", "model": "hand.onnx", "pre": {…}, "decode": {"type": "landmarks", …}}
 //!   },
 //!   "links": [
 //!     {"from": "camera.frame", "to": "palm.frame"},
@@ -46,10 +46,9 @@ pub struct Link {
     pub to: String,
 }
 
-/// A node, by `kind`. More kinds (`tracker`, `rule`, `lua`, `emit`) come
-/// with the stages that run them.
+/// A node, by `type`. (`emit` comes with event delivery.)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NodeConfig {
     /// The camera or video frame. Out: `frame`.
     Source {},
@@ -61,15 +60,24 @@ pub enum NodeConfig {
     Crop(CropConfig),
     /// Objects kept by class, score and count. In / out: `objects`.
     Filter(FilterConfig),
+    /// Objects followed across frames. In / out: `objects`, with track ids.
+    Tracker(TrackerConfig),
+    /// A built-in rule. In: `objects` (or `classes`); out: `events`.
+    Rule(Box<RuleConfig>),
+    /// A rule in Lua. In: `objects`; out: `events`.
+    Lua(Box<LuaRuleConfig>),
 }
 
 impl NodeConfig {
-    pub fn kind(&self) -> &'static str {
+    pub fn type_name(&self) -> &'static str {
         match self {
             NodeConfig::Source {} => "source",
             NodeConfig::Model(_) => "model",
             NodeConfig::Crop(_) => "crop",
             NodeConfig::Filter(_) => "filter",
+            NodeConfig::Tracker(_) => "tracker",
+            NodeConfig::Rule(_) => "rule",
+            NodeConfig::Lua(_) => "lua",
         }
     }
 }
@@ -303,4 +311,275 @@ fn d_max() -> usize {
 
 fn d_one() -> f32 {
     1.0
+}
+
+/// A tracker node (ByteTrack-style).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TrackerConfig {
+    /// At or above: matched first. Below: only keeps an existing track.
+    #[serde(default = "default_high")]
+    pub high_confidence: f32,
+    /// Below this, a detection is ignored.
+    #[serde(default = "default_low")]
+    pub low_confidence: f32,
+    /// What a detection needs to start a track.
+    #[serde(default = "default_new_track")]
+    pub new_track_confidence: f32,
+    /// The least box overlap (IoU) to match a confident detection.
+    #[serde(default = "default_min_iou")]
+    pub min_iou: f32,
+    /// The least overlap to match a weak one.
+    #[serde(default = "default_min_iou_low")]
+    pub min_iou_low: f32,
+    /// Frames in a row before a track counts (and gets an id).
+    #[serde(default = "default_min_hits")]
+    pub min_hits: u32,
+    /// How long a lost track waits to be picked up again, seconds.
+    #[serde(default = "default_max_lost")]
+    pub max_lost_s: f32,
+    /// Match only within a class.
+    #[serde(default = "default_true")]
+    pub class_aware: bool,
+    /// One-Euro smoothing of tracked objects' keypoints.
+    #[serde(default)]
+    pub smooth_keypoints: Option<SmoothKeypoints>,
+    /// Run the detector feeding this tracker only on control frames.
+    #[serde(default)]
+    pub control: Option<ControlConfig>,
+}
+
+fn default_high() -> f32 {
+    0.5
+}
+fn default_low() -> f32 {
+    0.1
+}
+fn default_new_track() -> f32 {
+    0.6
+}
+fn default_min_iou() -> f32 {
+    0.2
+}
+fn default_min_iou_low() -> f32 {
+    0.5
+}
+fn default_min_hits() -> u32 {
+    3
+}
+fn default_max_lost() -> f32 {
+    1.0
+}
+fn default_true() -> bool {
+    true
+}
+
+/// Control frames: the detector runs on one, the tracker carries the objects
+/// over the next `tracker_frames`, and models on tracked regions run on all.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ControlConfig {
+    /// Frames between control frames (0: detect on every frame).
+    #[serde(default = "default_tracker_frames")]
+    pub tracker_frames: u32,
+    /// Run the detector on its own thread, so a control frame doesn't hold
+    /// up the others.
+    #[serde(default = "default_true")]
+    pub background: bool,
+    /// The share of a tracked pose's keypoints that must be visible for it
+    /// to steer the box; below it, a control frame runs at once.
+    #[serde(default = "default_min_visible")]
+    pub min_visible: f32,
+    /// Control frames in a row that may miss a track before it ends (what a
+    /// crop model sees on an empty background can't keep it alive).
+    #[serde(default = "default_max_missed")]
+    pub max_missed: u32,
+    /// How gently a detection corrects the box: 1 follows it closely,
+    /// higher keeps the bounds steadier.
+    #[serde(default = "default_box_smoothing")]
+    pub box_smoothing: f32,
+}
+
+fn default_tracker_frames() -> u32 {
+    5
+}
+fn default_min_visible() -> f32 {
+    0.5
+}
+fn default_max_missed() -> u32 {
+    3
+}
+fn default_box_smoothing() -> f32 {
+    3.0
+}
+
+/// A One-Euro filter's settings.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SmoothKeypoints {
+    /// Hz: lower = smoother at rest.
+    #[serde(default = "default_min_cutoff")]
+    pub min_cutoff: f32,
+    /// How fast smoothing eases with speed: higher = less lag.
+    #[serde(default = "default_beta")]
+    pub beta: f32,
+}
+
+fn default_min_cutoff() -> f32 {
+    1.5
+}
+fn default_beta() -> f32 {
+    0.02
+}
+
+/// What a rule reads.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleInput {
+    #[default]
+    Objects,
+    /// A whole-frame classifier's classes (`label_changed`, `score_above`).
+    Classes,
+}
+
+/// The point of a box that counts for lines and zones.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Anchor {
+    /// Where people and cars touch the ground.
+    #[default]
+    BottomCenter,
+    Center,
+    TopCenter,
+}
+
+/// A rule node.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RuleConfig {
+    /// In its events (default: the node's id).
+    #[serde(default)]
+    pub name: Option<String>,
+    pub rule: RuleType,
+    #[serde(default)]
+    pub input: RuleInput,
+    /// Only these classes (default: all).
+    #[serde(default)]
+    pub classes: Vec<ClassRef>,
+    #[serde(default)]
+    pub anchor: Anchor,
+    /// How long a change must hold before it counts, seconds.
+    #[serde(default)]
+    pub debounce_s: f32,
+    /// The least time between one track's events, seconds.
+    #[serde(default)]
+    pub cooldown_s: f32,
+    /// The margin to change back: a distance (0..1) for lines and zones,
+    /// objects for counts, a score for scores.
+    #[serde(default)]
+    pub hysteresis: f32,
+}
+
+/// What a rule watches. Names follow ONVIF Profile M where it has one.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuleType {
+    /// Objects crossing a polyline. `in` = to the right of its direction.
+    LineCrossing {
+        line: Vec<[f32; 2]>,
+        #[serde(default)]
+        direction: LineDirection,
+    },
+    /// Objects entering or leaving a polygon.
+    Zone {
+        zone: Vec<[f32; 2]>,
+        #[serde(default)]
+        on: ZoneOn,
+    },
+    /// An object staying in a polygon for `seconds`.
+    Loitering { zone: Vec<[f32; 2]>, seconds: f32 },
+    /// How many objects (in a polygon, or in the frame) passing a limit.
+    Counting {
+        #[serde(default)]
+        zone: Option<Vec<[f32; 2]>>,
+        #[serde(default)]
+        above: Option<u32>,
+        #[serde(default)]
+        below: Option<u32>,
+    },
+    /// Tracks starting or ending.
+    Track {
+        #[serde(default)]
+        on: TrackOn,
+        /// A track younger than this never happened (flicker), seconds.
+        #[serde(default)]
+        min_age_s: f32,
+    },
+    /// A track's (or the frame's) label changing.
+    LabelChanged {
+        /// A model run on the object (default: the object's own class).
+        #[serde(default)]
+        from: Option<String>,
+    },
+    /// A score rising past a threshold.
+    ScoreAbove {
+        threshold: f32,
+        /// A model run on the object (default: the object's confidence).
+        #[serde(default)]
+        from: Option<String>,
+        /// Which class's score (default: the top one).
+        #[serde(default)]
+        class: Option<ClassRef>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LineDirection {
+    #[default]
+    Both,
+    In,
+    Out,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ZoneOn {
+    #[default]
+    Both,
+    Enter,
+    Exit,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackOn {
+    #[default]
+    Both,
+    Started,
+    Ended,
+}
+
+/// A Lua rule: `function(frame, objects, tracks, state)`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LuaRuleConfig {
+    /// In its events (default: the node's id).
+    #[serde(default)]
+    pub name: Option<String>,
+    pub script: String,
+    #[serde(default)]
+    pub limits: LuaLimits,
+}
+
+/// A Lua rule's limits per frame (default: the sandbox's).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LuaLimits {
+    #[serde(default)]
+    pub max_instructions: Option<u64>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub max_memory_bytes: Option<u64>,
 }

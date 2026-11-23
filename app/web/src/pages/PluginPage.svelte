@@ -146,6 +146,7 @@
           {#if plugin?.configured_fields.includes(key)}<span class="badge accent">set by its configurator</span>{/if}
           {#if f['x-flwrs-advanced']}<span class="badge">advanced</span>{/if}
           {#if f['x-flwrs-listen']}<span class="badge">listen address</span>{/if}
+          {#if f['x-flwrs-platforms']}<span class="badge">{f['x-flwrs-platforms'].join(', ')} only</span>{/if}
         </div>
         {#if f.description}<p class="desc">{f.description}</p>{/if}
         <p class="meta muted">

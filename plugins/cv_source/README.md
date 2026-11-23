@@ -2,7 +2,89 @@
 
 A flwrs source plugin that runs computer-vision models on a camera or video and emits what they see as events: objects with their boxes, keypoints and classes. One node is one camera.
 
-**Status: early.** At start, the plugin checks its model graph and loads every model on its device, then connects to the hub. The engine runs whole graphs on frames, but there's no camera input yet, so it emits no events.
+**Status: early.** At start, the plugin checks its model graph and loads every model on its device, then connects to the hub. It reads frames from a camera or files, runs the graph on them, follows objects across frames and evaluates rules. Rule events show in the debug mode; they aren't sent to the hub yet.
+
+
+## Input
+
+The `input` setting says where frames come from. Without it, the plugin loads its graph and reads nothing. A slow graph always gets the newest frame: older unread ones are dropped and counted.
+
+```json
+{ "type": "camera", "device": "FaceTime", "width": 1280, "height": 720, "fps": 30 }
+```
+
+| `type` | Settings | Notes |
+|---|---|---|
+| `camera` | `device`, `width`, `height`, `fps`, `format` (`auto`, `mjpeg`, `yuyv`, `uyvy`, `nv12`), `backend` (`auto`, `native`, `nokhwa`) | Any camera the OS exposes: built-in, USB, CSI through a video node, virtual. `device` is an index, a device id or path, or a unique part of the name; left out, the first camera. |
+| `images` | `path`, `fps`, `loop` | A folder of JPEG / PNG files, in name order. |
+| `mjpeg` | `path`, `fps`, `loop` | A file of concatenated JPEG frames. |
+
+File inputs without `fps` deliver every frame and wait for the graph, so runs are deterministic. A camera that disappears is reopened with a backoff (1 s, doubling to 30 s).
+
+| OS | Capture | Notes |
+|---|---|---|
+| macOS | AVFoundation, `nokhwa` as a fallback | `auto` falls back when the native backend can't open, gives no first frame, or killed the process during start-up (then for a day). `nokhwa` always reads YUYV. |
+| Linux | V4L2 (the `v4l` crate) | Building needs libclang and the Linux headers. Raspberry Pi CSI cameras will need `libcamera`, which isn't in yet. |
+| Windows | Media Foundation | Type-checked only so far. |
+| Others | none yet | Use a file input. |
+
+**macOS camera permission.** The plugin is a child of the server, so macOS asks on behalf of the app that started it (your terminal, for example). If it's denied, allow that app under System Settings → Privacy & Security → Camera and restart it.
+
+## Tracking and rules
+
+A `tracker` node follows objects across frames (ByteTrack-style: a Kalman filter per track, optimal matching by box overlap, weak detections keeping a partly hidden object's track alive). Objects get a `tracker_id` once seen on `min_hits` frames (default 3), and a track survives `max_lost_s` (default 1 s) without a detection. `smooth_keypoints` applies a One-Euro filter to tracked keypoints. A model run on a tracker's regions can use `"sampling": {"per_track": {"refresh_frames": 30}}` to run once per track instead of on every frame.
+
+**Control frames.** A heavy detector doesn't have to run on every frame. With `"control": {"tracker_frames": 5}` on a tracker, the model feeding it runs on one frame in six, and the tracker carries the objects in between while the models on their crops keep running on every frame. A top-down pose model suits this: its small input is what makes it cheap, and the pose it finds on each frame moves the box for the next one (only moves it: the box's size comes from the detector, eased in over a few frames so its corrections don't show as jumps). `box_smoothing` (default 3, at least 1) sets how gently detections correct the box: higher is steadier, lower hugs the person more closely. A detector also runs early when a new track waits to be confirmed, or a pose turns weak; a track control frames keep missing ends, so a crop model can't keep a ghost alive. `background` (default on) runs the detector on its own thread, so a control frame doesn't delay the others (it needs at least 2 cores). Limit the crops with the `crop` node's `max`, since cost grows with each person. `examples/graphs/pose_tracked_nanodet.json` and `pose_tracked_yolov10n.json` are complete graphs.
+
+`rule` nodes turn objects into events. Lines and zones are in normalised frame coordinates (0..1, y down), judged at the box's `anchor` (`bottom_center` by default).
+
+```json
+{ "type": "rule", "name": "door", "classes": ["person"], "debounce_s": 0.15, "hysteresis": 0.015,
+  "rule": { "type": "line_crossing", "line": [[0.5, 0.0], [0.5, 1.0]] } }
+```
+
+| `rule.type` | Fires | Settings |
+|---|---|---|
+| `line_crossing` | `in` (to the right of the line's direction) / `out` | `line`, `direction` |
+| `zone` | `enter` / `exit` | `zone`, `on` |
+| `loitering` | `exceeded`, once per stay | `zone`, `seconds` |
+| `counting` | `above` / `below` (no tracker needed) | `zone` (optional), `above`, `below` |
+| `track` | `started` / `ended` | `on`, `min_age_s` |
+| `label_changed` | `changed` | `from` (a model run on the object) |
+| `score_above` | `above`, on the rise | `threshold`, `from`, `class` |
+
+Every rule takes `debounce_s` (a change must hold this long), `cooldown_s` (the least time between one track's events) and `hysteresis` (the margin to change back: a distance for lines and zones, objects for counts, a score for scores). Without them, a real camera produces flickering events. `label_changed` and `score_above` can also read a whole-frame classifier (`"input": "classes"`). An object already inside a zone when it's first seen doesn't count as entering.
+
+### Lua rules
+
+A `lua` node's `script` is the body of `function(frame, objects, tracks, state)`, and returns nothing, an event, or a list of events (`event`, `action`, `tracker_id`, `class_name`, `label`, `previous`, `score`, `count`, `duration`, `data`). `examples/graphs/pose_hand_raised.json` is a complete one.
+
+- `frame`: `seq`, `time` (seconds), `width`, `height`.
+- `objects`: `class_id`, `class_name`, `confidence`, `tracker_id`, `box` (`x1` … `y2`), `keypoints`, `kp` (by name, with the model's `keypoint_layout`), `children` (what models run on it found, by node). In frame pixels.
+- `tracks`: `id`, `class_id`, `class_name`, `box`, `vx`, `vy` (pixels per second), `age`, `lost`.
+- `state`: the rule's own table across frames; `state.tracks[id]` is dropped when that track ends.
+- Helpers: `held(key, condition, seconds)` (true once it's been true that long), `once(key, condition, cooldown?)` (true on the frame it becomes true), `pose.angle(a, b, c)`, `pose.dist(a, b)`, `pose.torso(object)`, `pose.visible(point, min?)`.
+
+Durations use the stream's clock: real time for a camera, frame number / `fps` for a file (30 without `fps`), so a file gives the same events every run.
+
+## Debug mode
+
+`flwrs-cv-source debug` runs a node's graph with no hub and shows what it sees, using the same settings as a node, so what you tune is what you deploy. In this repository, `cargo cv-debug` runs it optimised, with its window:
+
+```sh
+cargo cv-debug --settings node.json --files models/ --camera
+cargo cv-debug --node .data/nodes/<scene>/<node> --video clip.mjpeg --loop
+```
+
+`--settings` is a JSON file with the node's launch args (`graph`, optional `input` and `execution`), and `--node` reads a node folder's `config/`. `--camera [device]`, `--video <mjpeg>` and `--images <folder>` replace the node's input.
+
+The window draws each detection as an outline (a stable colour per track), labelled with its track, class, confidence and everything the models run on it found, with its keypoints and skeleton, plus the rules' lines and zones and the latest events. Results without a box, the frame rate and each model's time and device are in a panel. Press `h` (or `?`) for the keyboard guide in the bottom-right corner: `space` pause, `n` step one frame, `b` boxes, `l` labels, `k` keypoints, `m` segmentation or depth map (when the graph has a model that produces one), `p` panel, `f` mirror the display, `z` rule lines and zones, `r` start or stop recording, `q` quit. Mirroring (off by default) only flips what's shown: the models always get the true image, so a person's left and right stay correct. While it's hidden, the corner shows how to open it.
+
+Without a display, with `--no-window`, or in a build without the `debug-window` feature, the same facts go to the console, a block per frame. `--on-change` prints only when what's seen changes, `--json` writes JSON lines, `--no-timing` makes runs comparable, and `--max-frames <n>` stops early.
+
+Recording saves every frame the camera delivers, without the overlay, as an MJPEG file under `.data/recordings/` (`--record-dir` to change it, `--record` to start at once). When it stops, the plugin prints the file and the command to replay it with `--video`, so the same movement can be tried under different settings.
+
+`--compare-cpu` also runs every model on the CPU and reports where the chosen device's results differ. Use it to check a `gpu` or `npu` setting.
 
 ## Settings
 
@@ -32,10 +114,10 @@ Models are chained inside the plugin, so a frame and its crops never travel thro
 ```json
 {
   "nodes": {
-    "camera": { "kind": "source" },
-    "palm":   { "kind": "model", "model": "mp_palm.onnx", "pre": { … }, "decode": { "type": "ssd_anchors", … } },
-    "roi":    { "kind": "crop", "rotate": { "from": 0, "to": 2, "angle": 90 }, "scale": 2.6, "shift_y": -0.5, "square": true },
-    "hand":   { "kind": "model", "model": "mp_hand.onnx", "pre": { … }, "decode": { "type": "landmarks", … } }
+    "camera": { "type": "source" },
+    "palm":   { "type": "model", "model": "mp_palm.onnx", "pre": { … }, "decode": { "type": "ssd_anchors", … } },
+    "roi":    { "type": "crop", "rotate": { "from": 0, "to": 2, "angle": 90 }, "scale": 2.6, "shift_y": -0.5, "square": true },
+    "hand":   { "type": "model", "model": "mp_hand.onnx", "pre": { … }, "decode": { "type": "landmarks", … } }
   },
   "links": [
     { "from": "camera.frame", "to": "palm.frame" },
@@ -48,9 +130,9 @@ Models are chained inside the plugin, so a frame and its crops never travel thro
 
 `examples/graphs/` has 22 graphs: detection, pose, faces, hands, segmentation, depth, OCR and re-id models, and a gesture classifier on hand landmarks.
 
-### Node kinds
+### Node types
 
-| Kind | Inputs | Output | |
+| Type | Inputs | Output | |
 |---|---|---|---|
 | `source` | none | `frame` | The camera frame. Exactly one per graph. |
 | `model` | `frame` (or `objects` with `tensor_input`) | named after its decoder's result: `objects`, `classes`, `map`, `text`, `vector` or `tensor` | Pre-processing, inference, decoding. |

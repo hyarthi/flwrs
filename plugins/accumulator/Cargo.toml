@@ -11,6 +11,8 @@ repository.workspace = true
 workspace = true
 
 [lib]
+# No doc examples to run: rustdoc would still take seconds per crate.
+doctest = false
 name = "flwrs_accumulator"
 path = "src/lib.rs"
 

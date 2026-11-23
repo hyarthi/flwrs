@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "pose": {
-        "kind": "model",
+        "type": "model",
         "model": "yolov8n_pose.onnx",
         "pre": {
           "width": 640,

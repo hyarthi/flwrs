@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "depth": {
-        "kind": "model",
+        "type": "model",
         "model": "depth_anything_s.onnx",
         "pre": {
           "width": 518,

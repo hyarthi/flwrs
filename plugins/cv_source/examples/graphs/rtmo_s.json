@@ -3,10 +3,10 @@
   "graph": {
     "nodes": {
       "camera": {
-        "kind": "source"
+        "type": "source"
       },
       "pose": {
-        "kind": "model",
+        "type": "model",
         "model": "rtmo_s.onnx",
         "pre": {
           "width": 640,

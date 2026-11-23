@@ -3,6 +3,7 @@
 use clap::Parser;
 use flwrs_cv_source::graph::config::Execution;
 use flwrs_cv_source::graph::{self, Checked, GraphConfig};
+use flwrs_cv_source::ingest::config::InputConfig;
 use flwrs_plugin::cli::{Bootstrap, read_json};
 use flwrs_plugin::schema::payload::SchemaDefinition;
 use flwrs_plugin::schema::rules;
@@ -29,6 +30,11 @@ pub struct Args {
     #[arg(long)]
     pub execution: Option<PathBuf>,
 
+    /// JSON file: where frames come from (a camera, an image folder, an
+    /// MJPEG file)
+    #[arg(long)]
+    pub input: Option<PathBuf>,
+
     /// JSON file: the events' payload schema (default: the detections schema)
     #[arg(long)]
     pub out_schema: Option<PathBuf>,
@@ -41,6 +47,8 @@ pub struct Settings {
     /// The node's files, by name (how the graph refers to them).
     pub files: BTreeMap<String, PathBuf>,
     pub execution: Execution,
+    /// Where frames come from; none: the plugin loads its graph and idles.
+    pub input: Option<InputConfig>,
     pub out_schema: SchemaDefinition,
 }
 
@@ -93,6 +101,19 @@ impl Args {
                 }
             },
         };
+        let input = match &self.input {
+            None => None,
+            Some(path) => match read_json::<InputConfig>(path) {
+                Ok(input) => {
+                    problems.extend(input.problems());
+                    Some(input)
+                }
+                Err(e) => {
+                    problems.push(format!("--input {e}"));
+                    None
+                }
+            },
+        };
         let mut files = BTreeMap::new();
         for path in &self.files {
             match path.file_name().and_then(|n| n.to_str()) {
@@ -121,6 +142,7 @@ impl Args {
                     checked,
                     files,
                     execution,
+                    input,
                     out_schema,
                 })
             }

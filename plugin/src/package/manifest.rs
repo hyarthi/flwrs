@@ -459,7 +459,11 @@ impl Manifest {
         if !self.executable.is_empty() {
             refs.push(("executable", self.executable.as_str()));
         }
-        if let Some(c) = self.configurator.as_ref().filter(|c| !c.executable.is_empty()) {
+        if let Some(c) = self
+            .configurator
+            .as_ref()
+            .filter(|c| !c.executable.is_empty())
+        {
             refs.push(("configurator.executable", c.executable.as_str()));
         }
         if let Some(p) = &self.launch_args_schema {
@@ -710,7 +714,10 @@ mod tests {
         m.launch = Some(PluginLaunch::Remote);
         // Still a package's executable: refused.
         let errors = m.validate("linux-x86_64");
-        assert!(errors.iter().any(|e| e.starts_with("executable:")), "{errors:?}");
+        assert!(
+            errors.iter().any(|e| e.starts_with("executable:")),
+            "{errors:?}"
+        );
         m.executable = String::new();
         assert!(m.validate("linux-x86_64").is_empty());
         assert!(!m.file_references().iter().any(|(f, _)| *f == "executable"));
@@ -730,10 +737,17 @@ mod tests {
         });
         let errors = m.validate("linux-x86_64");
         for field in ["configurator.executable:", "platforms:", "threads:"] {
-            assert!(errors.iter().any(|e| e.starts_with(field)), "{field} {errors:?}");
+            assert!(
+                errors.iter().any(|e| e.starts_with(field)),
+                "{field} {errors:?}"
+            );
         }
         m.manifest_version = 1;
-        assert!(m.validate("linux-x86_64").iter().any(|e| e.contains("launch needs")));
+        assert!(
+            m.validate("linux-x86_64")
+                .iter()
+                .any(|e| e.contains("launch needs"))
+        );
         // A package without an executable.
         let mut m = manifest(PluginType::Sink);
         m.executable = String::new();
@@ -746,7 +760,13 @@ mod tests {
         .unwrap();
         assert!(parsed.is_remote_only());
         assert!(parsed.validate("linux-x86_64").is_empty());
-        assert!(!serde_json::to_value(&parsed).unwrap().as_object().unwrap().contains_key("executable"));
+        assert!(
+            !serde_json::to_value(&parsed)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("executable")
+        );
     }
 
     #[test]

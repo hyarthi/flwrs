@@ -28,3 +28,9 @@ flwrs-trellis.workspace = true # tests/trellis.rs: audit and behaviour tests
 rumqttd.workspace = true # an embedded broker for the tests
 jsonschema.workspace = true
 tempfile.workspace = true
+
+[[test]]
+name = "bench"
+path = "tests/bench.rs"
+# On request only: cargo test -p flwrs-mqtt-sink --release --test bench -- --ignored --nocapture
+test = false
