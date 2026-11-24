@@ -1,0 +1,133 @@
+{
+  "format": 1,
+  "port_types": {
+    "frame": { "title": "Frame" },
+    "regions": { "title": "Regions" },
+    "objects": { "title": "Objects" },
+    "classes": { "title": "Classes" },
+    "map": { "title": "Map" },
+    "text": { "title": "Text" },
+    "vector": { "title": "Vector" },
+    "tensor": { "title": "Tensor" },
+    "events": { "title": "Rule events" }
+  },
+  "files_field": "files",
+  "live_setting": "live",
+  "connects": [
+    { "from": "regions", "to": "frame", "badge": "for each" }
+  ],
+  "node_types": {
+    "source": {
+      "title": "Camera or video",
+      "category": "Input",
+      "description": "The frames of the node's input.",
+      "settings": "#/$defs/source",
+      "max": 1,
+      "outputs": [{ "name": "frame", "type": "frame" }]
+    },
+    "model": {
+      "title": "Model",
+      "category": "Models",
+      "description": "An ONNX model: its pre-processing and how its output is read.",
+      "settings": "#/$defs/model",
+      "inputs": [
+        { "name": "frame", "type": "frame", "when": { "pointer": "/tensor_input", "present": false } },
+        { "name": "objects", "type": "objects", "when": { "pointer": "/tensor_input", "present": true } }
+      ],
+      "outputs": [
+        {
+          "type_from": {
+            "pointer": "/decode/type",
+            "map": {
+              "classify": "classes",
+              "yolo": "objects",
+              "detections_e2e": "objects",
+              "detr": "objects",
+              "gfl": "objects",
+              "ssd_anchors": "objects",
+              "yunet": "objects",
+              "movenet": "objects",
+              "rtmo": "objects",
+              "simcc": "objects",
+              "heatmap": "objects",
+              "landmarks": "objects",
+              "ocr_det": "objects",
+              "semantic": "map",
+              "dense_map": "map",
+              "ctc": "text",
+              "embedding": "vector",
+              "raw": "tensor"
+            }
+          }
+        }
+      ],
+      "file_settings": ["model"],
+      "proposal": { "field": "model_info", "file_setting": "model", "at": "/proposal" },
+      "link_badges": [
+        { "label": "every {value} frames", "when": { "pointer": "/sampling/every_n_frames", "present": true } },
+        { "label": "per track", "when": { "pointer": "/sampling/per_track", "present": true } }
+      ]
+    },
+    "crop": {
+      "title": "Crop",
+      "category": "Regions",
+      "description": "Cuts a region per object; a model linked to it runs once per region.",
+      "settings": "#/$defs/crop",
+      "inputs": [
+        { "name": "frame", "type": "frame" },
+        { "name": "objects", "type": "objects" }
+      ],
+      "outputs": [{ "name": "regions", "type": "regions" }]
+    },
+    "filter": {
+      "title": "Filter",
+      "category": "Regions",
+      "description": "Keeps objects by class and confidence.",
+      "settings": "#/$defs/filter",
+      "inputs": [{ "name": "objects", "type": "objects" }],
+      "outputs": [{ "name": "objects", "type": "objects" }]
+    },
+    "tracker": {
+      "title": "Tracker",
+      "category": "Analytics",
+      "description": "Follows objects across frames and gives them ids.",
+      "settings": "#/$defs/tracker",
+      "inputs": [{ "name": "objects", "type": "objects" }],
+      "outputs": [{ "name": "objects", "type": "objects" }]
+    },
+    "rule": {
+      "title": "Rule",
+      "category": "Analytics",
+      "description": "Turns what's seen into events: lines, zones, counts, labels.",
+      "settings": "#/$defs/rule",
+      "inputs": [
+        { "name": "objects", "type": "objects", "when": { "pointer": "/input", "not_equals": "classes", "default": "objects" } },
+        { "name": "classes", "type": "classes", "when": { "pointer": "/input", "equals": "classes", "default": "objects" } }
+      ],
+      "outputs": [{ "name": "events", "type": "events" }]
+    },
+    "lua": {
+      "title": "Lua rule",
+      "category": "Analytics",
+      "description": "A rule written in Lua.",
+      "settings": "#/$defs/lua",
+      "inputs": [{ "name": "objects", "type": "objects" }],
+      "outputs": [{ "name": "events", "type": "events" }]
+    },
+    "emit": {
+      "title": "Emit",
+      "category": "Output",
+      "description": "What the node sends as events.",
+      "settings": "#/$defs/emit",
+      "max": 1,
+      "inputs": [
+        { "name": "objects", "type": "objects", "when": { "pointer": "/mode", "not_equals": "rules", "default": "rules" } }
+      ]
+    }
+  },
+  "groups": {
+    "node_types": ["model"],
+    "families": ["execution", "resources"],
+    "settings": "#/$defs/group"
+  }
+}

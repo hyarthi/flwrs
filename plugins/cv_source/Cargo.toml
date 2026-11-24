@@ -22,6 +22,11 @@ path = "src/lib.rs"
 name = "flwrs-cv-source"
 path = "src/main.rs"
 
+[[bin]]
+name = "flwrs-cv-source-config"
+path = "src/bin/config.rs"
+test = false # no unit tests of its own
+
 [features]
 default = ["ort", "camera-nokhwa", "lua"]
 # Inference runtimes (at least one).
@@ -30,13 +35,14 @@ tract = ["dep:tract-onnx"]
 # macOS: nokhwa as the fallback camera backend.
 camera-nokhwa = ["dep:nokhwa"]
 # Lua rule nodes (vendored Lua 5.4).
-lua = ["dep:flwrs-types", "flwrs-types/lua"]
+lua = ["flwrs-types/lua"]
 # The debug mode's window (without it, the debug mode prints to the console).
 debug-window = ["dep:winit", "dep:softbuffer"]
 
 [dependencies]
 flwrs-plugin = { workspace = true, features = ["cli", "tls"] } # TLS for remote use
-flwrs-types = { workspace = true, optional = true }
+flwrs-types.workspace = true
+pbjson-types.workspace = true
 tokio.workspace = true
 clap.workspace = true
 log.workspace = true

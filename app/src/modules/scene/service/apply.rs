@@ -14,6 +14,7 @@ pub(crate) struct TargetGraph {
     pub name: String,
     pub max_hops: Option<u32>,
     pub defaults: SceneDefaults,
+    pub groups: Vec<Group>,
     pub nodes: Vec<TargetNode>,
     pub edges: Vec<TargetEdge>,
 }
@@ -212,9 +213,17 @@ impl Service {
         if scene.name != target.name
             || scene.max_hops != target.max_hops
             || scene.defaults != target.defaults
+            || scene.groups != target.groups
         {
-            query_sqlite::update_scene(tx, id, &target.name, target.max_hops, &target.defaults)
-                .await?;
+            query_sqlite::update_scene(
+                tx,
+                id,
+                &target.name,
+                target.max_hops,
+                &target.defaults,
+                &target.groups,
+            )
+            .await?;
         }
 
         let mut live_uploads: HashMap<String, Vec<NodeUpload>> = HashMap::new();
@@ -393,6 +402,7 @@ impl Service {
             name: scene.name.clone(),
             max_hops: scene.max_hops,
             defaults: scene.defaults.clone(),
+            groups: scene.groups.clone(),
             nodes: query_sqlite::list_nodes(&mut conn, Store::Live, scene_id)
                 .await?
                 .into_iter()
@@ -419,6 +429,17 @@ impl Service {
                 .map_err(|e| prefix_error(e, &format!("ops[{i}] ({name})")))?;
             ids.push(id);
         }
+
+        let entries = target
+            .nodes
+            .iter()
+            .map(|n| {
+                let node = n.as_node(scene_id)?;
+                Ok((node.id, node.config, node.plugin_id))
+            })
+            .collect::<Result<Vec<_>, ServiceError>>()?;
+        self.refuse_group_problems(scene.enabled, &target.groups, &entries)
+            .await?;
 
         let mut conn = self.conn().await?;
         let mut tx = conn.begin_with(WRITE_TX).await?;
@@ -469,12 +490,15 @@ impl Service {
                 target.name = name;
                 target.max_hops = max_hops;
                 target.defaults = input.defaults;
+                if let Some(groups) = input.groups {
+                    target.groups = groups;
+                }
                 Ok(None)
             }
             BatchOp::CreateNode { key, input } => {
                 let id = Ulid::generate().to_string();
                 add_key(keys, key, &id)?;
-                let ui = layout(&input)?;
+                let ui = layout(&input)?.map(Position::to_json);
                 let prepared = self
                     .prepare_node(Store::Live, &id, input, None, &target.defaults)
                     .await?;
@@ -491,7 +515,16 @@ impl Service {
                     .position(|n| n.id == id)
                     .ok_or(ServiceError::NotFound("node"))?;
                 let existing = target.nodes[index].as_node(scene_id)?;
-                let ui = layout(&input)?.or_else(|| target.nodes[index].ui.take());
+                let position = layout(&input)?;
+                let old_ui = target.nodes[index].ui.take();
+                let ui = match position {
+                    Some(p) => {
+                        let mut merged = NodeLayout::from_json(old_ui.as_deref());
+                        merged.set_position(Some(p));
+                        merged.to_json()
+                    }
+                    None => old_ui,
+                };
                 let prepared = self
                     .prepare_node(Store::Live, &id, input, Some(&existing), &target.defaults)
                     .await?;
@@ -637,12 +670,12 @@ fn target_node(id: &str, prepared: PreparedNode, uploads: Vec<NodeUpload>) -> Ta
 }
 
 /// A node input's position as the `ui` column holds it (checked).
-fn layout(input: &NodeInput) -> Result<Option<String>, ServiceError> {
+fn layout(input: &NodeInput) -> Result<Option<Position>, ServiceError> {
     input
         .position
         .map(|p| {
             p.check().map_err(|e| ServiceError::Invalid(vec![e]))?;
-            Ok(p.to_json())
+            Ok(p)
         })
         .transpose()
 }

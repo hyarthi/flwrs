@@ -205,6 +205,17 @@ pub struct Configurator {
     pub executable: String,
     /// The top-level launch-args properties it sets.
     pub fields: Vec<String>,
+    /// It also answers the read-only pre-flight check (`--mode preflight`):
+    /// can this node run on this machine right now? Only plugins declaring
+    /// it are ever run in that mode. Not for a remote plugin definition.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preflight: bool,
+    /// It also answers the read-only describe request (`--mode describe`):
+    /// what its configured fields would say about the node's uploaded files,
+    /// whatever state the other settings are in. Editors use it to propose
+    /// settings. Not for a remote plugin definition.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub describe: bool,
 }
 
 /// How the plugin is presented in a UI (manifest version 2).
@@ -329,6 +340,14 @@ impl Manifest {
                     self.configurator
                         .as_ref()
                         .is_some_and(|c| !c.executable.is_empty()),
+                ),
+                (
+                    "configurator.preflight",
+                    self.configurator.as_ref().is_some_and(|c| c.preflight),
+                ),
+                (
+                    "configurator.describe",
+                    self.configurator.as_ref().is_some_and(|c| c.describe),
                 ),
             ] {
                 if set {
@@ -726,8 +745,17 @@ mod tests {
         m.configurator = Some(Configurator {
             executable: String::new(),
             fields: vec!["out_schema".into()],
+            preflight: false,
+            describe: false,
         });
         assert!(m.validate("linux-x86_64").is_empty());
+        m.configurator.as_mut().unwrap().preflight = true;
+        assert!(
+            m.validate("linux-x86_64")
+                .iter()
+                .any(|e| e.starts_with("configurator.preflight:"))
+        );
+        m.configurator.as_mut().unwrap().preflight = false;
         m.configurator.as_mut().unwrap().executable = "bin/config".into();
         m.platforms = Some(vec!["linux-x86_64".into()]);
         m.threads = Some(Threads {

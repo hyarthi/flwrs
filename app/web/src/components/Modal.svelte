@@ -14,7 +14,7 @@
     title: string;
     onclose: () => void;
     children: Snippet;
-    size?: 'sm' | 'md' | 'lg' | 'xl';
+    size?: 'sm' | 'md' | 'lg' | 'xl' | 'full';
     /**
      * Full height, and the dialog itself doesn't scroll: the content lays
      * out its own scrolling area (e.g. tabs above, actions below, fixed).
@@ -68,6 +68,11 @@
 
   dialog.lg {
     width: min(960px, calc(100vw - 2 * var(--space-5)));
+  }
+
+  dialog.full {
+    width: min(1800px, calc(100vw - 2 * var(--space-4)));
+    max-width: none;
   }
 
   dialog.xl {

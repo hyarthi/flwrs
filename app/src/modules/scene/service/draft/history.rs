@@ -45,7 +45,7 @@ fn current_group() -> Option<(String, Option<String>)> {
 
 const SNAPSHOT: &str = "SELECT json_object(
     'draft', (SELECT json_object('base_revision', base_revision, 'name', \"name\", 'max_hops', max_hops,
-                                 'defaults', defaults, 'base_hash', base_hash, 'conflict', conflict)
+                                 'defaults', defaults, 'groups', \"groups\", 'base_hash', base_hash, 'conflict', conflict)
               FROM scene_drafts WHERE scene_id = $1),
     'nodes', (SELECT json_group_array(json_object('id', id, 'name', \"name\", 'type', \"type\", 'plugin_id', plugin_id,
                  'plugin_version', plugin_version, 'config', config, 'create_time', create_time,
@@ -285,12 +285,17 @@ pub(crate) async fn step(
     .await?
     .unwrap_or_default();
     restore(conn, scene_id, &snapshot).await?;
-    sqlx::query("UPDATE scene_drafts SET history_at = $1, update_time = $2 WHERE scene_id = $3")
-        .bind(seq)
-        .bind(chrono::Local::now())
-        .bind(scene_id)
-        .execute(conn)
-        .await?;
+    // Another state: a submit's mark no longer applies.
+    sqlx::query(
+        "UPDATE scene_drafts SET history_at = $1, update_time = $2, submit_state = NULL, \
+             submit_problems = NULL, submit_message = NULL, submit_time = NULL, submit_id = NULL \
+         WHERE scene_id = $3",
+    )
+    .bind(seq)
+    .bind(chrono::Local::now())
+    .bind(scene_id)
+    .execute(conn)
+    .await?;
     Ok(Some(label))
 }
 
@@ -312,7 +317,7 @@ async fn restore(
     sqlx::query(
         "UPDATE scene_drafts SET base_revision = json_extract($2, '$.draft.base_revision'), \
              \"name\" = json_extract($2, '$.draft.name'), max_hops = json_extract($2, '$.draft.max_hops'), \
-             defaults = json_extract($2, '$.draft.defaults'), base_hash = json_extract($2, '$.draft.base_hash'), \
+             defaults = json_extract($2, '$.draft.defaults'), \"groups\" = COALESCE(json_extract($2, '$.draft.groups'), '[]'), base_hash = json_extract($2, '$.draft.base_hash'), \
              conflict = json_extract($2, '$.draft.conflict') \
          WHERE scene_id = $1",
     )

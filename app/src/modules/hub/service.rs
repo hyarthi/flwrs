@@ -15,6 +15,7 @@
 
 use super::config::HubConfig;
 use super::link_stats::{HubConnections, LinkReport, LinkStats, Lost, Pings};
+use super::live::{self, LiveFeeds};
 use super::pending::{PendingLimits, PendingSlot};
 use super::wire::{self, DataEvent, InitInfo, Negotiated};
 use crate::modules::plugin::manifest::PluginType;
@@ -26,18 +27,18 @@ use flwrs_plugin::plugin::frame::{
 use flwrs_plugin::schema::payload::{Field, SchemaDefinition, field_value::Value};
 use flwrs_plugin::schema::protocol::{
     Ack, Credit, ErrorEvent, EventMetadata, Exit, FrameHeader, Initialize, InitializeResponse,
-    LogEvent, Nack, Ping, Pong, Shutdown, capability::Enum as Capability,
-    log_level::Enum as LogLevel, msg_code::Enum as MsgCode,
+    LiveFeed, LiveFeedControl, LogEvent, Nack, Ping, Pong, Shutdown,
+    capability::Enum as Capability, log_level::Enum as LogLevel, msg_code::Enum as MsgCode,
 };
 use flwrs_plugin::schema::rules;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Frames queued for one connection's writer.
@@ -52,6 +53,8 @@ const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MISSED_HEARTBEATS: u32 = 3;
 /// Inputs a transform's outputs can still refer to after they're acked.
 const INPUT_MEMORY: usize = 1024;
+/// At most one WARN per this interval about a node's dropped live feed frames.
+const LIVE_DROP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 pub(crate) type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
@@ -207,6 +210,8 @@ struct Inner {
     refused_busy: AtomicU64,
     /// Handshakes that failed before reaching a node ([`stranger`]).
     failed_handshakes: AtomicU64,
+    /// Live observation data, per node.
+    live: LiveFeeds,
 }
 
 struct NodeEntry {
@@ -346,6 +351,7 @@ impl Hub {
                 pending,
                 refused_busy: AtomicU64::new(0),
                 failed_handshakes: AtomicU64::new(0),
+                live: LiveFeeds::default(),
             }),
         })
     }
@@ -364,6 +370,11 @@ impl Hub {
             refused_busy: inner.refused_busy.load(Ordering::Relaxed),
             failed_handshakes: inner.failed_handshakes.load(Ordering::Relaxed),
         }
+    }
+
+    /// Nodes' live feeds (what the live view reads).
+    pub(crate) fn live(&self) -> LiveFeeds {
+        self.inner.live.clone()
     }
 
     /// The address plugins connect to (with the actual port if `port = 0`).
@@ -701,6 +712,7 @@ fn negotiate(config: &HubConfig, plugin_type: PluginType, init: &InitInfo) -> Ne
         acks,
         credits,
         max_unacked,
+        live_feed: init.capabilities.contains(&Capability::LiveFeed),
     }
 }
 
@@ -1084,6 +1096,10 @@ async fn serve_connection(
     );
     let heartbeat = (heartbeat_ms > 0).then(|| Duration::from_millis(u64::from(heartbeat_ms)));
     let write_failed = CancellationToken::new();
+    let watched = conn
+        .negotiated
+        .live_feed
+        .then(|| inner.live.connected(&expected.node_id, conn.id));
     tokio::spawn(write_frames(
         writer,
         out_rx,
@@ -1091,6 +1107,7 @@ async fn serve_connection(
         write_failed.clone(),
         heartbeat,
         conn.shared.clone(),
+        watched,
     ));
     let _ = events
         .send(HubEvent::Connected {
@@ -1115,6 +1132,9 @@ async fn serve_connection(
         seqs: SeqCounter::new(),
         exited: false,
         max_event_bytes,
+        live: inner.live.clone(),
+        max_live_feed_bytes: inner.config.max_live_feed_bytes,
+        live_drop_log: RateLimit::new(LIVE_DROP_LOG_INTERVAL),
     };
     let lost = loop {
         // Only time spent waiting to read counts as silence; time spent
@@ -1164,6 +1184,9 @@ async fn serve_connection(
     };
 
     conn.close.cancel(); // stops the writer
+    if conn.negotiated.live_feed {
+        inner.live.disconnected(&expected.node_id, conn.id);
+    }
     let was_current = unregister(&inner, &expected.node_id, conn.id);
     if let Some((cause, reason)) = lost
         && was_current
@@ -1196,6 +1219,9 @@ struct Running {
     /// After Exit, the plugin closing the connection is expected.
     exited: bool,
     max_event_bytes: usize,
+    live: LiveFeeds,
+    max_live_feed_bytes: usize,
+    live_drop_log: RateLimit,
 }
 
 impl Running {
@@ -1274,6 +1300,10 @@ impl Running {
                 log_plugin_error(&self.tag, &self.node_id, decode(&frame)?);
                 return Ok(true);
             }
+            MsgCode::LiveFeed => {
+                self.live_feed(&frame)?;
+                return Ok(true);
+            }
             MsgCode::Ping => {
                 let ping: Ping = decode(&frame)?;
                 let _ = self
@@ -1298,6 +1328,11 @@ impl Running {
 
     /// A data frame larger than the event size limit: its body was skipped.
     async fn oversized(&mut self, header: FrameHeader, body_len: usize) -> Result<bool, String> {
+        if header.code() == MsgCode::LiveFeed {
+            self.require_live_feed()?;
+            self.live_frame_dropped(body_len);
+            return Ok(true);
+        }
         if header.code() != MsgCode::Event
             || !wire::plugin_may_send(self.plugin_type, MsgCode::Event)
         {
@@ -1327,6 +1362,46 @@ impl Running {
         )
         .await;
         Ok(true)
+    }
+
+    /// Takes a live feed frame. It never waits, so observation can't hold up
+    /// this connection's events or heartbeats. Too large = dropped.
+    fn live_feed(&mut self, frame: &Frame) -> Result<(), String> {
+        self.require_live_feed()?;
+        if frame.body.len() > self.max_live_feed_bytes {
+            self.live_frame_dropped(frame.body.len());
+            return Ok(());
+        }
+        let feed: LiveFeed = decode(frame)?;
+        if let Some(violation) = live::violation(&feed) {
+            return Err(violation);
+        }
+        let channel = feed.channel.clone();
+        if !self.live.receive(&self.node_id, self.conn.id, feed) && self.live_drop_log.allow() {
+            log::warn!(
+                "Hub: {} ignored live feed channel {channel:?}: too many channels",
+                self.tag
+            );
+        }
+        Ok(())
+    }
+
+    fn live_frame_dropped(&self, body_len: usize) {
+        if self.live_drop_log.allow() {
+            log::warn!(
+                "Hub: {} dropped a live feed frame of {body_len} bytes (limit {})",
+                self.tag,
+                self.max_live_feed_bytes.min(self.max_event_bytes)
+            );
+        }
+    }
+
+    fn require_live_feed(&self) -> Result<(), String> {
+        if self.conn.negotiated.live_feed {
+            Ok(())
+        } else {
+            Err("LiveFeed without the LIVE_FEED capability".into())
+        }
     }
 
     /// Checks an EVENT frame's seq and credit. Returns its seq.
@@ -1428,7 +1503,9 @@ async fn write_and_flush(writer: &mut BoxedWriter, frame: &[u8]) -> std::io::Res
     writer.flush().await
 }
 
-/// Writes queued frames, and a PING every heartbeat interval.
+/// Writes queued frames, a PING every heartbeat interval, and the watched
+/// live channels when they change (the newest list only, so it takes no room
+/// in the queue and can't be held up by it).
 async fn write_frames(
     mut writer: BoxedWriter,
     mut frames: mpsc::Receiver<Vec<u8>>,
@@ -1436,6 +1513,7 @@ async fn write_frames(
     failed: CancellationToken,
     heartbeat: Option<Duration>,
     shared: Arc<ConnShared>,
+    mut watched: Option<watch::Receiver<BTreeSet<String>>>,
 ) {
     let mut ticker = heartbeat.map(|interval| {
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
@@ -1450,8 +1528,22 @@ async fn write_frames(
                 None => std::future::pending().await,
             }
         };
+        let live = async {
+            match watched.as_mut() {
+                Some(rx) => rx.changed().await.is_ok(),
+                None => std::future::pending().await,
+            }
+        };
         let frame = tokio::select! {
             _ = close.cancelled() => break,
+            open = live => {
+                let Some(rx) = watched.as_mut().filter(|_| open) else {
+                    watched = None;
+                    continue;
+                };
+                let channels = rx.borrow_and_update().iter().cloned().collect();
+                encode_message(&LiveFeedControl { channels })
+            }
             frame = frames.recv() => match frame {
                 Some(frame) => frame,
                 None => break,

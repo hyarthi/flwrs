@@ -1,10 +1,12 @@
 <script lang="ts">
-  // The scene's settings (name, hop limit, node defaults), edited in the
+  // The scene's settings (name, hop limit, node defaults, groups), edited in the
   // draft like the graph: they reach live when the draft is submitted.
   import { untrack } from 'svelte';
   import Modal from '../Modal.svelte';
   import { ApiError } from '../../lib/api';
-  import { updateDraftSettings, type SceneView } from '../../lib/sceneView';
+  import { updateDraftNode, updateDraftSettings, type SceneView } from '../../lib/sceneView';
+  import { groupEdit, groupsOf, isEditable, membersByGroup, movedMembership, rowProblems, toRows, withGroups } from '../../lib/groups';
+  import GroupEditor from './GroupEditor.svelte';
   import { getInfo, type ServerInfo } from '../../lib/server';
 
   let { view, onclose }: { view: SceneView; onclose: () => void } = $props();
@@ -17,6 +19,17 @@
   let remoteAuth = $state<'' | 'token' | 'mtls'>(current.defaults.remote_auth ?? '');
   /** '' = the server's default (TLS required when the hub has a TLS listener). */
   let requireTls = $state<'' | 'true' | 'false'>(current.defaults.require_tls === undefined ? '' : String(current.defaults.require_tls) as 'true' | 'false');
+
+  // Groups: edited as rows; members follow a rename or a delete on save.
+  const graph = untrack(() => view.draft?.nodes ?? view.nodes);
+  const beforeGroups = current.groups ?? [];
+  const groupMembers = membersByGroup(graph);
+  const checkProblems = untrack(() => (view.draft_check ?? view.check).problems);
+  let groupRows = $state(toRows(beforeGroups));
+  const edit = $derived(groupEdit(beforeGroups, groupRows));
+  const groupsInvalid = $derived(rowProblems(groupRows).size > 0);
+  /** The server refuses a groups list holding a family it doesn't accept. */
+  const blockedBy = $derived(edit.changed ? edit.groups.filter((g) => !isEditable(g)).map((g) => g.id) : []);
 
   // The server's own defaults, to say what leaving a setting out means.
   let info = $state<ServerInfo | null>(null);
@@ -32,6 +45,7 @@
     busy = true;
     error = null;
     try {
+      const undo = edit.changed ? { group: `groups-${Date.now()}-${Math.random().toString(36).slice(2)}`, label: 'Edit groups' } : undefined;
       await updateDraftSettings(view.scene.id, {
         name: name.trim(),
         max_hops: typeof maxHops === 'number' ? maxHops : null,
@@ -40,7 +54,14 @@
           ...(remoteAuth ? { remote_auth: remoteAuth } : {}),
           ...(requireTls ? { require_tls: requireTls === 'true' } : {}),
         },
-      });
+        ...(edit.changed ? { groups: edit.groups } : {}),
+      }, undo);
+      // Members follow renames and deletes (nodes removed in the draft can't be edited).
+      for (const n of view.draft?.nodes ?? view.nodes) {
+        if ('change' in n && n.change === 'removed') continue;
+        const next = movedMembership(groupsOf(n.config), edit.moves);
+        if (next) await updateDraftNode(view.scene.id, n.id, { name: n.name, plugin_id: n.plugin_id, config: withGroups(n.config, next) }, undo);
+      }
       onclose();
     } catch (e) {
       error = e instanceof ApiError ? e : new ApiError(0, String(e));
@@ -83,6 +104,10 @@
       </label>
       <span class="hint muted">A node’s own setting wins over these.</span>
     </fieldset>
+    <GroupEditor bind:rows={groupRows} members={groupMembers} problems={checkProblems} />
+    {#if blockedBy.length}
+      <div class="notice warn" role="status">A scene doesn’t accept {blockedBy.join(', ')}: delete {blockedBy.length === 1 ? 'it' : 'them'} to save changes to groups.</div>
+    {/if}
     {#if error}
       <div class="notice danger" role="alert">
         <div>
@@ -96,7 +121,7 @@
     <p class="muted hint">Saved to the draft: live changes when you submit it.</p>
     <div class="dialog-actions">
       <button class="btn" type="button" onclick={onclose}>Cancel</button>
-      <button class="btn primary" type="submit" disabled={busy || !name.trim()}>Save to draft</button>
+      <button class="btn primary" type="submit" disabled={busy || !name.trim() || groupsInvalid || blockedBy.length > 0}>Save to draft</button>
     </div>
   </form>
 </Modal>

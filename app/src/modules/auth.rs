@@ -119,6 +119,17 @@ impl Auth {
         }
     }
 
+    /// A guard with `key`, for tests of routes behind it.
+    #[cfg(test)]
+    pub(crate) fn with_key(key: &str) -> &'static Self {
+        Box::leak(Box::new(Self::new(AuthSettings {
+            secret_key: Some(key.to_string()),
+            session_ttl: Duration::from_secs(3_600),
+            allowed_origins: vec![],
+            secure_cookie: None,
+        })))
+    }
+
     /// Whether only loopback clients get in (no key configured).
     pub(crate) fn loopback_only(&self) -> bool {
         self.key.is_none()

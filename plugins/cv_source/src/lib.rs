@@ -8,13 +8,17 @@ compile_error!("flwrs-cv-source needs an inference runtime: enable the `ort` or 
 
 pub mod analytics;
 pub mod backend;
+pub mod configure;
 pub mod debug;
 pub mod decode;
+pub mod emit;
 pub mod frame;
 pub mod graph;
 pub mod ingest;
+pub mod inspect;
 pub mod keypoints;
 pub mod labels;
+pub mod live;
 pub mod model;
 pub mod pre;
 pub mod results;

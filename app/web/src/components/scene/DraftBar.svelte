@@ -32,6 +32,15 @@
     return rows + (draft.settings.change !== 'unchanged' ? 1 : 0);
   });
   const conflicts = $derived(draft?.conflicts.length ?? 0);
+  const held = $derived(draft?.submit ?? null);
+  const heldLines = $derived(
+    held ? [...held.problems.map((p) => `${nodeName(p.node_id)}: ${p.message}`), ...(held.message ? [held.message] : [])] : [],
+  );
+
+  function nodeName(id: string): string {
+    const node = draft?.nodes.find((n) => n.id === id) ?? null;
+    return node?.name ?? id;
+  }
 
   let reviewing = $state(false);
   let editingSettings = $state(false);
@@ -80,6 +89,11 @@
       {#if conflicts}
         <span class="badge warn">{plural(conflicts, 'conflict')}</span>
       {/if}
+      {#if held?.state === 'WAITING'}
+        <span class="badge warn" title={heldLines.join('\n')}>Waiting for pre-flight</span>
+      {:else if held}
+        <span class="badge danger" title={heldLines.join('\n')}>Submit failed</span>
+      {/if}
     {:else}
       <span class="badge">Live</span>
       <span class="muted">Edits start a draft; live changes only when you submit it.</span>
@@ -123,15 +137,30 @@
           class="btn primary"
           type="button"
           disabled={busy || conflicts > 0 || !draft.has_changes}
-          title={conflicts ? 'Resolve the conflicts first (Review)' : !draft.has_changes ? 'Nothing to submit' : 'Apply the draft to live'}
+          title={conflicts ? 'Resolve the conflicts first (Review)' : !draft.has_changes ? 'Nothing to submit' : held ? 'Run the pre-flight checks again, and apply the draft if they pass' : 'Apply the draft to live'}
           onclick={submit}
         >
-          <Send size={16} strokeWidth={1.75} />Submit
+          <Send size={16} strokeWidth={1.75} />{held?.state === 'WAITING' ? 'Check now' : held ? 'Retry submit' : 'Submit'}
         </button>
       {/if}
     {/if}
   </div>
 </div>
+
+{#if held}
+  <div class="notice held {held.state === 'WAITING' ? 'warn' : 'danger'}" role="status">
+    <div>
+      {#if held.state === 'WAITING'}
+        Not committed yet: waiting for the pre-flight check{held.retry ? ` (check ${held.retry.attempt} of ${held.retry.max_attempts})` : ''}. The scene keeps running its current version.
+      {:else}
+        Not committed: the scene keeps running its current version, and the draft is kept.
+      {/if}
+      {#if heldLines.length}
+        <ul>{#each heldLines as line, i (i)}<li>{line}</li>{/each}</ul>
+      {/if}
+    </div>
+  </div>
+{/if}
 
 {#if reviewing && draft}
   <ReviewDialog
@@ -176,6 +205,11 @@
 {/if}
 
 <style>
+  .held {
+    margin: var(--space-2) var(--space-3) 0;
+    overflow-wrap: anywhere;
+  }
+
   .bar {
     display: flex;
     flex-wrap: wrap;

@@ -7,12 +7,16 @@
 
 use crate::modules::plugin::service::Plugin;
 use crate::modules::scene::service::{Store, stored_name};
-use flwrs_plugin::package::configure::{self, Configured, Invocation};
+use flwrs_plugin::package::configure::{
+    self, Configured, Invocation, PreflightProblem, PreflightReport,
+};
 use flwrs_plugin::package::{LaunchSpec, Manifest};
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, SqliteConnection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) use configure::Limits;
 
@@ -107,6 +111,30 @@ fn with_invocation<T>(
     })
 }
 
+/// Runs the package's describe mode on a node's uploads (on a blocking
+/// thread). `Ok(None)`: the plugin doesn't declare it.
+pub(crate) async fn describe(
+    package: &PackageRef,
+    launch_args: &Value,
+    node_id: &str,
+    uploads: HashMap<String, PathBuf>,
+    limits: &Limits,
+) -> Result<Option<serde_json::Map<String, Value>>, Vec<String>> {
+    let (package, launch_args, node_id, limits) = (
+        package.clone(),
+        launch_args.clone(),
+        node_id.to_string(),
+        limits.clone(),
+    );
+    tokio::task::spawn_blocking(move || {
+        with_invocation(&package, &launch_args, &node_id, &uploads, &limits, |inv| {
+            configure::describe(inv)
+        })
+    })
+    .await
+    .map_err(|e| vec![format!("the describe run's thread failed: {e}")])?
+}
+
 /// Runs the package's configurator for a node (on a blocking thread).
 pub(crate) async fn run(
     package: &PackageRef,
@@ -133,6 +161,121 @@ pub(crate) async fn run(
     })
     .await
     .map_err(|e| vec![format!("the configurator's thread failed: {e}")])?
+}
+
+/// How many pre-flight programs one call runs at a time.
+const MAX_PREFLIGHT_PARALLEL: usize = 32;
+
+/// One local node's pre-flight check, ready to run.
+#[derive(Clone, Debug)]
+pub(crate) struct PreflightTarget {
+    pub node_id: String,
+    pub package: PackageRef,
+    pub launch_args: Value,
+    pub uploads: HashMap<String, PathBuf>,
+    pub plugin_id: String,
+    /// Running nodes of the same plugin and scene that this change stops.
+    pub releasing: Vec<configure::ReleasingNode>,
+}
+
+/// The nodes of `snapshot` that get a pre-flight check: local ones whose
+/// plugin declares it, all or only those in `only`.
+pub(crate) fn preflight_targets(
+    snapshot: &crate::modules::scene::service::SceneSnapshot,
+    files_dir: &Path,
+    only: Option<&std::collections::HashSet<String>>,
+) -> Vec<PreflightTarget> {
+    snapshot
+        .nodes
+        .iter()
+        .filter(|n| n.config.launch == crate::modules::node_config::LaunchMode::Local)
+        .filter(|n| only.is_none_or(|ids| ids.contains(&n.id)))
+        .filter_map(|n| {
+            let package = PackageRef::of(snapshot.plugins.get(&n.plugin_id)?)?;
+            configure::has_preflight(&package.manifest).then(|| PreflightTarget {
+                node_id: n.id.clone(),
+                plugin_id: n.plugin_id.clone(),
+                releasing: vec![],
+                package,
+                launch_args: n.config.launch_args.clone(),
+                uploads: n
+                    .uploads
+                    .iter()
+                    .map(|u| {
+                        (
+                            u.name.clone(),
+                            files_dir.join(stored_name(&u.name, &u.sha256)),
+                        )
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// Runs the targets' checks in parallel, each on a blocking thread and under
+/// `limits`. Returns `(node id, report)` in the targets' order. `cancel` kills
+/// the running programs; what's cut short then reports a retryable problem.
+pub(crate) async fn run_preflight(
+    targets: &[PreflightTarget],
+    limits: &Limits,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Vec<(String, PreflightReport)> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (flag, cancel) = (flag.clone(), cancel.clone());
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            flag.store(true, Ordering::Relaxed);
+        })
+    };
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_PREFLIGHT_PARALLEL));
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, target) in targets.iter().cloned().enumerate() {
+        let (flag, limits, permits) = (flag.clone(), limits.clone(), permits.clone());
+        tasks.spawn(async move {
+            let node_id = target.node_id.clone();
+            let _permit = permits.acquire_owned().await;
+            let ran = tokio::task::spawn_blocking(move || {
+                with_invocation(
+                    &target.package,
+                    &target.launch_args,
+                    &target.node_id,
+                    &target.uploads,
+                    &limits,
+                    |inv| Ok(configure::preflight_with(inv, &target.releasing, &flag)),
+                )
+            })
+            .await;
+            let report = match ran {
+                Ok(Ok(report)) => report,
+                Ok(Err(errors)) => PreflightReport {
+                    problems: errors
+                        .into_iter()
+                        .map(|message| PreflightProblem {
+                            message,
+                            retryable: false,
+                        })
+                        .collect(),
+                    warnings: vec![],
+                },
+                Err(e) => PreflightReport {
+                    problems: vec![PreflightProblem {
+                        message: format!("the pre-flight check's thread failed: {e}"),
+                        retryable: false,
+                    }],
+                    warnings: vec![],
+                },
+            };
+            (index, node_id, report)
+        });
+    }
+    let mut done = tasks.join_all().await;
+    watcher.abort();
+    done.sort_by_key(|(index, ..)| *index);
+    done.into_iter()
+        .map(|(_, id, report)| (id, report))
+        .collect()
 }
 
 /// Whether `url` is within one of the `allowed` prefixes: the same, or
@@ -412,7 +555,7 @@ async fn store_warnings(
         "INSERT INTO scene_node_configure_warnings (node_id, args_key, warnings, run_time) \
          VALUES ($1, $2, $3, $4) \
          ON CONFLICT (node_id, args_key) DO UPDATE SET warnings = excluded.warnings, \
-             run_time = excluded.run_time",
+             errors = '[]', run_time = excluded.run_time",
     )
     .bind(node_id)
     .bind(&key)
@@ -420,6 +563,10 @@ async fn store_warnings(
     .bind(chrono::Local::now())
     .execute(&mut *conn)
     .await?;
+    keep_recent_runs(conn, node_id).await
+}
+
+async fn keep_recent_runs(conn: &mut SqliteConnection, node_id: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "DELETE FROM scene_node_configure_warnings WHERE node_id = $1 AND args_key NOT IN \
          (SELECT args_key FROM scene_node_configure_warnings WHERE node_id = $1 \
@@ -432,21 +579,56 @@ async fn store_warnings(
     Ok(())
 }
 
+/// Records what a configurator refused about settings a draft keeps anyway
+/// (`launch_args`: those settings, without configured fields).
+pub(crate) async fn store_refusal(
+    conn: &mut SqliteConnection,
+    node_id: &str,
+    launch_args: &Value,
+    errors: &[String],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO scene_node_configure_warnings (node_id, args_key, warnings, errors, run_time) \
+         VALUES ($1, $2, '[]', $3, $4) \
+         ON CONFLICT (node_id, args_key) DO UPDATE SET warnings = '[]', \
+             errors = excluded.errors, run_time = excluded.run_time",
+    )
+    .bind(node_id)
+    .bind(warnings_key(launch_args))
+    .bind(serde_json::to_string(errors).expect("strings serialize"))
+    .bind(chrono::Local::now())
+    .execute(&mut *conn)
+    .await?;
+    keep_recent_runs(conn, node_id).await
+}
+
+/// What the configurator run behind some settings had to say.
+pub(crate) struct RunNotes {
+    pub warnings: Vec<String>,
+    /// It refused these settings (only a draft keeps them).
+    pub errors: Vec<String>,
+    pub time: chrono::DateTime<chrono::Local>,
+}
+
 /// The warnings of the run that produced these launch args, with its time.
 pub(crate) async fn warnings(
     conn: &mut SqliteConnection,
     node_id: &str,
     launch_args: &Value,
-) -> Result<Option<(Vec<String>, chrono::DateTime<chrono::Local>)>, sqlx::Error> {
-    let row: Option<(String, chrono::DateTime<chrono::Local>)> = sqlx::query_as(
-        "SELECT warnings, run_time FROM scene_node_configure_warnings \
+) -> Result<Option<RunNotes>, sqlx::Error> {
+    let row: Option<(String, String, chrono::DateTime<chrono::Local>)> = sqlx::query_as(
+        "SELECT warnings, errors, run_time FROM scene_node_configure_warnings \
          WHERE node_id = $1 AND args_key = $2",
     )
     .bind(node_id)
     .bind(warnings_key(launch_args))
     .fetch_optional(conn)
     .await?;
-    Ok(row.map(|(text, time)| (serde_json::from_str(&text).unwrap_or_default(), time)))
+    Ok(row.map(|(warnings, errors, time)| RunNotes {
+        warnings: serde_json::from_str(&warnings).unwrap_or_default(),
+        errors: serde_json::from_str(&errors).unwrap_or_default(),
+        time,
+    }))
 }
 
 /// Drops the warnings of nodes that are in neither the live graph nor a draft.

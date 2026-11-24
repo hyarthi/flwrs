@@ -4,7 +4,9 @@
 pub(crate) mod api;
 pub(crate) mod api_draft;
 pub(crate) mod api_graph;
+pub(crate) mod api_live;
 pub(crate) mod api_mapping;
+pub(crate) mod api_preflight;
 pub(crate) mod api_scene_stream;
 pub(crate) mod api_status;
 pub(crate) mod api_stream;
@@ -14,6 +16,7 @@ pub(crate) mod api_usage;
 pub(crate) mod archive;
 pub(crate) mod config;
 pub(crate) mod graph;
+pub(crate) mod groups;
 pub(crate) mod scene_file;
 pub(crate) mod service;
 
@@ -32,6 +35,7 @@ pub(crate) async fn init(director: DirectorHandle) -> &'static Service {
     SERVICE
         .get_or_init(|| async {
             let paths = DirectorConfig::read();
+            let preflight_retry = paths.preflight_retry.clone();
             let limits = config::ScenesConfig::read();
             let files = service::NodeFiles {
                 nodes_dir: paths.nodes_dir,
@@ -51,7 +55,11 @@ pub(crate) async fn init(director: DirectorHandle) -> &'static Service {
                     max_file_bytes: files.max_upload_bytes,
                 },
             });
-            let service = Service::new(main_db().await, plugin::service(), director, files);
+            let service = Service::new(main_db().await, plugin::service(), director, files)
+                .with_preflight_retry(preflight_retry);
+            if let Err(e) = service.fail_stale_submits().await {
+                log::warn!("Scene service: couldn't update waiting draft submits: {e}");
+            }
             if let Err(e) = service.clean_files().await {
                 log::warn!("Scene service: couldn't clean up uploaded files: {e}");
             }

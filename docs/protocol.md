@@ -25,6 +25,7 @@ Contents:
 15. [Versioning and compatibility](#15-versioning-and-compatibility)
 16. [Writing a minimal plugin](#16-writing-a-minimal-plugin)
 17. [Open questions](#17-open-questions)
+18. [Live feed](#18-live-feed-capability-live_feed)
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
@@ -127,13 +128,15 @@ Each code names exactly one body type. The table also says who may send it.
 | 10 | `CREDIT` | `Credit` | hub | Only with capability `CREDITS`, to producers. |
 | 11 | `PING` | `Ping` | both | |
 | 12 | `PONG` | `Pong` | both | |
+| 13 | `LIVE_FEED` | `LiveFeed` | plugin | Only with capability `LIVE_FEED` ([section 18](#18-live-feed-capability-live_feed)). |
+| 14 | `LIVE_FEED_CONTROL` | `LiveFeedControl` | hub | Only with capability `LIVE_FEED`. |
 
 Code `0` (`UNDEFINED`) is never valid. What each plugin type may send and receive after the handshake:
 
 | | Source | Transform | Sink |
 |---|---|---|---|
-| plugin → hub | `EVENT`, `LOG`, `ERROR`, `EXIT`, `PING`, `PONG` | all of the source's, plus `ACK`, `NACK` | `LOG`, `ERROR`, `EXIT`, `PING`, `PONG`, `ACK`, `NACK` |
-| hub → plugin | `SHUTDOWN`, `PING`, `PONG`, `CREDIT`, `ACK`, `NACK` | all of the source's, plus `EVENT` | `SHUTDOWN`, `PING`, `PONG`, `EVENT` |
+| plugin → hub | `EVENT`, `LOG`, `ERROR`, `EXIT`, `PING`, `PONG`, `LIVE_FEED` | all of the source's, plus `ACK`, `NACK` | `LOG`, `ERROR`, `EXIT`, `PING`, `PONG`, `LIVE_FEED`, `ACK`, `NACK` |
+| hub → plugin | `SHUTDOWN`, `PING`, `PONG`, `CREDIT`, `ACK`, `NACK`, `LIVE_FEED_CONTROL` | all of the source's, plus `EVENT` | `SHUTDOWN`, `PING`, `PONG`, `EVENT`, `LIVE_FEED_CONTROL` |
 
 `ACK` and `NACK` go from consumers to the hub (for events the hub delivered), and from the hub to producers (for events they sent). A code outside its row is a protocol violation ([section 13](#13-errors-and-protocol-violations)).
 
@@ -154,6 +157,8 @@ The definitions are in [`plugin/schema/protocol.proto`](../plugin/schema/protoco
 | `ErrorEvent` | `message`, `details` |
 | `Shutdown` | `reason` |
 | `Exit` | `code` (`OK`, `INTERRUPTED`, `ERROR`), `message` |
+| `LiveFeed` | `channel`, `media_type`, `data`, `seq`, `capture_time` |
+| `LiveFeedControl` | `channels` |
 
 Every enum's zero value is `UNDEFINED`, so a field that was never set can't be mistaken for a real value. Enums are wrapped in a message (`MsgCode.Enum`, `PluginType.Enum`, …) to keep their value names scoped.
 
@@ -393,6 +398,8 @@ Every implementation enforces the same limits, so a frame accepted by one side i
 | Connections still in their handshake | 256 at once, 8 per address (loopback not counted) by default; configurable. More are closed at once (section 6.1). |
 | Event body, as accepted by the hub | 16 MiB by default (configurable, and lower per node). Larger events are skipped without being buffered, and NACKed (`retry = false`) to producers with `ACKS`. |
 | Nesting depth of payload values and schemas | at most 32 levels |
+| `LiveFeed` body, as kept by the hub | 4 MiB by default (`[hub] max_live_feed_bytes`; a node's lower event limit also applies). Larger frames are dropped; the connection stays. |
+| Live feed channels | 16 per connection, names of 1 to 64 characters |
 
 Protobuf itself allows messages up to 2 GiB, and most libraries limit decoding to 100 levels of nesting, so these limits are below every library default. Keep events small: results, labels, detections, small crops. For anything over about 1 MiB, pass a reference (a key in an object store, a file name in a shared folder) instead of the data.
 
@@ -453,3 +460,23 @@ Feedback is especially welcome on these:
 3. **Batching and compression** are reserved in `flags` but not specified. Is per-frame compression worth it for the expected event sizes, or is batching (several events per frame) the better first step?
 4. **Heartbeat defaults**: a 10 s interval with three missed intervals, about 30 s to notice a dead link. Too slow for some deployments, too chatty for others?
 5. **How far back a transform's output can refer**: the hub remembers every unacked input and the last 1024 delivered. Should that window be negotiable, for accumulators with long windows? Or should an output be able to name several inputs (span links in tracing terms)?
+
+## 18. Live feed (capability `LIVE_FEED`)
+
+An optional side channel for observing a running node: stats, a preview image. It's separate from the data flow. Its frames never enter a scene, and they have no `seq` in the header, no credit and no acks. Any of them may be dropped, by either side, at any time.
+
+**Negotiation.** A plugin offers `LIVE_FEED` in `Initialize`, and the hub enables it in `InitializeResponse`. Without it, neither `LIVE_FEED` nor `LIVE_FEED_CONTROL` may be sent: doing so is a protocol violation ([section 13](#13-errors-and-protocol-violations)).
+
+**Channels.** A plugin has up to 16 named channels. A name is 1 to 64 characters of `A-Z a-z 0-9 . _ -`. Each frame carries the channel's `media_type`: an IANA media type without parameters, such as `application/json` or `image/jpeg`. It tells the hub how to show the data, so it MUST describe `data` truthfully. A malformed name or media type is a protocol violation. A channel beyond the limit is ignored.
+
+**Announcing.** A `LiveFeed` with empty `data` announces a channel without sending anything, so the hub can list it before anyone watches. A plugin SHOULD announce its channels right after `InitializeResponse`, on every connection: the hub forgets them when a connection ends. Any frame with data announces its channel too.
+
+**Watching.** `LiveFeedControl.channels` is the full list of channels being watched now; an empty list means nobody is. The hub sends it after `InitializeResponse` if anything is being watched, and again on each change. Several changes may arrive as one message. A plugin SHOULD do the work for a channel (rendering, encoding, sending) only while it's listed. On a new connection nothing is watched until the hub says so. A frame for a channel that isn't watched is harmless, and dropped.
+
+**Frames.** `seq` counts up per channel, so a viewer can see what it missed; it isn't checked. `capture_time` is when the content was captured, if known.
+
+**Rules for senders.** Observation must never get in the way of the data:
+
+- A plugin MUST NOT queue live frames without bound. It keeps at most the newest one per channel, and replaces it when a newer one is ready.
+- All frames share the one connection, so a large frame delays what's behind it. A plugin SHOULD keep frames small and write them one at a time, so an event or `PONG` waits for at most one. For a preview, a low frame rate and a modest resolution are the right defaults.
+- The hub reads live frames without waiting, keeps only the newest per watched channel, in memory, and never writes them to disk, telemetry or a scene export. A viewer that's too slow skips frames.

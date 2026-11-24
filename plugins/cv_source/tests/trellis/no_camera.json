@@ -1,0 +1,1 @@
+{ "graph": { "nodes": { "camera": { "type": "source" } } }, "input": { "type": "camera", "device": "no-such-camera-here" } }

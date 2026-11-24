@@ -19,6 +19,17 @@ pub trait Session: Send {
     fn input_names(&self) -> &[String];
     /// Runs the model on one input; every output, as `f32`.
     fn run(&mut self, input: &str, tensor: Tensor) -> Result<Outputs, String>;
+    /// Runs a model with several inputs, by name.
+    fn run_many(&mut self, mut inputs: Vec<(String, Tensor)>) -> Result<Outputs, String> {
+        if inputs.len() != 1 {
+            return Err(format!(
+                "the {} runtime runs models with one input",
+                self.runtime().name()
+            ));
+        }
+        let (name, tensor) = inputs.remove(0);
+        self.run(&name, tensor)
+    }
     /// A value of the model's metadata (ONNX `metadata_props`).
     fn metadata(&self, key: &str) -> Option<String>;
     /// Where it runs: the device, and the provider and vendor where the
@@ -107,6 +118,13 @@ pub fn load(runtime: Runtime, path: &Path, options: &Options) -> Result<Box<dyn 
         other => Err(format!("this build has no {} runtime", other.name())),
     };
     session.map_err(|e| format!("{label} ({}): {e}", runtime.name()))
+}
+
+/// Multiply-adds of one run on an input of this shape, by tract's cost
+/// analysis. `None`: it couldn't tell.
+#[cfg(feature = "tract")]
+pub fn flops(path: &Path, shape: &[usize], dtype: DType) -> Option<u64> {
+    tract::flops(path, shape, dtype)
 }
 
 /// Shapes for runtimes that take signed dimensions.

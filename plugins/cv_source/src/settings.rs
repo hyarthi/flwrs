@@ -4,6 +4,7 @@ use clap::Parser;
 use flwrs_cv_source::graph::config::Execution;
 use flwrs_cv_source::graph::{self, Checked, GraphConfig};
 use flwrs_cv_source::ingest::config::InputConfig;
+use flwrs_cv_source::live::LiveConfig;
 use flwrs_plugin::cli::{Bootstrap, read_json};
 use flwrs_plugin::schema::payload::SchemaDefinition;
 use flwrs_plugin::schema::rules;
@@ -38,6 +39,17 @@ pub struct Args {
     /// JSON file: the events' payload schema (default: the detections schema)
     #[arg(long)]
     pub out_schema: Option<PathBuf>,
+
+    /// JSON file: what the configurator read from the model files, for
+    /// editors. The plugin doesn't use it.
+    #[arg(long)]
+    #[allow(dead_code, reason = "a configured value for editors")]
+    pub model_info: Option<PathBuf>,
+
+    /// JSON file: the live view (per-node stats, an annotated preview). Off
+    /// by default; either only works while someone is watching
+    #[arg(long)]
+    pub live: Option<PathBuf>,
 }
 
 /// What the plugin runs with.
@@ -50,10 +62,10 @@ pub struct Settings {
     /// Where frames come from; none: the plugin loads its graph and idles.
     pub input: Option<InputConfig>,
     pub out_schema: SchemaDefinition,
+    pub live: LiveConfig,
 }
 
-/// The package's default out schema (`schema/out.json`).
-pub const DEFAULT_OUT_SCHEMA: &str = include_str!("../schema/out.json");
+pub use flwrs_cv_source::emit::DEFAULT_OUT_SCHEMA;
 
 impl Args {
     /// The settings, or every problem found.
@@ -114,6 +126,19 @@ impl Args {
                 }
             },
         };
+        let live = match &self.live {
+            None => Some(LiveConfig::default()),
+            Some(path) => match read_json::<LiveConfig>(path) {
+                Ok(live) => {
+                    problems.extend(live.problems());
+                    Some(live)
+                }
+                Err(e) => {
+                    problems.push(format!("--live {e}"));
+                    None
+                }
+            },
+        };
         let mut files = BTreeMap::new();
         for path in &self.files {
             match path.file_name().and_then(|n| n.to_str()) {
@@ -135,8 +160,10 @@ impl Args {
                 }
             }
         }
-        match (graph, out_schema, execution) {
-            (Some((graph, checked)), Some(out_schema), Some(execution)) if problems.is_empty() => {
+        match (graph, out_schema, execution, live) {
+            (Some((graph, checked)), Some(out_schema), Some(execution), Some(live))
+                if problems.is_empty() =>
+            {
                 Ok(Settings {
                     graph,
                     checked,
@@ -144,6 +171,7 @@ impl Args {
                     execution,
                     input,
                     out_schema,
+                    live,
                 })
             }
             _ => Err(problems),

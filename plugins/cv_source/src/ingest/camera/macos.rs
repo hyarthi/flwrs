@@ -223,6 +223,23 @@ fn devices() -> Result<Retained<NSArray<AVCaptureDevice>>, IngestError> {
     }
 }
 
+fn names(list: &NSArray<AVCaptureDevice>) -> Vec<Listed> {
+    // SAFETY: reading names and ids of live, retained devices.
+    list.iter()
+        .map(|d| unsafe {
+            Listed {
+                id: d.uniqueID().to_string(),
+                name: d.localizedName().to_string(),
+            }
+        })
+        .collect()
+}
+
+/// The cameras the OS lists; none is opened and no permission is asked for.
+pub(super) fn list() -> Result<Vec<Listed>, IngestError> {
+    Ok(names(&*devices()?))
+}
+
 /// The device's best format for the settings, and the rate to set.
 fn configure(device: &AVCaptureDevice, config: &CameraConfig) -> Result<(), IngestError> {
     let size = config.width.zip(config.height);
@@ -290,16 +307,7 @@ pub(super) fn open(config: &CameraConfig) -> Result<MacCamera, IngestError> {
     };
     check_permission()?;
     let list = devices()?;
-    // SAFETY: reading names and ids of live, retained devices.
-    let listed: Vec<Listed> = list
-        .iter()
-        .map(|d| unsafe {
-            Listed {
-                id: d.uniqueID().to_string(),
-                name: d.localizedName().to_string(),
-            }
-        })
-        .collect();
+    let listed = names(&list);
     let i = pick(config.device.as_deref(), &listed)?;
     let device = list.objectAtIndex(i);
     configure(&device, config)?;

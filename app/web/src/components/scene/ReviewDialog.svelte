@@ -101,6 +101,22 @@
     </section>
   {/if}
 
+  {#if view.draft?.submit}
+    {@const held = view.draft.submit}
+    <section>
+      <h3>Last submit</h3>
+      <div class="notice {held.state === 'WAITING' ? 'warn' : 'danger'}">
+        <div>
+          {held.state === 'WAITING' ? 'Waiting for the pre-flight check; it commits once it passes.' : 'Not committed: live is unchanged.'}
+          <ul>
+            {#each held.problems as p, i (i)}<li>{names.get(p.node_id) ?? p.node_id}: {p.message}{p.retryable ? ' (retryable)' : ''}</li>{/each}
+            {#if held.message}<li>{held.message}</li>{/if}
+          </ul>
+        </div>
+      </div>
+    </section>
+  {/if}
+
   {#if check.problems.length || check.warnings.length}
     <section>
       <h3>Check</h3>

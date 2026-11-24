@@ -838,15 +838,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_hub_wide_memory_soft_limit_sends_events_to_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = shared(dir.path(), 25, 0);
+        let shared = shared(dir.path(), 35, 0);
         let first = queue(&shared, "first", Limits::default());
-        let second = queue(&shared, "second", Limits::default());
+        // Two events keep this queue above its refill watermark (1 event, 10
+        // bytes). Below it, the spill task could move a pending event straight
+        // back to memory and end the spilling state before the check.
+        let second = queue(
+            &shared,
+            "second",
+            Limits {
+                memory_bytes: 40,
+                ..Limits::default()
+            },
+        );
         first.push(event(0), SIZE).await;
-        first.push(event(1), SIZE).await;
+        second.push(event(1), SIZE).await;
+        second.push(event(2), SIZE).await;
         assert!(!first.stats().spilling);
-        second.push(event(2), SIZE).await; // 30 bytes > 25 hub-wide
+        assert!(!second.stats().spilling);
+        // Within the queue's own limits, but 40 bytes > 35 hub-wide.
+        second.push(event(3), SIZE).await;
         assert!(second.stats().spilling, "{:?}", second.stats());
-        assert_eq!(pop(&second).await, "2");
+        for n in 1..=3 {
+            assert_eq!(pop(&second).await, n.to_string());
+        }
         // Oversized: bigger than the hub-wide hard memory limit.
         assert_eq!(
             second.push(event(9), (1 << 30) + 1).await,

@@ -2,7 +2,7 @@
 
 A flwrs source plugin that runs computer-vision models on a camera or video and emits what they see as events: objects with their boxes, keypoints and classes. One node is one camera.
 
-**Status: early.** At start, the plugin checks its model graph and loads every model on its device, then connects to the hub. It reads frames from a camera or files, runs the graph on them, follows objects across frames and evaluates rules. Rule events show in the debug mode; they aren't sent to the hub yet.
+**Status: early.** At start, the plugin checks its model graph and loads every model on its device, then connects to the hub. It reads frames from a camera or files, runs the graph on them, follows objects across frames and evaluates rules. It sends rule events, and optionally the objects it sees, to the hub.
 
 
 ## Input
@@ -107,6 +107,46 @@ Recording saves every frame the camera delivers, without the overlay, as an MJPE
 
 Loading a model includes one run on a zero input, so a model that compiles for a device but fails on it is caught at start. A device other than the CPU may change results: on an Apple M2, CoreML (GPU or Neural Engine) with its default model format computes in float16, and a sixth to a third of the example graphs' runs differed from the CPU's; with `"ModelFormat": "MLProgram"` the results matched, but some models didn't compile. Check a model's results before choosing another device.
 
+### Execution groups
+
+A graph may list `groups`, and each model node names the ones it's in. The graph says what is computed; groups say how it runs:
+
+```json
+{
+  "groups": [
+    {"id": "detector", "family": "execution", "policy": {"threads": 4, "priority": 10}},
+    {"id": "crops", "family": "execution", "policy": {"mode": "parallel", "threads": 2}},
+    {"id": "budget", "family": "resources", "policy": {"limits": {"cpu": 6}}}
+  ],
+  "nodes": {
+    "det": {"type": "model", "groups": ["detector", "budget"], "…": "…"},
+    "pose": {"type": "model", "groups": ["crops", "budget"], "…": "…"}
+  }
+}
+```
+
+Only model nodes have `groups`. `placement` policies are refused here, since a node's models all run in one process on one machine. Groups of one family nest or stay apart. A model follows its **innermost** execution group, whole: an outer group doesn't fill in what an inner one leaves out. Two execution groups with exactly the same members are refused, since neither would be innermost.
+
+| Execution key | |
+|---|---|
+| `device`, `provider`, `allow_fallback` | As in `execution`. The order is the model's own `execution`, then its group, then the plugin's. A group that names another device or provider doesn't inherit the plugin's provider or its options. |
+| `mode` | How a for-each's items run: `sequential` (the default), `parallel` or `batched`. |
+| `threads` | Cores for the group. The groups' sum must fit the node's `--threads` (a node that won't fit doesn't start). With no group, a model keeps the default split. |
+| `priority` | Which models give way when a live frame runs late (below). |
+
+`limits.cpu` of a `resources` group is a budget over the threads of the execution groups with a member inside it (each counted in full); more is refused. A model in the budget without a thread count of its own is capped to it.
+
+**Modes never change results.** Items are put back in their order whichever finishes first, and the graph's results match a sequential run within float tolerance.
+
+- `parallel`: the items run side by side, on `min(threads, the crop's max, 8)` workers. Each worker has **its own session of the model** with its share of the threads, so memory grows with the workers, and loading takes that much longer. A frame with a single item runs on a session with all the group's threads. This pays off when frames often have several items; on mostly single-item streams it costs memory and buys nothing.
+- `batched`: a frame's items go through one run, at most 16 at a time. It needs a model whose first input dimension is dynamic, on ONNX Runtime. At start the plugin compares a batch of two with the same two inputs run alone. A model that fails this, has a **fixed batch size**, or runs on tract gets a warning and runs its items **one by one**, with the same results. If a batch fails on a frame, that batch's items run one by one too.
+
+`mode` only matters for a for-each: a model on a crop's regions, or on objects (`tensor_input`). A model that runs once per frame uses the group's device and threads.
+
+**`threads` left out** is measured at start, for groups that aren't `parallel`: the group's largest model (up to 16 MiB) is loaded with 1, 2 and 4 threads within what the other groups leave, timed over three runs, and the fewest threads within 10 % of the fastest win. The choice is in the log. All of this takes at most about 300 ms, and a model that's too large keeps the default. A `parallel` group without `threads` takes an even share of the cores the other groups leave.
+
+**`priority` is the one setting that can change results**, only on live streams, and only by reusing results sampling already keeps. A frame's time budget is the gap between its capture and the previous frame's. Once a frame is past it, a model in a group **below the highest priority** that has a sampling policy may skip a run that's due and reuse its last results: `every_n_frames` for one due run in a row, `per_track` for up to `refresh_frames` frames beyond its refresh. A model without sampling, or without results to reuse, always runs, and detectors on control frames are never skipped. Runs on a file never skip, so they repeat exactly. Leave `priority` out, or give all groups the same one, and nothing is ever skipped.
+
 ## The model graph
 
 Models are chained inside the plugin, so a frame and its crops never travel through the hub. The graph has **nodes** with typed ports, and **links** from an output port to an input port, written `<node>.<port>`. Every input is linked exactly once, and there are no cycles. Node ids are lowercase letters, digits and `_`, starting with a letter.
@@ -167,13 +207,14 @@ The nodes that run once per frame go first, in an order where each node follows 
 | `model` | The ONNX file: the name of one of the node's `files`. |
 | `input_name` | The input tensor's name (default: the model's first input). |
 | `pre` | How a frame becomes the input: `width`, `height`, `resize` (`stretch`, `letterbox`, `cover`), `pad`, `color` (`rgb`, `bgr`), `dtype` (`f32`, `i32`, `u8`), `scale`, `mean`, `std` (value = (pixel × scale − mean) / std), `layout` (`nchw`, `nhwc`). |
-| `tensor_input` | Or: the input built from an object's keypoints, linked from an `objects` output: a flat `[1, n × dims]` vector, `x y` (`dims` 2) or `x y confidence` (3) per keypoint (all, or the indexes in `keypoints`), relative to: nothing (`normalize: none`, frame pixels), the object's box (`box`: 0..1), or the first keypoint scaled by the farthest one (`wrist`). An object without the keypoints it needs gets no result. |
+| `tensor_input` | Or: the input built from an object's keypoints, linked from an `objects` output: a flat `[1, n × dims]` vector, `x y` (`dims` 2) or `x y confidence` (3) per keypoint (all, or the indexes in `keypoints`), relative to: nothing (`normalize: none`, frame pixels), the object's box (`box`: 0..1), or the first keypoint scaled by the farthest one (`wrist`). An object without the keypoints it needs gets no result. For MediaPipe's gesture classifier, `{"embedder": "gesture_embedder.onnx"}` instead: the node first runs that embedder on a hand from a `landmarks` decoder with `world` and `handedness` set (ONNX Runtime only, since it takes three inputs). |
 | `decode` | The decoder (below). |
 | `min_confidence` | The confidence cutoff, 0 to 1: a result below it is dropped as soon as the decoder knows its confidence (before NMS and keypoints), so no node downstream (crops, models run on objects) and no event sees it. Default 0.25 for detectors (`yolo`, `detections_e2e`, `detr`, `gfl`, `ssd_anchors`, `yunet`, `movenet`, `rtmo`), 0 for the others. It applies to objects, classes (`classify`: the top-k below it are dropped), poses and landmarks (`simcc`, `heatmap`: the mean keypoint confidence; `landmarks`: the presence score), text regions (`ocr_det`) and text (`ctc`). Decoders whose results have no confidence (`semantic`, `dense_map`, `embedding`, `raw`) don't take it. |
 | `labels` | A list, or `{"builtin": "coco80" \| "imagenet1k"}`, `{"file": "<name>"}`, `{"model_metadata": "names"}` (Ultralytics exports), `{"hf_config": "<name>"}` (a Hugging Face `config.json`); names are of the node's `files`. |
 | `charset` | For `ctc`: `{"file": "<name>"}` or `{"model_metadata": "<key>"}`, one entry per line. |
 | `sampling` | How often it runs: `{"every_n_frames": n}` (the frames in between reuse its last results; only for models that run once per frame). Default: every frame. (`per_track` needs object tracking, which isn't there yet.) |
-| `execution` | Where it runs (as the plugin's `execution` setting): each field set here overrides the plugin's. |
+| `execution` | Where it runs (as the plugin's `execution` setting): each field set here overrides its execution group's and the plugin's. |
+| `groups` | The [groups](#execution-groups) it's in, by id. |
 | `keypoint_layout` | What the keypoints are (point names and skeleton): `coco17`, `blazepose33`, `hand21`, `wholebody133` (COCO-WholeBody), `face5` (YuNet: eyes, nose, mouth corners), `face6` (BlazeFace: eyes, nose, mouth, ears). Where the decoder's settings fix the count, it must match. |
 
 ### Decoders
@@ -205,9 +246,86 @@ Decoders that run NMS take `iou` (0.45); at most 300 objects come out of one run
 
 Built-in label lists: `coco80`, `imagenet1k`.
 
+## The configurator
+
+The package has a configurator (`flwrs-cv-source-config`). It runs on the server's machine.
+
+**When a node is saved** it sets two read-only settings:
+
+- `out_schema`: the event payload, without the fields this graph can never fill in (rule fields without a rule, `data` without a Lua rule, `keypoints` when the `emit` node turns them off).
+- `model_info`: what each model file says about itself, read without loading it: inputs, outputs, class count, and either a `proposal` (`decode`, plus `pre` and `labels` for Ultralytics exports) or `candidates` (decoders whose output shape it could be). A proposal is a starting point and is never applied by itself. Also `file_bytes`, `parameters` (from the weights' dimensions), `dynamic_batch`, `flops` (multiply-adds per run, in builds with the `tract` feature, for a model of at most 16 MiB with a fixed input size), and a `recommendation` for its execution group (`mode`, `threads`, `reason`): small models (at most 0.5 GFLOP, or 3 M parameters without a count) get 2 threads, `batched` with a dynamic batch and `parallel` without; large ones `sequential` with most threads. These depend only on the file and the build, never on the machine; a group asking for more threads than this machine has cores is a warning.
+
+A graph that's invalid is refused. Everything else is a warning, because a scene may be configured here and run on another machine: a missing file, a camera that isn't there, a model that won't load on its device, a decoder output the model doesn't have, a `pre` size that differs from the model's input, or a graph that would send nothing.
+
+**Before a node starts** (pre-flight) the same checks are binding. A camera that isn't listed is retryable. Missing files, models that won't load and ambiguous camera names are permanent. A model that fell back to the CPU under `allow_fallback` is a warning. Models get 20 s to load here; past that they're checked when the node starts.
+
+The check **never opens a camera**, so it can't disturb a running node. It also means it can't tell that a camera is busy: that shows up when the node starts, and the node's restart limit decides what happens next.
+
 ## Events
 
-The default payload (`schema/out.json`), named as in [supervision](https://supervision.roboflow.com/): `event`, `frame_time`, `frame_seq`, `width`, `height`, and `objects`, each with `class_id`, `class_name`, `confidence`, `tracker_id`, `source` (the graph node), `box` (`x1`, `y1`, `x2`, `y2`), `keypoints` (`x`, `y`, `confidence`) and `classes` (classifier results on the object). Boxes and keypoints are normalised to the frame (0..1), so they don't depend on the camera's resolution. Rule events (`line_crossing`, `zone`, `loitering`, `counting`, after the ONVIF analytics rules) will use the same object shape.
+What leaves the plugin is set by an optional `emit` node (at most one per graph):
+
+| `mode` | Sends |
+|---|---|
+| `rules` (default, also without the node) | Rule events only. |
+| `changes` | Rule events, and the objects when who's there or a label changes. Link the objects to its `objects` input. |
+| `frames` | Rule events, and the objects at most every `min_interval_ms` (default 200). Link the objects to its `objects` input. |
+
+`max_objects` (default 32) caps a frame's objects, keeping the most confident, and `keypoints` (default on) can leave keypoints out.
+
+The default payload (`schema/out.json`), named as in [supervision](https://supervision.roboflow.com/): `event` (`detections`, or a rule's type), `frame_time`, `frame_seq`, `width`, `height`, and `objects`, each with `class_id`, `class_name`, `confidence`, `tracker_id` (0 when untracked), `source` (the graph node), `box` (`x1`, `y1`, `x2`, `y2`), `keypoints` (`x`, `y`, `confidence`; from a model run on the object's crop too) and `classes` (classifier results on the object). Boxes and keypoints are normalised to the frame (0..1), so they don't depend on the camera's resolution. A rule event also has `rule`, `action`, `tracker_id`, `label`, `previous`, `score`, `count`, `duration_s` and `data` (a Lua rule's values, as JSON text), and its `objects` hold the object it's about. Rule types follow the ONVIF analytics rules where they exist (`line_crossing`, `zone`, `loitering`, `counting`).
+
+The frame loop never waits for the hub. Rule events queue (up to 256; the oldest are dropped beyond that, and counted) and go first, each sent until the hub confirms it, so they survive a reconnect. Frame results replace each other, so a slow workflow gets the newest.
+
+## Live view
+
+The `live` setting lets a node show what it's doing while someone watches it, through the protocol's live feed. Both parts are off by default and switch on independently:
+
+```json
+{ "stats": true, "preview": { "enabled": true, "fps": 5, "width": 640 } }
+```
+
+| Setting | Default | Range | What it does |
+|---|---|---|---|
+| `stats` | `false` | | The `stats` channel (`application/json`), about once a second |
+| `preview.enabled` | `false` | | The `preview` channel (`image/jpeg`): the frame with boxes, labels, skeletons, map overlays and rule shapes |
+| `preview.fps` | `5` | 0.5 to 30 | At most this many preview frames per second |
+| `preview.width` | `640` | 160 to 1920 | Width in pixels; a smaller frame isn't enlarged |
+
+With neither on, the plugin doesn't offer the capability. With a channel on but nobody watching it, the frame loop only asks whether it's watched: nothing is counted, drawn, encoded or serialized. Changing the setting restarts the node, like any launch argument.
+
+Drawing and JPEG encoding run on their own thread. It takes one frame at a time and a newer frame replaces a waiting one, so a slow encoder can't delay inference or events. Preview frames stay in memory: they're never written to disk, logs, events or telemetry. A frame is kept under 2 MiB by lowering its JPEG quality, and left out if it still doesn't fit.
+
+A stats message:
+
+```json
+{
+  "version": 1,
+  "interval_s": 1.0,
+  "frames": {
+    "captured_fps": 30.0,
+    "processed_fps": 28.9,
+    "dropped": 1,
+    "errors": 0,
+    "process_ms": { "mean": 13.2, "p95": 21.0 },
+    "latency_ms": { "mean": 15.1, "p95": 24.3 }
+  },
+  "nodes": {
+    "pose": {
+      "fps": 14.5,
+      "runs": 29,
+      "skipped": 14,
+      "yielded": 2,
+      "errors": 0,
+      "latency_ms": { "mean": 9.8, "p95": 14.0 }
+    }
+  }
+}
+```
+
+- `frames`: `captured_fps` is what the input delivered, `processed_fps` what the graph ran on, `dropped` the frames replaced by a newer one in the interval. `process_ms` is the graph's time on a frame, `latency_ms` the time from capture to results. Either is `null` with nothing to measure.
+- `nodes` is keyed by the graph's node ids. It lists every model node, and any other node that reported an error.
+- A node's `fps` counts frames it ran on, `runs` its runs (a per-region node runs once per region), and `skipped` frames it didn't run on: sampling, a late frame, or nothing to run on. `yielded` is the part of `skipped` where it gave way to a higher-priority group. `latency_ms` is its time on a frame, all its runs together, or `null` if it didn't run.
 
 ## Runtimes
 

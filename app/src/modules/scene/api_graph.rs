@@ -38,6 +38,10 @@ pub(crate) struct Node {
     pub launch_args_secrets: BTreeMap<String, bool>,
     /// Where the node sits on the editor's canvas; `null` = not placed.
     pub position: Option<Position>,
+    /// Where the inner nodes of its graph settings sit: setting → inner
+    /// node → position. Layout, like `position`.
+    #[schema(value_type = Object)]
+    pub inner_layout: service::InnerLayout,
     pub create_time: i64,
     pub update_time: i64,
 }
@@ -60,6 +64,7 @@ impl From<service::Node> for Node {
             plugin_id: n.plugin_id,
             plugin_version: n.plugin_version,
             position: n.position,
+            inner_layout: n.inner_layout,
             create_time: n.create_time.timestamp_millis(),
             update_time: n.update_time.timestamp_millis(),
         }
@@ -110,6 +115,11 @@ pub(crate) struct LayoutRequest {
     #[serde(default)]
     #[schema(value_type = BTreeMap<String, Position>)]
     pub edges: BTreeMap<String, Option<Position>>,
+    /// Node id → graph setting → inner node → its position (`null` = not
+    /// placed). What's left out keeps its place.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub inner: service::InnerPlaces,
 }
 
 #[utoipa::path(
@@ -131,13 +141,21 @@ pub(crate) async fn set_layout(
     Path(id): Path<String>,
     Json(req): Json<LayoutRequest>,
 ) -> Result<StatusCode, ApiError> {
-    if req.nodes.len() + req.edges.len() > MAX_LAYOUT_NODES {
+    let inner = req
+        .inner
+        .values()
+        .flat_map(|settings| settings.values())
+        .map(BTreeMap::len)
+        .sum::<usize>();
+    if req.nodes.len() + req.edges.len() + inner > MAX_LAYOUT_NODES {
         return Err(service::ServiceError::Invalid(vec![format!(
             "at most {MAX_LAYOUT_NODES} nodes and edges per request"
         )])
         .into());
     }
-    service.set_layout(&id, &req.nodes, &req.edges).await?;
+    service
+        .set_layout_with(&id, &req.nodes, &req.edges, &req.inner)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

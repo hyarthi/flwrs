@@ -193,7 +193,12 @@ impl Fixture {
         let Some(remote) = self.target.remote.as_ref().filter(|r| !r.stop.is_empty()) else {
             return Ok(());
         };
-        let argv = remote.command(&remote.stop, self.port(), self.target.instance_id(), &self.token);
+        let argv = remote.command(
+            &remote.stop,
+            self.port(),
+            self.target.instance_id(),
+            &self.token,
+        );
         match tokio::time::timeout(
             Duration::from_secs(60),
             crate::stimulus::run_command(&argv, &remote.dir, self.port()),

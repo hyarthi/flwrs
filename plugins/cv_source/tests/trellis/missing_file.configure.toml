@@ -1,0 +1,6 @@
+name = "a model file that isn't there is a permanent problem"
+mode = "preflight"
+launch_args = "missing_file.json"
+expect = "error"
+problems_contain = ["fixed_det.onnx"]
+retryable = false

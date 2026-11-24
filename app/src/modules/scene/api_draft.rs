@@ -51,6 +51,10 @@ pub(crate) struct DraftResponse {
     pub undo: Option<String>,
     /// What `…/draft/redo` would make again; `null` = nothing.
     pub redo: Option<String>,
+    /// A submit its pre-flight check held back: `WAITING` (it commits once
+    /// the check passes) or `FAILED`, with the problems. Live is unchanged in
+    /// both. `null` = none; an edit to the draft clears it.
+    pub submit: Option<draft::submit::DraftSubmit>,
     pub create_time: i64,
     pub update_time: i64,
 }
@@ -60,6 +64,8 @@ pub(crate) struct DraftSettings {
     pub name: String,
     pub max_hops: Option<u32>,
     pub defaults: SceneDefaults,
+    #[schema(value_type = Vec<crate::modules::scene::groups::SceneGroup>)]
+    pub groups: Vec<flwrs_types::groups::Group>,
     /// `unchanged` or `changed`.
     pub change: Change,
     pub conflict: Option<Conflict>,
@@ -95,6 +101,7 @@ impl From<draft::Draft> for DraftResponse {
             conflicts: d.conflicts(),
             undo: d.undo.clone(),
             redo: d.redo.clone(),
+            submit: d.submit.clone(),
             scene_id: d.row.scene_id,
             base_revision: d.row.base_revision,
             live_revision: d.live_revision,
@@ -102,6 +109,7 @@ impl From<draft::Draft> for DraftResponse {
                 name: d.row.name,
                 max_hops: d.row.max_hops,
                 defaults: d.row.defaults,
+                groups: d.row.groups,
                 change: d.settings_change,
                 conflict: d.settings_conflict,
             },
@@ -232,6 +240,10 @@ pub(crate) enum BatchOpRequest {
         max_hops: Option<u32>,
         #[serde(default)]
         defaults: SceneDefaults,
+        /// Omitted = kept.
+        #[serde(default)]
+        #[schema(value_type = Option<Vec<crate::modules::scene::groups::SceneGroup>>)]
+        groups: Option<Vec<flwrs_types::groups::Group>>,
     },
     CreateNode {
         /// Names the new node for later operations (`"$<key>"`).
@@ -307,10 +319,12 @@ impl From<BatchOpRequest> for BatchOp {
                 name,
                 max_hops,
                 defaults,
+                groups,
             } => BatchOp::UpdateScene(SceneInput {
                 name,
                 max_hops,
                 defaults,
+                groups,
             }),
             BatchOpRequest::CreateNode {
                 key,
@@ -668,13 +682,14 @@ async fn resolve_conflict(
     path = "/by-id/{id}/draft/submit",
     operation_id = "submit-scene-draft",
     summary = "Commit the draft to live, at once",
-    description = "One transaction: the scene's live graph becomes the draft's, its revision goes up once, the draft goes, and a running scene reloads once (only changed nodes restart). Refused (409) while the draft is behind live (rebase first) or has conflicts, and for an enabled scene while it has problems, unless `disable`.",
+    description = "One transaction: the scene's live graph becomes the draft's, its revision goes up once, the draft goes, and a running scene reloads once (only changed nodes restart). Refused (409) while the draft is behind live (rebase first) or has conflicts, and for an enabled scene while it has problems, unless `disable`. On an enabled scene (without `disable`) the draft's added and changed local nodes pass their pre-flight checks first, and live and the running scene are untouched until they do. A permanent problem commits nothing: 409, and the draft is kept with `submit.state` FAILED. Retryable problems only: 202, `submit.state` WAITING, and the server retries under the scene's `preflight_retry`, committing on a pass if the draft is unchanged and live hasn't moved on. Editing, rebasing, undoing or discarding the draft, submitting again, or disabling or deleting the scene ends the wait.",
     params(("id" = String, Path, description = "Scene ID")),
     request_body = SubmitRequest,
     responses(
         (status = 200, description = "The scene after submitting", body = Scene),
+        (status = 202, description = "Not committed yet: waiting out retryable pre-flight problems (the scene as it still is)", body = Scene),
         (status = 404, description = "No such scene, or no draft", body = ErrorBody),
-        (status = 409, description = "Behind live, conflicts, or problems (listed)", body = ErrorBody),
+        (status = 409, description = "Behind live, conflicts, problems, or a failed pre-flight check (listed)", body = ErrorBody),
         (status = 422, description = "The draft breaks a graph rule", body = ErrorBody),
     )
 )]
@@ -682,14 +697,15 @@ async fn submit_draft(
     State(service): State<Svc>,
     Path(id): Path<String>,
     body: Option<Json<SubmitRequest>>,
-) -> Result<Json<Scene>, ApiError> {
+) -> Result<(StatusCode, Json<Scene>), ApiError> {
     let request = body.map(|Json(b)| b).unwrap_or_default();
-    Ok(Json(
-        service
-            .submit_draft(&id, request.base_revision, request.disable)
-            .await?
-            .into(),
-    ))
+    let submitted = service
+        .submit(&id, request.base_revision, request.disable)
+        .await?;
+    Ok(match submitted {
+        draft::submit::Submitted::Committed(scene) => (StatusCode::OK, Json(scene.into())),
+        draft::submit::Submitted::Waiting(scene) => (StatusCode::ACCEPTED, Json(scene.into())),
+    })
 }
 
 // ---- draft nodes and edges ----

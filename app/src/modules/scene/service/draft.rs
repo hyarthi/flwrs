@@ -16,13 +16,18 @@
 //!   settings (base, draft, live). Where both sides changed the same thing,
 //!   the row is marked with a conflict, and submit waits until each is
 //!   resolved (`resolve`: keep the draft's, or take live's).
+//! - Submitting to an enabled scene runs the pre-flight checks first
+//!   (`submit`): a draft that fails them stays a draft, marked.
 
 pub(crate) mod history;
 pub(crate) mod query;
+pub(crate) mod submit;
 
 use super::apply::{TargetEdge, TargetGraph, TargetNode};
 use super::*;
 use query::{DraftRow, RowMeta};
+use std::collections::HashSet;
+use submit::DraftSubmit;
 
 const NODES: &str = "scene_draft_nodes";
 const EDGES: &str = "scene_draft_edges";
@@ -111,6 +116,8 @@ pub(crate) struct Draft {
     /// The step undo would take back, and the one redo would make again.
     pub undo: Option<String>,
     pub redo: Option<String>,
+    /// A submit its pre-flight check held back (`WAITING` / `FAILED`).
+    pub submit: Option<DraftSubmit>,
 }
 
 impl Draft {
@@ -255,12 +262,22 @@ pub(super) fn edge_content_hash(
     }))
 }
 
-pub(super) fn settings_hash(name: &str, max_hops: Option<u32>, defaults: &SceneDefaults) -> String {
-    hash_of(&serde_json::json!({
+pub(super) fn settings_hash(
+    name: &str,
+    max_hops: Option<u32>,
+    defaults: &SceneDefaults,
+    groups: &[Group],
+) -> String {
+    let mut settings = serde_json::json!({
         "name": name,
         "max_hops": max_hops,
         "defaults": serde_json::to_value(defaults).unwrap_or(Value::Null),
-    }))
+    });
+    // Only when there are some, so the hashes drafts already hold stay right.
+    if !groups.is_empty() {
+        settings["groups"] = serde_json::to_value(groups).unwrap_or(Value::Null);
+    }
+    hash_of(&settings)
 }
 
 /// What differs between a draft node and its live counterpart.
@@ -355,16 +372,8 @@ impl Service {
             return Ok(row);
         }
         let mut tx = conn.begin_with(WRITE_TX).await?;
-        let row = query::insert(
-            &mut tx,
-            &scene.id,
-            scene.revision,
-            &scene.name,
-            scene.max_hops,
-            &scene.defaults,
-            &settings_hash(&scene.name, scene.max_hops, &scene.defaults),
-        )
-        .await?;
+        let base_hash = settings_hash(&scene.name, scene.max_hops, &scene.defaults, &scene.groups);
+        let row = query::insert(&mut tx, scene, &base_hash).await?;
         let uploads = uploads_by_node(
             query_sqlite::list_scene_uploads(&mut tx, Store::Live, &scene.id).await?,
         );
@@ -521,14 +530,17 @@ impl Service {
                 parts,
             });
         }
-        let settings_change =
-            if settings_hash(&row.name, row.max_hops, &row.defaults) == row.base_hash {
-                Change::Unchanged
-            } else {
-                Change::Changed
-            };
+        let settings_change = if settings_hash(&row.name, row.max_hops, &row.defaults, &row.groups)
+            == row.base_hash
+        {
+            Change::Unchanged
+        } else {
+            Change::Changed
+        };
         let (undo, redo) = history::steps(conn, &row.scene_id).await?;
+        let submit = self.draft_submit(&row);
         Ok(Draft {
+            submit,
             settings_conflict: Conflict::parse(row.conflict.as_deref()),
             live_revision: scene.revision,
             row,
@@ -542,6 +554,7 @@ impl Service {
 
     /// Discards the draft (its uploads' files go once nothing names them).
     pub(crate) async fn discard_draft(&self, scene_id: &str) -> Result<(), ServiceError> {
+        self.clear_submit(scene_id).await?;
         let _guard = self.lock.lock().await;
         let mut conn = self.conn().await?;
         self.scene_row(&mut conn, scene_id).await?;
@@ -563,9 +576,11 @@ impl Service {
             let _guard = self.lock.lock().await;
             let mut conn = self.conn().await?;
             let scene = self.scene_row(&mut conn, scene_id).await?;
-            self.ensure_draft(&mut conn, &scene).await?;
+            let draft_groups = self.ensure_draft(&mut conn, &scene).await?.groups;
             let mut tx = conn.begin_with(WRITE_TX).await?;
-            query::set_settings(&mut tx, scene_id, &name, max_hops, &input.defaults).await?;
+            let groups = input.groups.as_ref().unwrap_or(&draft_groups);
+            query::set_settings(&mut tx, scene_id, &name, max_hops, &input.defaults, groups)
+                .await?;
             history::record(&mut tx, scene_id).await?;
             tx.commit().await?;
         }
@@ -578,7 +593,13 @@ impl Service {
         let draft = self.get_draft(scene_id).await?;
         let mut conn = self.conn().await?;
         let mut check = self
-            .check_store(&mut conn, Store::Draft, scene_id, &draft.row.defaults)
+            .check_store(
+                &mut conn,
+                Store::Draft,
+                scene_id,
+                &draft.row.defaults,
+                &draft.row.groups,
+            )
             .await?;
         check.problems.extend(
             draft
@@ -767,8 +788,10 @@ impl Service {
         let mut tx = conn.begin_with(WRITE_TX).await?;
 
         // Settings.
-        let live_settings = settings_hash(&scene.name, scene.max_hops, &scene.defaults);
-        let draft_settings = settings_hash(&draft.name, draft.max_hops, &draft.defaults);
+        let live_settings =
+            settings_hash(&scene.name, scene.max_hops, &scene.defaults, &scene.groups);
+        let draft_settings =
+            settings_hash(&draft.name, draft.max_hops, &draft.defaults, &draft.groups);
         if live_settings != draft.base_hash {
             if draft_settings == draft.base_hash {
                 query::set_settings(
@@ -777,6 +800,7 @@ impl Service {
                     &scene.name,
                     scene.max_hops,
                     &scene.defaults,
+                    &scene.groups,
                 )
                 .await?;
                 query::set_settings_meta(&mut tx, scene_id, &live_settings, None).await?;
@@ -1028,6 +1052,7 @@ impl Service {
                             &scene.name,
                             scene.max_hops,
                             &scene.defaults,
+                            &scene.groups,
                         )
                         .await?;
                     }
@@ -1095,110 +1120,6 @@ impl Service {
             self.collect_garbage(&mut conn).await?;
         }
         self.get_draft(scene_id).await
-    }
-
-    // ---- submit ----
-
-    /// Commits the draft to live in one transaction: the scene's graph
-    /// becomes the draft's, the revision goes up once, the draft goes, and
-    /// the director reloads the scene once (a diff: only changed nodes
-    /// restart). Refused while the draft is behind live or has conflicts,
-    /// and, for an enabled scene, while it has problems, unless `disable`
-    /// (then the scene is disabled in the same step).
-    pub(crate) async fn submit_draft(
-        &self,
-        scene_id: &str,
-        base_revision: Option<i64>,
-        disable: bool,
-    ) -> Result<Scene, ServiceError> {
-        let draft = self.get_draft(scene_id).await?;
-        if let Some(b) = base_revision
-            && b != draft.row.base_revision
-        {
-            return Err(ServiceError::Conflict(
-                format!(
-                    "the draft is based on revision {}, not {b}: reload it",
-                    draft.row.base_revision
-                ),
-                vec![],
-            ));
-        }
-        let conflicts = draft.conflicts();
-        if !conflicts.is_empty() {
-            return Err(ServiceError::Conflict(
-                "the draft has unresolved conflicts".into(),
-                conflicts,
-            ));
-        }
-        if draft.behind() {
-            return Err(ServiceError::Conflict(
-                format!(
-                    "live has changed since the draft started (revision {} → {}): rebase the draft",
-                    draft.row.base_revision, draft.live_revision
-                ),
-                vec![],
-            ));
-        }
-        let check = self.check_draft(scene_id).await?;
-
-        let _guard = self.lock.lock().await;
-        let mut conn = self.conn().await?;
-        let scene = self.scene_row(&mut conn, scene_id).await?;
-        // Re-checked under the lock: nothing moved since.
-        let row = query::get(&mut conn, scene_id)
-            .await?
-            .ok_or_else(no_draft)?;
-        if row.base_revision != scene.revision || row.update_time != draft.row.update_time {
-            return Err(ServiceError::Conflict(
-                "the draft or live changed while submitting; try again".into(),
-                vec![],
-            ));
-        }
-        let disable = disable && scene.enabled;
-        if scene.enabled && !disable && !check.problems.is_empty() {
-            return Err(ServiceError::Conflict(
-                "the scene is enabled and the draft has problems: fix them, or submit and disable the scene".into(),
-                check.problems,
-            ));
-        }
-        // From the stored rows (configs as stored, so unchanged nodes stay
-        // byte-identical).
-        let mut uploads = uploads_by_node(query::all_uploads(&mut conn, scene_id).await?);
-        let target = TargetGraph {
-            name: row.name.clone(),
-            max_hops: row.max_hops,
-            defaults: row.defaults.clone(),
-            nodes: query::all_nodes(&mut conn, scene_id)
-                .await?
-                .into_iter()
-                .filter(|(_, m)| !m.removed)
-                .map(|(n, _)| {
-                    let files = uploads.remove(&n.id).unwrap_or_default();
-                    TargetNode::from_row(n, files)
-                })
-                .collect(),
-            edges: query::all_edges(&mut conn, scene_id)
-                .await?
-                .into_iter()
-                .filter(|(_, m)| !m.removed)
-                .map(|(e, _)| TargetEdge::from_row(e))
-                .collect(),
-        };
-        let mut tx = conn.begin_with(WRITE_TX).await?;
-        let applied = self.apply_graph(&mut tx, &scene, &target).await?;
-        query::delete(&mut tx, scene_id).await?;
-        if disable {
-            query_sqlite::set_scene_enabled(&mut tx, scene_id, false).await?;
-        }
-        tx.commit().await?;
-        self.after_apply(&mut conn, &scene, &applied, disable)
-            .await?;
-        log::info!(
-            "Scene service: submitted the draft of scene [{scene_id}] (revision {}){}",
-            scene.revision + 1,
-            if disable { "; scene disabled" } else { "" }
-        );
-        self.scene_row(&mut conn, scene_id).await
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::modules::node_config::SceneDefaults;
 use crate::modules::scene::service::{EdgeRow, ListFilters, NodeRow, NodeUpload, Scene};
 use chrono::Local;
+use flwrs_types::groups::Group;
 use sqlx::{AssertSqlSafe, Sqlite, SqliteConnection};
 
 /// Which graph a query reads or writes: the live one, or the scene's draft.
@@ -167,14 +168,16 @@ pub(super) async fn create_scene(
     name: &str,
     max_hops: Option<u32>,
     defaults: &SceneDefaults,
+    groups: &[Group],
 ) -> Result<Scene, sqlx::Error> {
     sqlx::query_as::<Sqlite, Scene>(
-        "INSERT INTO scenes (id, name, max_hops, defaults) VALUES ($1, $2, $3, $4) RETURNING *",
+        "INSERT INTO scenes (id, name, max_hops, defaults, \"groups\") VALUES ($1, $2, $3, $4, $5) RETURNING *",
     )
     .bind(id)
     .bind(name)
     .bind(max_hops)
     .bind(sqlx::types::Json(defaults))
+    .bind(sqlx::types::Json(groups))
     .fetch_one(conn)
     .await
 }
@@ -185,13 +188,15 @@ pub(super) async fn update_scene(
     name: &str,
     max_hops: Option<u32>,
     defaults: &SceneDefaults,
+    groups: &[Group],
 ) -> Result<Scene, sqlx::Error> {
     sqlx::query_as::<Sqlite, Scene>(
-        "UPDATE scenes SET name = $1, max_hops = $2, defaults = $3, update_time = $4 WHERE id = $5 RETURNING *",
+        "UPDATE scenes SET name = $1, max_hops = $2, defaults = $3, \"groups\" = $4, update_time = $5 WHERE id = $6 RETURNING *",
     )
     .bind(name)
     .bind(max_hops)
     .bind(sqlx::types::Json(defaults))
+    .bind(sqlx::types::Json(groups))
     .bind(Local::now())
     .bind(id)
     .fetch_one(conn)
@@ -368,6 +373,23 @@ pub(super) async fn update_node(
     .bind(scene_id)
     .bind(id)
     .fetch_one(conn)
+    .await
+}
+
+/// A node's layout (`ui`), tombstones included: `None` = no such node.
+pub(super) async fn get_ui(
+    conn: &mut SqliteConnection,
+    store: Store,
+    scene_id: &str,
+    id: &str,
+) -> Result<Option<Option<String>>, sqlx::Error> {
+    sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT ui FROM {} WHERE scene_id = $1 AND id = $2",
+        store.nodes()
+    )))
+    .bind(scene_id)
+    .bind(id)
+    .fetch_optional(conn)
     .await
 }
 

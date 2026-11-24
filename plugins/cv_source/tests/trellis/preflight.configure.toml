@@ -1,0 +1,6 @@
+name = "a node whose model loads can run here"
+mode = "preflight"
+launch_args = "detector.json"
+
+[uploads]
+"fixed_det.onnx" = "fixed_det.onnx"

@@ -14,6 +14,22 @@
 //! # errors_contain = ["paths./x: oneOf"]       # with expect = "error"
 //! ```
 //!
+//! With `mode = "preflight"` the file checks the plugin's pre-flight answer
+//! (manifest `configurator.preflight`) instead; the configurator runs first
+//! for its fields, as on the server:
+//!
+//! ```toml
+//! mode = "preflight"
+//! launch_args = "devices.json"
+//! expect = "error"                             # "ok": no problems at all
+//! problems_contain = ["no camera"]             # optional
+//! retryable = true                             # optional: every problem is retryable (false: at least one is permanent)
+//!
+//! [[releasing]]                                # optional: running nodes this change stops first
+//! node_id = "old-camera"
+//! launch_args = { device = "/dev/video0" }
+//! ```
+//!
 //! `--update` (or `Tester::update(true)`) writes the actual values into the
 //! `values` file instead of comparing. `${name}` variables apply to the
 //! launch args, as in test files.
@@ -22,6 +38,7 @@ use crate::audit::Outcome;
 use crate::stimulus::{Vars, substitute_json_vars};
 use crate::target::Target;
 use crate::testing::{StepResult, TestResult};
+use flwrs_plugin::package::configure::{PreflightReport, ReleasingNode};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -39,10 +56,21 @@ pub enum Expect {
     Error,
 }
 
+/// What a test file runs.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Configure,
+    Preflight,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigureTestFile {
     pub name: Option<String>,
+    #[serde(default)]
+    pub mode: Mode,
     pub launch_args: Option<String>,
     #[serde(default)]
     pub uploads: BTreeMap<String, String>,
@@ -53,6 +81,15 @@ pub struct ConfigureTestFile {
     pub warnings_contain: Vec<String>,
     #[serde(default)]
     pub errors_contain: Vec<String>,
+    /// Pre-flight: texts some problem must contain.
+    #[serde(default)]
+    pub problems_contain: Vec<String>,
+    /// Pre-flight: `true`, every problem is retryable; `false`, at least one
+    /// is permanent.
+    pub retryable: Option<bool>,
+    /// Pre-flight: the running nodes the change would stop.
+    #[serde(default)]
+    pub releasing: Vec<ReleasingNode>,
 }
 
 pub fn is_configure_test(path: &Path) -> bool {
@@ -116,6 +153,22 @@ async fn run(
     let mut target = target.clone();
     for (upload, rel) in &file.uploads {
         target = target.with_upload(upload, dir.join(rel))?;
+    }
+    if file.mode == Mode::Preflight {
+        if file.values.is_some() || !file.errors_contain.is_empty() {
+            return Err("`values` and `errors_contain` don't apply to mode = \"preflight\"".into());
+        }
+        let releasing = file.releasing.clone();
+        let ran =
+            tokio::task::spawn_blocking(move || target.preflight_releasing(&args, &releasing))
+                .await
+                .map_err(|e| format!("the pre-flight check's thread failed: {e}"))?;
+        return Ok((name, preflight_steps(&file, ran)));
+    }
+    if !file.problems_contain.is_empty() || file.retryable.is_some() || !file.releasing.is_empty() {
+        return Err(
+            "`problems_contain`, `retryable` and `releasing` need mode = \"preflight\"".into(),
+        );
     }
     let ran = tokio::task::spawn_blocking(move || {
         target
@@ -207,6 +260,70 @@ async fn run(
         }
     }
     Ok((name, steps))
+}
+
+/// Checks a pre-flight answer against the file.
+fn preflight_steps(
+    file: &ConfigureTestFile,
+    ran: Result<PreflightReport, Vec<String>>,
+) -> Vec<StepResult> {
+    let mut steps = vec![];
+    let mut step = |action: String, outcome: Outcome| {
+        steps.push(StepResult {
+            index: steps.len() + 1,
+            action,
+            outcome,
+        });
+    };
+    let check = |found: bool, shown: String| {
+        if found {
+            Outcome::Pass
+        } else {
+            Outcome::Fail(shown)
+        }
+    };
+    let report = match ran {
+        Ok(report) => report,
+        Err(errors) => {
+            step(
+                "preflight".into(),
+                Outcome::Fail(format!("couldn't run: {}", errors.join("; "))),
+            );
+            return steps;
+        }
+    };
+    let shown = format!("{:?}", report.problems);
+    let outcome = match (&file.expect, report.problems.is_empty()) {
+        (Expect::Ok, false) => Outcome::Fail(format!("expected no problems, got: {shown}")),
+        (Expect::Error, true) => Outcome::Fail("expected problems, but there are none".into()),
+        _ => Outcome::Pass,
+    };
+    step("preflight".into(), outcome);
+    for want in &file.problems_contain {
+        let found = report
+            .problems
+            .iter()
+            .any(|p| p.message.contains(want.as_str()));
+        step(
+            format!("problems contain {want:?}"),
+            check(found, format!("not in {shown}")),
+        );
+    }
+    if let Some(retryable) = file.retryable {
+        let holds = !report.problems.is_empty() && report.is_permanent() != retryable;
+        step(
+            format!("retryable = {retryable}"),
+            check(holds, format!("the problems are {shown}")),
+        );
+    }
+    for want in &file.warnings_contain {
+        let found = report.warnings.iter().any(|w| w.contains(want.as_str()));
+        step(
+            format!("warnings contain {want:?}"),
+            check(found, format!("not in {:?}", report.warnings)),
+        );
+    }
+    steps
 }
 
 #[cfg(all(test, unix))]
@@ -314,5 +431,120 @@ printf '{"values": {"out_schema": {"fields": [{"key": "%s", "type": "STRING"}]}}
         .unwrap();
         let result = tester.run_file(&tests.join("ok.configure.toml")).await;
         assert!(matches!(result.outcome, Outcome::Fail(e) if e.contains("differ")));
+    }
+
+    /// A package whose configurator also answers pre-flight checks, by the
+    /// `name` setting: "busy" is retryable, "broken" permanent, "crash" dies.
+    fn preflight_package() -> tempfile::TempDir {
+        let dir = package();
+        let manifest = dir.path().join("manifest.json");
+        let text = std::fs::read_to_string(&manifest).unwrap().replace(
+            r#""fields": ["out_schema"]}"#,
+            r#""fields": ["out_schema"], "preflight": true}"#,
+        );
+        std::fs::write(&manifest, text).unwrap();
+        let script = dir.path().join("bin/configure");
+        let body = std::fs::read_to_string(&script).unwrap().replacen(
+            "#!/bin/sh\n",
+            r#"#!/bin/sh
+if [ "$1" = --mode ]; then
+  name=$(sed -n 's/.*"name": "\([^"]*\)".*/\1/p' request.json)
+  grep -q '"out_schema"' request.json || { echo 'no configured field' >&2; exit 3; }
+  case "$name" in
+    busy) grep -q '"node_id": "old-camera"' request.json && grep -q '"releasing"' request.json && { echo '{}' > response.json; exit 0; }
+      echo '{"problems": [{"message": "camera busy", "retryable": true}]}' > response.json;;
+    broken) echo '{"problems": [{"message": "no such device"}], "warnings": ["w"]}' > response.json;;
+    crash) echo 'GLIBC_2.38 not found' >&2; exit 127;;
+    *) echo '{"warnings": ["all good"]}' > response.json;;
+  esac
+  exit 0
+fi
+"#,
+            1,
+        );
+        std::fs::write(&script, body).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn preflight_test_files_check_the_answer() {
+        let pkg = preflight_package();
+        let target = Target::from_package(pkg.path()).unwrap();
+        let tests = pkg.path().join("tests");
+        std::fs::create_dir(&tests).unwrap();
+        for name in ["ok", "busy", "broken", "crash"] {
+            std::fs::write(
+                tests.join(format!("{name}.json")),
+                format!(r#"{{"name": "{name}"}}"#),
+            )
+            .unwrap();
+        }
+        let write = |file: &str, text: &str| {
+            let path = tests.join(file);
+            std::fs::write(&path, format!("mode = \"preflight\"\n{text}")).unwrap();
+            path
+        };
+        let mut tester = Tester::new(target.clone());
+        for (file, text) in [
+            (
+                "a.configure.toml",
+                "launch_args = \"ok.json\"\nwarnings_contain = [\"all good\"]\n",
+            ),
+            (
+                "b.configure.toml",
+                "launch_args = \"busy.json\"\nexpect = \"error\"\nretryable = true\nproblems_contain = [\"camera busy\"]\n",
+            ),
+            (
+                "c.configure.toml",
+                "launch_args = \"broken.json\"\nexpect = \"error\"\nretryable = false\nwarnings_contain = [\"w\"]\n",
+            ),
+            (
+                "d.configure.toml",
+                "launch_args = \"crash.json\"\nexpect = \"error\"\nretryable = false\nproblems_contain = [\"GLIBC_2.38\"]\n",
+            ),
+        ] {
+            let result = tester.run_file(&write(file, text)).await;
+            assert_eq!(
+                result.outcome,
+                Outcome::Pass,
+                "{file}: {}",
+                crate::testing::report(std::slice::from_ref(&result))
+            );
+        }
+        // Wrong expectations fail.
+        for text in [
+            "launch_args = \"busy.json\"\n",
+            "launch_args = \"ok.json\"\nexpect = \"error\"\n",
+            "launch_args = \"busy.json\"\nexpect = \"error\"\nretryable = false\n",
+            "launch_args = \"busy.json\"\nexpect = \"error\"\nproblems_contain = [\"nope\"]\n",
+            "launch_args = \"ok.json\"\nvalues = \"x.json\"\n",
+        ] {
+            let result = tester.run_file(&write("e.configure.toml", text)).await;
+            assert!(matches!(result.outcome, Outcome::Fail(_)), "{text}");
+        }
+        // A device held by a node the change stops isn't busy.
+        let result = tester
+            .run_file(&write(
+                "g.configure.toml",
+                "launch_args = \"busy.json\"\n[[releasing]]\nnode_id = \"old-camera\"\nlaunch_args = { name = \"busy\" }\n",
+            ))
+            .await;
+        assert_eq!(
+            result.outcome,
+            Outcome::Pass,
+            "{}",
+            crate::testing::report(std::slice::from_ref(&result))
+        );
+        // Pre-flight keys need the mode; the mode needs the declaration.
+        let path = tests.join("f.configure.toml");
+        std::fs::write(&path, "launch_args = \"ok.json\"\nretryable = true\n").unwrap();
+        let result = tester.run_file(&path).await;
+        assert!(matches!(result.outcome, Outcome::Fail(e) if e.contains("need mode")));
+        let plain = package();
+        let e = Target::from_package(plain.path())
+            .unwrap()
+            .preflight(&serde_json::json!({"name": "x"}))
+            .unwrap_err();
+        assert!(e[0].contains("doesn't declare"), "{e:?}");
     }
 }

@@ -1,10 +1,30 @@
 {
   "fields": [
-    { "key": "event", "description": "What happened: detections (the objects seen in a frame), or a rule's type (line_crossing, zone, loitering, counting)", "type": "STRING" },
-    { "key": "frame_time", "description": "When the frame was captured", "type": "DATETIME" },
-    { "key": "frame_seq", "description": "Frame number since the plugin started, from 1", "type": "U64" },
-    { "key": "width", "description": "Frame width, pixels", "type": "U32" },
-    { "key": "height", "description": "Frame height, pixels", "type": "U32" },
+    {
+      "key": "event",
+      "description": "What happened: detections (the objects seen in a frame), or a rule's type (line_crossing, zone, loitering, counting)",
+      "type": "STRING"
+    },
+    {
+      "key": "frame_time",
+      "description": "When the frame was captured",
+      "type": "DATETIME"
+    },
+    {
+      "key": "frame_seq",
+      "description": "Frame number since the plugin started, from 1",
+      "type": "U64"
+    },
+    {
+      "key": "width",
+      "description": "Frame width, pixels",
+      "type": "U32"
+    },
+    {
+      "key": "height",
+      "description": "Frame height, pixels",
+      "type": "U32"
+    },
     {
       "key": "objects",
       "description": "The objects, boxes and keypoints normalised to the frame (0..1)",
@@ -12,20 +32,52 @@
       "nested_type_definition": {
         "type": "OBJECT",
         "object_fields": [
-          { "key": "class_id", "description": "Class index in the model's labels", "type": "U32" },
-          { "key": "class_name", "description": "Class label (empty without labels)", "type": "STRING" },
-          { "key": "confidence", "description": "Score, 0..1", "type": "F32" },
-          { "key": "tracker_id", "description": "Track id (0 without a tracker)", "type": "U64" },
-          { "key": "source", "description": "The graph node that found it", "type": "STRING" },
+          {
+            "key": "class_id",
+            "description": "Class index in the model's labels",
+            "type": "U32"
+          },
+          {
+            "key": "class_name",
+            "description": "Class label (empty without labels)",
+            "type": "STRING"
+          },
+          {
+            "key": "confidence",
+            "description": "Score, 0..1",
+            "type": "F32"
+          },
+          {
+            "key": "tracker_id",
+            "description": "Track id (0 without a tracker)",
+            "type": "U64"
+          },
+          {
+            "key": "source",
+            "description": "The graph node that found it",
+            "type": "STRING"
+          },
           {
             "key": "box",
             "description": "x1, y1 (top left), x2, y2 (bottom right), 0..1",
             "type": "OBJECT",
             "object_fields": [
-              { "key": "x1", "type": "F32" },
-              { "key": "y1", "type": "F32" },
-              { "key": "x2", "type": "F32" },
-              { "key": "y2", "type": "F32" }
+              {
+                "key": "x1",
+                "type": "F32"
+              },
+              {
+                "key": "y1",
+                "type": "F32"
+              },
+              {
+                "key": "x2",
+                "type": "F32"
+              },
+              {
+                "key": "y2",
+                "type": "F32"
+              }
             ]
           },
           {
@@ -35,9 +87,18 @@
             "nested_type_definition": {
               "type": "OBJECT",
               "object_fields": [
-                { "key": "x", "type": "F32" },
-                { "key": "y", "type": "F32" },
-                { "key": "confidence", "type": "F32" }
+                {
+                  "key": "x",
+                  "type": "F32"
+                },
+                {
+                  "key": "y",
+                  "type": "F32"
+                },
+                {
+                  "key": "confidence",
+                  "type": "F32"
+                }
               ]
             }
           },
@@ -48,15 +109,72 @@
             "nested_type_definition": {
               "type": "OBJECT",
               "object_fields": [
-                { "key": "source", "type": "STRING" },
-                { "key": "class_id", "type": "U32" },
-                { "key": "class_name", "type": "STRING" },
-                { "key": "confidence", "type": "F32" }
+                {
+                  "key": "source",
+                  "type": "STRING"
+                },
+                {
+                  "key": "class_id",
+                  "type": "U32"
+                },
+                {
+                  "key": "class_name",
+                  "type": "STRING"
+                },
+                {
+                  "key": "confidence",
+                  "type": "F32"
+                }
               ]
             }
           }
         ]
       }
+    },
+    {
+      "key": "rule",
+      "description": "The rule's name (rule events)",
+      "type": "STRING"
+    },
+    {
+      "key": "action",
+      "description": "What it saw: in / out, enter / exit, exceeded, above / below, started / ended, changed, or a Lua rule's own",
+      "type": "STRING"
+    },
+    {
+      "key": "tracker_id",
+      "description": "The track it's about (rule events)",
+      "type": "U64"
+    },
+    {
+      "key": "label",
+      "description": "The new label, or a Lua rule's",
+      "type": "STRING"
+    },
+    {
+      "key": "previous",
+      "description": "The label before",
+      "type": "STRING"
+    },
+    {
+      "key": "score",
+      "description": "The score that crossed a threshold",
+      "type": "F32"
+    },
+    {
+      "key": "count",
+      "description": "The count that crossed a limit",
+      "type": "U32"
+    },
+    {
+      "key": "duration_s",
+      "description": "How long, seconds",
+      "type": "F32"
+    },
+    {
+      "key": "data",
+      "description": "A Lua rule's own values, as JSON",
+      "type": "STRING"
     }
   ]
 }

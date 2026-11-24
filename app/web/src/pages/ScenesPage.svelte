@@ -79,6 +79,9 @@
   function stateOf(row: SceneRow): Shown {
     const s = status.get(row.id);
     if (s?.state === 'FAILED') return { label: 'Failed', tone: 'danger', detail: `${s.errors} load error(s)` };
+    if (s?.state === 'WAITING') {
+      return { label: 'Waiting', tone: 'warn', detail: s.errors ? `Pre-flight: ${s.errors} problem(s), retrying` : 'Pre-flight check running' };
+    }
     if (!row.enabled) return s?.state === 'RUNNING' ? { label: 'Stopping', tone: 'warn' } : { label: 'Disabled', tone: '' };
     if (s?.state === 'RUNNING') {
       return s.running_nodes < s.nodes
@@ -233,7 +236,7 @@
                 </td>
                 <td><span class="badge {state.tone}" title={state.detail}>{state.label}</span></td>
                 <td class="muted">{row.nodes} {row.nodes === 1 ? 'node' : 'nodes'} · {row.edges} {row.edges === 1 ? 'edge' : 'edges'}</td>
-                <td class="num">{status.get(row.id)?.state === 'RUNNING' ? formatRate(rates.get(row.id)) : '—'}</td>
+                <td class="num">{status.get(row.id)?.state === 'RUNNING' || (status.get(row.id)?.state === 'WAITING' && status.get(row.id)?.nodes) ? formatRate(rates.get(row.id)) : '—'}</td>
                 <td>
                   {#if row.problems.length}
                     <span class="badge danger" title={row.problems.join('\n')}>

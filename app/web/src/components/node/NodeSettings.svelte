@@ -42,6 +42,7 @@
   import type { Scope } from '../../lib/lua/types';
   import { formatBytes, safeUploadName } from './uploads';
   import { getInfo } from '../../lib/server';
+  import { familyLabel, isEditable, joinGroup, leaveGroup, policySummary, threadsText, withGroups, type NodeThreads, type SceneGroup } from '../../lib/groups';
 
   let {
     sceneId,
@@ -51,7 +52,14 @@
     uploads,
     problems,
     sceneDefaults = {},
+    sceneGroups = [],
+    groupMembers = new Map(),
+    currentGroups = [],
+    threads = null,
     savedToken = null,
+    graphSaved = null,
+    graphField = null,
+    onopengraph,
     justSaved = false,
     onsaved,
   }: {
@@ -64,8 +72,20 @@
     problems: string[];
     /** The scene's defaults for its nodes (the draft's, if any). */
     sceneDefaults?: SceneDefaults;
+    /** The scene's groups (the draft's, if any). */
+    sceneGroups?: SceneGroup[];
+    groupMembers?: Map<string, Set<string>>;
+    /** The node's groups as they are now (they can change while the form is open). */
+    currentGroups?: string[];
+    /** The core count the check says it gets. */
+    threads?: NodeThreads | null;
     /** A token generated before the last save, still shown to copy. */
     savedToken?: string | null;
+    /** The launch args a save from the graph editor left: the form follows them. */
+    graphSaved?: { keys: string[]; args: Record<string, unknown> } | null;
+    /** The setting the Graph tab edits, if any. */
+    graphField?: string | null;
+    onopengraph?: () => void;
     /** The form was just re-created after a save. */
     justSaved?: boolean;
     onsaved: (saved: GraphNode, token: string | null) => void;
@@ -93,6 +113,25 @@
   /** A token generated in this form, shown until the form closes. */
   let token = $state<string | null>(null);
   let dirty = $state(false);
+  /** Membership changed in this form; until then it follows the node. */
+  let groupEdits = $state<string[] | null>(null);
+  const memberOf = $derived(groupEdits ?? currentGroups);
+  let groupNote = $state<string | null>(null);
+
+  function toggleGroup(id: string, on: boolean) {
+    groupNote = null;
+    if (on) {
+      const joined = joinGroup(sceneGroups, groupMembers, node.id, memberOf, id);
+      if (joined.problem) {
+        groupNote = joined.problem;
+        return;
+      }
+      groupEdits = joined.ids;
+    } else {
+      groupEdits = leaveGroup(sceneGroups, groupMembers, memberOf, id);
+    }
+    touch();
+  }
 
   const secrets = $derived(untrack(() => node.launch_args_secrets));
   const configured = $derived(launch === 'local' ? (plugin?.configured_fields ?? []) : []);
@@ -102,6 +141,17 @@
   const nodePlatform = $derived(launch === 'local' ? serverPlatform : null);
   setContext(PLATFORM_CONTEXT, () => nodePlatform);
   const groups = $derived(schema ? topFields(schema, configured, nodePlatform, args) : []);
+
+  // A save from the graph editor: its setting, the files it added and what
+  // the configurator set. Other edits in this form stay.
+  $effect(() => {
+    const saved = graphSaved;
+    if (!saved) return;
+    untrack(() => {
+      const touched = new Set([...(graphField ? [graphField] : []), ...configured, ...saved.keys.filter((k) => Array.isArray(saved.args[k]))]);
+      for (const key of touched) args = setPath(args, [key], saved.args[key]);
+    });
+  });
 
   // ---- errors ----
 
@@ -274,7 +324,7 @@
   // ---- save ----
 
   function buildConfig(): Config {
-    let config: Config = { ...original, launch };
+    let config: Config = withGroups({ ...original, launch }, memberOf);
     const launchArgs: Record<string, unknown> = { ...args };
     for (const [key, value] of Object.entries(secretEdits)) launchArgs[key] = value;
     config = setPath(config, ['launch_args'], Object.keys(launchArgs).length ? launchArgs : undefined);
@@ -296,6 +346,7 @@
       const saved = await updateDraftNode(sceneId, node.id, { name: name.trim() || null, plugin_id: node.plugin_id, config: buildConfig() });
       saveErrors = null;
       secretEdits = {};
+      groupEdits = null;
       dirty = false;
       onsaved(saved, token);
     } catch (e) {
@@ -313,6 +364,7 @@
 
   type Unit = 'bytes' | 'ms';
   const RUNTIME: { path: string[]; label: string; hint?: string; type: 'number' | 'when_full' | 'tri'; unit?: Unit }[] = [
+    { path: ['is_critical_path'], label: 'Critical', hint: 'if it fails, the whole scene fails; otherwise only this node goes offline', type: 'tri' },
     { path: ['queue', 'capacity'], label: 'Queue capacity (events)', type: 'number' },
     { path: ['queue', 'max_bytes'], label: 'Queue size (bytes)', type: 'number', unit: 'bytes' },
     { path: ['queue', 'when_full'], label: 'When the queue is full', type: 'when_full' },
@@ -323,7 +375,7 @@
     { path: ['delivery', 'retry_delay_ms'], label: 'Retry delay (ms)', type: 'number', unit: 'ms' },
     { path: ['init_timeout_ms'], label: 'Start timeout (ms)', type: 'number', unit: 'ms' },
     { path: ['restart_delay_ms'], label: 'Restart delay (ms)', type: 'number', unit: 'ms' },
-    { path: ['max_restarts'], label: 'Failed launches before giving up', type: 'number' },
+    { path: ['max_restarts'], label: 'Failed launches before giving up', hint: '0 = fail on the first failed launch, -1 = try forever. Empty = 5 for a critical or just-updated node until it first runs, otherwise no limit', type: 'number' },
     { path: ['reconnect_timeout_ms'], label: 'Reconnect timeout (ms)', type: 'number', unit: 'ms' },
     { path: ['shutdown_grace_ms'], label: 'Shutdown grace (ms)', type: 'number', unit: 'ms' },
     { path: ['kill_grace_ms'], label: 'Kill grace (ms)', type: 'number', unit: 'ms' },
@@ -348,7 +400,8 @@
     }
     if (key === 'queue.when_full') return typeof value === 'string' ? (WHEN_FULL[value] ?? value) : 'block';
     if (!plugin) return '';
-    if (key === 'max_restarts' && value === undefined) return 'no limit';
+    if (key === 'max_restarts' && value === undefined) return 'automatic';
+    if (key === 'max_restarts' && value === -1) return 'try forever';
     if (key === 'threads' && value === undefined) return 'the plugin decides';
     if (typeof value === 'boolean') return value ? 'on' : 'off';
     if (typeof value !== 'number') return '';
@@ -536,7 +589,13 @@
           <summary><ChevronRight size={14} strokeWidth={2} />{group.group ?? (group.advanced ? 'Advanced' : 'Settings')}</summary>
           <div class="fields">
             {#each body as field (field.key)}
-              {#if field.secret}
+              {#if field.key === graphField}
+                <div class="field">
+                  <span>{labelOf(field.key, field.schema)}</span>
+                  <span class="hint">Edited on the <button class="link" type="button" onclick={() => onopengraph?.()}>Graph</button> tab.</span>
+                  {#each fieldErrors(field.key) as e, i (i)}<span class="error">{e}</span>{/each}
+                </div>
+              {:else if field.secret}
                 {@const isSet = secrets[`/${field.key}`]}
                 {@const edit = secretEdits[field.key]}
                 <div class="field">
@@ -645,6 +704,22 @@
       <p class="muted small">This plugin takes no settings.</p>
     {/if}
 
+    {#if sceneGroups.length}
+      <details class="section" open={memberOf.length > 0}>
+        <summary><ChevronRight size={14} strokeWidth={2} />Groups{memberOf.length ? ` (${memberOf.length})` : ''}</summary>
+        <div class="fields">
+          {#each sceneGroups as g (g.id)}
+            <label class="check">
+              <input type="checkbox" checked={memberOf.includes(g.id)} disabled={!isEditable(g)} onchange={(e) => toggleGroup(g.id, e.currentTarget.checked)} />
+              <span class="mono">{g.id}</span>
+              <span class="muted small">{familyLabel(g.family)}: {policySummary(g)}{isEditable(g) ? '' : ' (read-only)'}</span>
+            </label>
+          {/each}
+          {#if groupNote}<p class="error">{groupNote}</p>{/if}
+        </div>
+      </details>
+    {/if}
+
     <details class="section" open={errors.runtime.length > 0}>
       <summary><ChevronRight size={14} strokeWidth={2} />Run-time (queue, delivery, restarts)</summary>
       <div class="fields grid">
@@ -653,7 +728,7 @@
           <label class="field">
             {f.label}
             {#if f.type === 'number'}
-              <input class="input" type="number" min="0" placeholder={defaultLabel(f.path, f.unit)} value={typeof value === 'number' ? value : ''} oninput={(e) => setRuntime(f.path, e.currentTarget.value === '' ? undefined : Number(e.currentTarget.value))} />
+              <input class="input" type="number" min={f.path[0] === 'max_restarts' ? -1 : 0} placeholder={defaultLabel(f.path, f.unit)} value={typeof value === 'number' ? value : ''} oninput={(e) => setRuntime(f.path, e.currentTarget.value === '' ? undefined : Number(e.currentTarget.value))} />
             {:else if f.type === 'when_full'}
               <select class="input" value={(value as string) ?? ''} onchange={(e) => setRuntime(f.path, e.currentTarget.value || undefined)}>
                 <option value="">{defaultLabel(f.path)}</option>
@@ -670,6 +745,7 @@
             {/if}
             {#if f.type === 'when_full' && whenFullByGraph}<span class="hint">On a cycle: drop the newest.</span>{/if}
             {#if f.hint}<span class="hint">{f.hint}</span>{/if}
+            {#if f.path[0] === 'threads' && threads}<span class="hint">In effect (as saved): {threadsText(threads)}</span>{/if}
           </label>
         {/each}
       </div>
@@ -685,6 +761,15 @@
 </form>
 
 <style>
+  .link {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    cursor: pointer;
+  }
+
   /* Fills the modal's tab area: the fields scroll, the actions stay below. */
   .settings {
     display: flex;

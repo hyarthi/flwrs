@@ -150,23 +150,28 @@ impl Session for OrtModel {
     }
 
     fn run(&mut self, input: &str, tensor: Tensor) -> Result<Outputs, String> {
-        let shape = signed(&tensor.shape);
-        let value: ort::session::SessionInputValue = match tensor.data {
-            TensorData::F32(d) => {
-                ort::value::Tensor::from_array((shape, d)).map(|t| t.into_dyn().into())
+        self.run_many(vec![(input.to_string(), tensor)])
+    }
+
+    fn run_many(&mut self, inputs: Vec<(String, Tensor)>) -> Result<Outputs, String> {
+        let mut values = Vec::with_capacity(inputs.len());
+        for (name, tensor) in inputs {
+            let shape = signed(&tensor.shape);
+            let value: ort::session::SessionInputValue = match tensor.data {
+                TensorData::F32(d) => {
+                    ort::value::Tensor::from_array((shape, d)).map(|t| t.into_dyn().into())
+                }
+                TensorData::I32(d) => {
+                    ort::value::Tensor::from_array((shape, d)).map(|t| t.into_dyn().into())
+                }
+                TensorData::U8(d) => {
+                    ort::value::Tensor::from_array((shape, d)).map(|t| t.into_dyn().into())
+                }
             }
-            TensorData::I32(d) => {
-                ort::value::Tensor::from_array((shape, d)).map(|t| t.into_dyn().into())
-            }
-            TensorData::U8(d) => {
-                ort::value::Tensor::from_array((shape, d)).map(|t| t.into_dyn().into())
-            }
-        }
-        .map_err(|e| e.to_string())?;
-        let outputs = self
-            .session
-            .run(vec![(std::borrow::Cow::from(input), value)])
             .map_err(|e| e.to_string())?;
+            values.push((std::borrow::Cow::<str>::Owned(name), value));
+        }
+        let outputs = self.session.run(values).map_err(|e| e.to_string())?;
         let mut result = Outputs::new();
         for (name, value) in outputs.iter() {
             let ty = match value.dtype() {

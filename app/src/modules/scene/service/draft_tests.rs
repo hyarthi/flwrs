@@ -703,6 +703,97 @@ async fn a_batch_applies_everything_at_once_or_nothing() {
 }
 
 #[tokio::test]
+async fn inner_layout_is_layout_beside_the_node() {
+    let f = fixture().await;
+    let s = f.scene().await;
+    let at = |x: f64, y: f64| Position { x, y };
+    let mut input = node_input("test-sink", sink(5));
+    input.position = Some(at(10.0, 20.0));
+    let a = f.service.create_node(&s.id, input).await.unwrap();
+    let none = BTreeMap::new();
+    let place = |pairs: Vec<(&str, Option<Position>)>| -> InnerPlaces {
+        let places = pairs.into_iter().map(|(k, p)| (k.to_string(), p)).collect();
+        BTreeMap::from([(
+            a.id.clone(),
+            BTreeMap::from([("graph".to_string(), places)]),
+        )])
+    };
+    let revision = f.service.get_scene(&s.id).await.unwrap().revision;
+    f.service
+        .set_layout_with(
+            &s.id,
+            &none,
+            &none,
+            &place(vec![("det", Some(at(1.0, 2.0)))]),
+        )
+        .await
+        .unwrap();
+    let got = f.service.get_node(&s.id, &a.id).await.unwrap();
+    assert_eq!(got.inner_layout["graph"]["det"], at(1.0, 2.0));
+    assert_eq!(got.position, Some(at(10.0, 20.0)), "the node's place stays");
+    assert_eq!(f.service.get_scene(&s.id).await.unwrap().revision, revision);
+
+    // In a draft: no change, both stores follow, and moving the node itself
+    // or saving its content keeps the inner places.
+    f.service.start_draft(&s.id).await.unwrap();
+    f.service
+        .set_layout_with(
+            &s.id,
+            &BTreeMap::from([(a.id.clone(), Some(at(30.0, 40.0)))]),
+            &none,
+            &place(vec![("crop", Some(at(5.0, 6.0)))]),
+        )
+        .await
+        .unwrap();
+    let draft = f.service.get_draft(&s.id).await.unwrap();
+    assert!(!draft.has_changes());
+    assert_eq!(draft.nodes[0].node.inner_layout["graph"].len(), 2);
+    assert_eq!(draft.nodes[0].node.position, Some(at(30.0, 40.0)));
+    let live = f.service.get_node(&s.id, &a.id).await.unwrap();
+    assert_eq!(live.inner_layout["graph"]["crop"], at(5.0, 6.0));
+
+    // `null` forgets one; bad values refuse the request and change nothing.
+    f.service
+        .set_layout_with(&s.id, &none, &none, &place(vec![("crop", None)]))
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.service
+            .set_layout_with(
+                &s.id,
+                &none,
+                &none,
+                &place(vec![("det", Some(at(f64::MAX, 0.0)))])
+            )
+            .await,
+        Err(ServiceError::Invalid(_))
+    ));
+    let live = f.service.get_node(&s.id, &a.id).await.unwrap();
+    assert_eq!(live.inner_layout["graph"].len(), 1);
+    assert_eq!(live.inner_layout["graph"]["det"], at(1.0, 2.0));
+    f.service.discard_draft(&s.id).await.unwrap();
+
+    // It travels with an export.
+    let export = f.service.export_scene(&s.id, false).await.unwrap();
+    let imported = f.service.import_scene(&export.bytes).await.unwrap();
+    let nodes = f.service.list_nodes(&imported.scene.id).await.unwrap();
+    assert_eq!(nodes[0].inner_layout["graph"]["det"], at(1.0, 2.0));
+    assert_eq!(nodes[0].position, Some(at(30.0, 40.0)));
+}
+
+#[test]
+fn a_node_layout_reads_old_and_damaged_values() {
+    let plain = NodeLayout::from_json(Some(r#"{"x":1.0,"y":2.0}"#));
+    assert_eq!(plain.position(), Some(Position { x: 1.0, y: 2.0 }));
+    assert_eq!(plain.to_json().as_deref(), Some(r#"{"x":1.0,"y":2.0}"#));
+    assert_eq!(NodeLayout::from_json(Some("not json")).position(), None);
+    assert_eq!(NodeLayout::from_json(None).to_json(), None);
+    let only_inner = NodeLayout::from_json(Some(r#"{"inner":{"graph":{"a":{"x":1,"y":1}}}}"#));
+    assert_eq!(only_inner.position(), None);
+    assert!(only_inner.to_json().is_some());
+}
+
+#[tokio::test]
 async fn layout_is_kept_apart_from_content() {
     let f = fixture().await;
     let s = f.scene().await;

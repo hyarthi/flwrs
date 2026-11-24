@@ -15,9 +15,9 @@ use flwrs_plugin::schema::payload::{
     field_value::Value,
 };
 use flwrs_plugin::schema::protocol::{
-    Ack, Credit, Event, EventMetadata, Exit, FrameHeader, Initialize, InitializeResponse, LogEvent,
-    Nack, Ping, Pong, Shutdown, capability::Enum as Capability, exit_code,
-    msg_code::Enum as MsgCode, plugin_type::Enum as PbPluginType,
+    Ack, Credit, Event, EventMetadata, Exit, FrameHeader, Initialize, InitializeResponse, LiveFeed,
+    LiveFeedControl, LogEvent, Nack, Ping, Pong, Shutdown, capability::Enum as Capability,
+    exit_code, msg_code::Enum as MsgCode, plugin_type::Enum as PbPluginType,
 };
 use prost::Message;
 use std::time::Duration;
@@ -1270,4 +1270,313 @@ async fn sdk_plugin_with_wrong_schema_is_rejected_and_stops() {
         other => panic!("expected Rejected, got {other:?}"),
     }
     child_succeeded(child).await;
+}
+
+// --- live feed ---
+
+fn live_source() -> Initialize {
+    with_caps(
+        init(PbPluginType::Source, "src", TOKEN),
+        &[Capability::LiveFeed],
+    )
+}
+
+fn live_frame(channel: &str, data: &[u8], seq: u64) -> LiveFeed {
+    LiveFeed {
+        channel: channel.into(),
+        media_type: "application/json".into(),
+        data: data.to_vec(),
+        seq,
+        capture_time: None,
+    }
+}
+
+/// Waits until the hub lists `channel` for the node.
+async fn announced(hub: &Hub, node: &str, channel: &str) {
+    let live = hub.live();
+    tokio::time::timeout(WAIT, async {
+        while !live.channels(node).iter().any(|c| c.channel == channel) {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the channel was never announced");
+}
+
+#[tokio::test]
+async fn the_live_feed_is_negotiated_only_when_offered() {
+    let hub = start_hub(config()).await;
+    let mut link = hub.hub.expect(expected("src", PluginType::Source));
+    let (_plugin, _, response) = connected(&hub.hub, &mut link, live_source()).await;
+    assert_eq!(response.capabilities, [Capability::LiveFeed as i32]);
+
+    let mut other = hub.hub.expect(expected("plain", PluginType::Source));
+    let (_plain, _, response) = connected(
+        &hub.hub,
+        &mut other,
+        init(PbPluginType::Source, "plain", TOKEN),
+    )
+    .await;
+    assert!(response.capabilities.is_empty());
+}
+
+#[tokio::test]
+async fn control_follows_viewers_and_a_reconnect() {
+    let hub = start_hub(config()).await;
+    let mut link = hub.hub.expect(expected("src", PluginType::Source));
+    let (mut plugin, _, _) = connected(&hub.hub, &mut link, live_source()).await;
+    plugin.send(&live_frame("stats", b"", 0)).await;
+    announced(&hub.hub, "src", "stats").await;
+
+    let live = hub.hub.live();
+    let mut viewer = live.subscribe("src", "stats").unwrap();
+    let second = live.subscribe("src", "stats").unwrap();
+    let control: LiveFeedControl = plugin.recv_msg().await;
+    assert_eq!(control.channels, ["stats"]);
+    drop(second); // one still watches: nothing to say
+
+    plugin.send(&live_frame("stats", b"{}", 7)).await;
+    let frame = tokio::time::timeout(WAIT, viewer.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((frame.seq, &frame.data[..]), (7, &b"{}"[..]));
+
+    // A new connection is told what's watched, right after the handshake.
+    drop(plugin);
+    assert!(matches!(
+        next(&mut link).await,
+        HubEvent::Disconnected { .. }
+    ));
+    let (mut plugin, _, _) = connected(&hub.hub, &mut link, live_source()).await;
+    let control: LiveFeedControl = plugin.recv_msg().await;
+    assert_eq!(control.channels, ["stats"]);
+    plugin.send(&live_frame("stats", b"[1]", 8)).await;
+    let frame = tokio::time::timeout(WAIT, viewer.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.seq, 8, "the viewer carries on");
+
+    drop(viewer);
+    let control: LiveFeedControl = plugin.recv_msg().await;
+    assert!(control.channels.is_empty());
+}
+
+#[tokio::test]
+async fn nothing_is_said_to_a_new_connection_when_nobody_watches() {
+    let hub = start_hub(config()).await;
+    let mut link = hub.hub.expect(expected("src", PluginType::Source));
+    let (mut plugin, _, _) = connected(&hub.hub, &mut link, live_source()).await;
+    plugin.send(&Ping { nonce: 5 }).await;
+    let pong: Pong = plugin.recv_msg().await; // the first frame after the response
+    assert_eq!(pong.nonce, 5);
+}
+
+#[tokio::test]
+async fn a_live_feed_without_the_capability_is_a_violation() {
+    let hub = start_hub(config()).await;
+    let mut link = hub.hub.expect(expected("src", PluginType::Source));
+    let (mut plugin, _, _) = connected(
+        &hub.hub,
+        &mut link,
+        init(PbPluginType::Source, "src", TOKEN),
+    )
+    .await;
+    plugin.send(&live_frame("stats", b"{}", 1)).await;
+    match next(&mut link).await {
+        HubEvent::Disconnected { reason, .. } => {
+            assert!(reason.contains("LIVE_FEED"), "{reason}");
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+    assert!(hub.hub.live().channels("src").is_empty());
+}
+
+#[tokio::test]
+async fn a_bad_channel_name_is_a_violation() {
+    let hub = start_hub(config()).await;
+    let mut link = hub.hub.expect(expected("src", PluginType::Source));
+    let (mut plugin, _, _) = connected(&hub.hub, &mut link, live_source()).await;
+    plugin.send(&live_frame("not valid", b"{}", 1)).await;
+    match next(&mut link).await {
+        HubEvent::Disconnected { reason, .. } => assert!(reason.contains("channel"), "{reason}"),
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn oversized_live_frames_are_dropped_and_the_connection_stays() {
+    let hub = start_hub(HubConfig {
+        max_live_feed_bytes: 64,
+        max_event_bytes: 1024,
+        ..config()
+    })
+    .await;
+    let mut link = hub.hub.expect(expected("src", PluginType::Source));
+    let (mut plugin, _, _) = connected(&hub.hub, &mut link, live_source()).await;
+    plugin.send(&live_frame("stats", b"", 0)).await;
+    announced(&hub.hub, "src", "stats").await;
+    let mut viewer = hub.hub.live().subscribe("src", "stats").unwrap();
+    let _: LiveFeedControl = plugin.recv_msg().await;
+
+    // Over the live limit, then over the event limit as well.
+    plugin.send(&live_frame("stats", &[b'x'; 200], 1)).await;
+    plugin.send(&live_frame("stats", &[b'x'; 4096], 2)).await;
+    plugin.send(&live_frame("stats", b"{}", 3)).await;
+    let frame = tokio::time::timeout(WAIT, viewer.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(frame.seq, 3, "the large ones were dropped");
+    assert!(link.is_connected());
+}
+
+#[tokio::test]
+async fn a_viewer_that_never_reads_holds_up_no_events() {
+    let hub = start_hub(config()).await;
+    let mut link = hub.hub.expect(expected("src", PluginType::Source));
+    let mut init = live_source();
+    init.capabilities.push(Capability::Credits as i32);
+    let (mut plugin, conn_id, _) = connected(&hub.hub, &mut link, init).await;
+    let credit: Credit = plugin.recv_msg().await;
+    assert_eq!(credit.events, 4);
+    plugin.send(&live_frame("preview", b"", 0)).await;
+    announced(&hub.hub, "src", "preview").await;
+    let viewer = hub.hub.live().subscribe("src", "preview").unwrap();
+    let _: LiveFeedControl = plugin.recv_msg().await;
+
+    for seq in 1..=500 {
+        plugin
+            .send(&live_frame("preview", &[b'x'; 1024], seq))
+            .await;
+    }
+    let seq = plugin.send_event(text_payload("still flows"), 0).await;
+    match next(&mut link).await {
+        HubEvent::Event {
+            conn_id: id,
+            seq: got,
+            ..
+        } => assert_eq!((id, got), (conn_id, seq)),
+        other => panic!("expected the event, got {other:?}"),
+    }
+    drop(viewer);
+}
+
+/// Runs only as a child of the test below: a source on the SDK that publishes
+/// to its live feed while it's watched.
+#[tokio::test]
+#[ignore = "runs as a child process of the hub SDK tests"]
+async fn sdk_live_feed_child() {
+    use flwrs_plugin::plugin::core::{
+        ConnectionConfig, FieldDefinition, InitializeRequest, SchemaDefinition,
+    };
+    use flwrs_plugin::plugin::error::{InitializeError, ShutdownError, SourceError};
+    use flwrs_plugin::plugin::live::LiveFeedPublisher;
+    use flwrs_plugin::schema::protocol::log_level::Enum as Level;
+    use flwrs_plugin::source::local_sink::LocalSink;
+    use flwrs_plugin::source::plugin::Source;
+    use flwrs_plugin::source::runner::{SourceRunner, SourceRunnerConfig};
+
+    struct Live(LiveFeedPublisher);
+    impl Source for Live {
+        fn initialize(
+            &mut self,
+            id: String,
+            _: Level,
+            _: LocalSink,
+        ) -> Result<InitializeRequest, InitializeError> {
+            let schema = SchemaDefinition::new().add_field(
+                FieldDefinition::new()
+                    .with_key("text".into())
+                    .with_type(field_type::Enum::String),
+            );
+            Ok(InitializeRequest::new()
+                .with_id(id)
+                .with_version("1.0.0".into())
+                .with_out_schema(schema)
+                .with_live_feed(self.0.clone()))
+        }
+        fn shutdown(&mut self) -> Result<(), ShutdownError> {
+            Ok(())
+        }
+        fn version(&self) -> String {
+            "1.0.0".into()
+        }
+        async fn run(&self) -> Result<(), SourceError> {
+            loop {
+                if self.0.is_watched("stats") {
+                    self.0.publish(
+                        "stats",
+                        br#"{"fps":5}"#.to_vec(),
+                        Some(std::time::SystemTime::now()),
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    let Ok(port) = std::env::var(PORT_ENV) else {
+        return;
+    };
+    let live = LiveFeedPublisher::new();
+    live.announce("stats", "application/json").unwrap();
+    let mut runner = SourceRunner::initialize(
+        Live(live),
+        SourceRunnerConfig {
+            plugin_id: "live".into(),
+            log_level: Level::Info,
+            hub_connection: ConnectionConfig::new("127.0.0.1", port.parse().unwrap()),
+        },
+    )
+    .await
+    .unwrap();
+    runner.run().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_real_sdk_plugin_feeds_a_viewer() {
+    let hub = start_hub(config()).await;
+    let mut link = hub.hub.expect(expected("live", PluginType::Source));
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "modules::hub::tests::sdk_live_feed_child",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(PORT_ENV, hub.hub.local_addr().port().to_string())
+        .env("FLWRS_TOKEN", TOKEN)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let HubEvent::Connected { negotiated, .. } = next(&mut link).await else {
+        panic!("expected Connected");
+    };
+    assert!(negotiated.live_feed);
+    announced(&hub.hub, "live", "stats").await;
+    assert_eq!(
+        hub.hub.live().channels("live")[0].media_type,
+        "application/json"
+    );
+
+    let mut viewer = hub.hub.live().subscribe("live", "stats").unwrap();
+    let frame = tokio::time::timeout(WAIT, viewer.next())
+        .await
+        .expect("no frame from the plugin")
+        .unwrap();
+    assert_eq!(&frame.data[..], br#"{"fps":5}"#);
+    assert!(frame.capture_time.is_some());
+    drop(viewer);
+
+    link.shutdown("done").await.unwrap();
+    let status = tokio::time::timeout(WAIT, child.wait())
+        .await
+        .expect("plugin process didn't exit")
+        .unwrap();
+    assert!(status.success(), "plugin process failed: {status}");
 }

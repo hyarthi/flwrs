@@ -26,6 +26,9 @@ message SceneFile {
   // The scene's defaults for its nodes as a JSON object (durable,
   // remote_auth, require_tls); unset = none.
   optional string defaults_json = 8;
+  // The scene's groups as a JSON array of {id, family, policy}; unset = none.
+  // A node's membership is in its config (`groups`).
+  optional string groups_json = 9;
 }
 
 message PluginType {
@@ -60,6 +63,9 @@ message Node {
   repeated NodeFile files = 7;
   // Where the node sits in the editor's canvas; unset = not placed.
   optional Position position = 9;
+  // Where a graph setting's inner nodes sit in the editor: JSON
+  // `{"<setting>": {"<inner node>": {"x": 0, "y": 0}}}`. Layout, not content.
+  optional string inner_layout_json = 10;
 }
 
 message Position {

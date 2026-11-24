@@ -60,6 +60,8 @@
         The scene isn’t running{view.scene.enabled ? ' yet' : ''}: counters appear while it runs (they restart with each node).
       {:else if status.state === 'FAILED'}
         The scene failed to start.
+      {:else if status.state === 'WAITING'}
+        Waiting for the pre-flight check{status.preflight_retry ? ` (check ${status.preflight_retry.attempt} of ${status.preflight_retry.max_attempts})` : ''}{status.nodes.length ? ': the nodes below keep running the previous graph meanwhile.' : '.'}
       {:else}
         Live: counters since each node started; rates between the last two samples.
       {/if}
@@ -71,7 +73,7 @@
 
   {#if purged}<div class="notice ok" role="status">{purged}</div>{/if}
   {#if status?.errors.length}
-    <div class="notice danger"><ul>{#each status.errors as e, i (i)}<li>{e}</li>{/each}</ul></div>
+    <div class="notice {status.state === 'WAITING' ? 'warn' : 'danger'}"><ul>{#each status.errors as e, i (i)}<li>{e}</li>{/each}</ul></div>
   {/if}
 
   {#if reports.length}

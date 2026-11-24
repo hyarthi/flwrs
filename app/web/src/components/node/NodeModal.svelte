@@ -12,9 +12,12 @@
   import NodeUploads from './NodeUploads.svelte';
   import NodeStats from './NodeStats.svelte';
   import NodeLogs from './NodeLogs.svelte';
+  import GraphEditor from '../graph/GraphEditor.svelte';
   import Wand from '@lucide/svelte/icons/wand-sparkles';
   import { ApiError } from '../../lib/api';
   import { topFields, type Schema } from '../../lib/schemaForm';
+  import { groupsOf, membersByGroup } from '../../lib/groups';
+  import { withoutLocation } from '../../lib/graphModel';
   import {
     configureDraftNode,
     getLaunchArgsSchema,
@@ -43,7 +46,7 @@
   const node = $derived<GraphNode | undefined>(view.draft ? draftNode : liveNode);
   const removed = $derived(draftNode?.change === 'removed');
 
-  type TabId = 'settings' | 'uploads' | 'stats' | 'logs';
+  type TabId = 'graph' | 'settings' | 'uploads' | 'stats' | 'logs';
   let tab = $state<TabId>('settings');
   /** Tabs shown so far: they stay mounted (hidden), so their inputs survive switching. */
   let visited = $state(new Set<TabId>(['settings']));
@@ -74,6 +77,17 @@
         .finally(() => (loaded = true));
     });
   });
+
+  /** The setting holding a graph, if the plugin has one: it gets a tab. */
+  const graphField = $derived.by(() => {
+    for (const [key, property] of Object.entries(schema?.properties ?? {})) {
+      const catalog = property['x-flwrs-graph']?.catalog;
+      if (catalog) return { key, catalog };
+    }
+    return null;
+  });
+  /** What a graph save changed, for the settings form to follow. */
+  let graphSaved = $state<{ keys: string[]; args: Record<string, unknown> } | null>(null);
 
   // ---- uploads: the draft's, else live's (fetched) ----
 
@@ -114,7 +128,14 @@
   const check = $derived(view.draft_check ?? view.check);
   const problems = $derived(messagesFor(check.problems, nodeId));
   const warnings = $derived(messagesFor(check.warnings, nodeId));
-  const running = $derived(!!liveNode && (status?.state === 'RUNNING' || status?.state === 'FAILED'));
+  const running = $derived(
+    !!liveNode && (status?.state === 'RUNNING' || status?.state === 'WAITING' || status?.state === 'FAILED'),
+  );
+  const preflight = $derived(
+    [...(status?.preflight ?? []), ...(status?.failed_update?.problems ?? []), ...(view.draft?.submit?.problems ?? [])].filter(
+      (p) => p.node_id === nodeId,
+    ),
+  );
 
   let actionError = $state<string | null>(null);
   async function remove() {
@@ -155,7 +176,7 @@
   const title = $derived(node ? (node.name ?? plugin?.name ?? node.plugin_id) : 'Node');
 </script>
 
-<Modal {title} {onclose} size="lg" fixed>
+<Modal {title} {onclose} size={tab === 'graph' ? 'full' : 'lg'} fixed>
   {#if !node}
     <p class="muted">This node isn’t in the scene{view.draft ? '’s draft' : ''}.</p>
   {:else}
@@ -184,12 +205,19 @@
 
     {#if actionError}<div class="notice danger" role="alert">{actionError}</div>{/if}
     {#if loadError}<div class="notice danger" role="alert">Couldn’t load the plugin: {loadError}</div>{/if}
+    {#if preflight.length}
+      <div class="notice {preflight.some((p) => !p.retryable) ? 'danger' : 'warn'}" role="status">
+        Pre-flight check on this machine:
+        <ul>{#each preflight as p, i (i)}<li>{withoutLocation(p.message)}{p.retryable ? ' (retrying)' : ''}</li>{/each}</ul>
+      </div>
+    {/if}
     {#if warnings.length}
-      <div class="notice warn"><ul>{#each warnings as w, i (i)}<li>{w}</li>{/each}</ul></div>
+      <div class="notice warn"><ul>{#each warnings as w, i (i)}<li>{withoutLocation(w)}</li>{/each}</ul></div>
     {/if}
 
     <Tabs
       tabs={[
+        ...(graphField && !removed ? [{ id: 'graph', label: 'Graph' }] : []),
         { id: 'settings', label: 'Settings' },
         { id: 'uploads', label: `Uploads${uploads.length ? ` (${uploads.length})` : ''}` },
         { id: 'stats', label: 'Stats' },
@@ -202,6 +230,28 @@
     <!-- Only the tab's content scrolls; the header, the tabs and the
          settings' actions stay put. -->
     <div class="panes">
+      {#if graphField && plugin && schema && visited.has('graph') && !removed}
+        <div class="pane" hidden={tab !== 'graph'}>
+          <GraphEditor
+            {view}
+            {node}
+            {plugin}
+            {schema}
+            field={graphField.key}
+            catalogPath={graphField.catalog}
+            {uploads}
+            messages={[...problems, ...warnings, ...preflight.map((p) => p.message)]}
+            active={tab === 'graph'}
+            running={!!liveNode && status?.state === 'RUNNING'}
+            liveArgs={(liveNode?.config.launch_args ?? null) as Record<string, unknown> | null}
+            onopensettings={() => select('settings')}
+            onsaved={(saved) => {
+              const args = (saved.config.launch_args ?? {}) as Record<string, unknown>;
+              graphSaved = { keys: Object.keys(args).filter((k) => k === graphField?.key || !schema?.properties?.[k]?.writeOnly), args };
+            }}
+          />
+        </div>
+      {/if}
       <div class="pane" hidden={tab !== 'settings'}>
         {#if removed}
           <p class="muted">Removed in the draft. Restore it to edit its settings.</p>
@@ -215,9 +265,16 @@
               {plugin}
               {schema}
               {uploads}
-              {problems}
+              problems={problems.map(withoutLocation)}
               sceneDefaults={(view.draft?.settings ?? view.scene).defaults}
+              sceneGroups={(view.draft?.settings ?? view.scene).groups ?? []}
+              groupMembers={membersByGroup(view.draft?.nodes ?? view.nodes)}
+              currentGroups={node ? groupsOf(node.config) : []}
+              threads={check.threads?.[nodeId] ?? null}
               {savedToken}
+              {graphSaved}
+              graphField={graphField?.key ?? null}
+              onopengraph={() => select('graph')}
               justSaved={formKey > 0}
               onsaved={(saved, token) => {
                 formNode = saved;

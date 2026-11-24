@@ -187,14 +187,14 @@ A **scene** is a workflow: a directed graph whose **nodes** are plugin instances
 
 | Request | Purpose |
 |---|---|
-| `GET/POST /api/scenes`, `GET/PUT/DELETE /api/scenes/by-id/{id}` | List, create, get, update (`name`, `max_hops`, `defaults`), delete scenes (deleting removes nodes, edges and queued events). |
+| `GET/POST /api/scenes`, `GET/PUT/DELETE /api/scenes/by-id/{id}` | List, create, get, update (`name`, `max_hops`, `defaults`, `groups`), delete scenes (deleting removes nodes, edges and queued events). |
 | `POST /api/scenes/by-id/{id}/enable`, `…/disable` | Run or stop the workflow. Enabling requires every node's plugin to be installed. |
 | `GET/POST /api/scenes/by-id/{id}/nodes`, `GET/PUT/DELETE …/nodes/by-id/{node_id}` | Manage nodes. A node runs a registered plugin; its `type` is the plugin's type. |
 | `GET/POST /api/scenes/by-id/{id}/edges`, `GET/PUT/DELETE …/edges/by-id/{edge_id}` | Manage edges. A SINK can't send and a SOURCE can't receive; at most one edge per direction between two nodes. |
 | `GET /api/scenes/by-id/{id}/export`, `POST /api/scenes/import` | Move a scene to another server as a `.flwr` file or a `.far` archive with its nodes' files (see below). |
 | `PUT/GET/DELETE …/nodes/by-id/{node_id}/uploads/{name}`, `GET …/uploads`, `GET …/uploads/{name}/content` | Files uploaded to a node, for settings that name one (a model, a certificate, a spec). Raw body, up to `[scenes] max_upload_bytes`. A running node restarts with the new file; a file a setting names can't be deleted, and one a secret setting names can't be downloaded. |
 | `DELETE …/nodes/by-id/{node_id}/workdir` | Empty a node's folder (the plugin's state and caches), while the scene is disabled. |
-| `GET /api/scenes/by-id/{id}/check` | Whether the scene can run here: `launchable`, `problems` (block enabling), `warnings`. |
+| `GET /api/scenes/by-id/{id}/check` | Whether the scene can run here: `launchable`, `problems` (block enabling), `warnings`; and by node id, the core count each local node effectively gets (`threads`) and the devices it claims (`devices`). |
 | `GET /api/scenes/by-id/{id}/status` | What the scene is doing right now (see *Status*, below). |
 | `GET /api/scenes/stream` | The scenes list, live (Server-Sent Events; the web UI's list): `scenes` (every scene with its node and edge counts and its check, sent first and after each change to scenes or plugins), `status` (each running scene's state and event counters, every `[scenes] stream_interval_ms`, 1 s by default). |
 | `…/scenes/by-id/{id}/draft…` | The scene's **draft**: edit the graph apart from the live one, then submit it at once (see *Drafts*, below). |
@@ -234,6 +234,23 @@ Each change through the endpoints above is committed (and a running scene reload
 { "name": "enrichment pipeline", "max_hops": 200, "defaults": { "durable": true } }
 ```
 
+**Groups** (`groups`) name sets of a scene's nodes with a shared policy. A node lists the ones it's in, in its config (`"groups": ["vision"]`); that alone never restarts it. A scene accepts **`resources`** groups, a shared core budget:
+
+```json
+{ "name": "cameras", "groups": [
+  { "id": "edge", "family": "resources", "policy": { "limits": { "cpu": 8 } } },
+  { "id": "vision", "family": "resources", "policy": { "limits": { "cpu": 4 } } }
+] }
+```
+
+- Budgets of one scene nest or share no members. Saving a scene's settings without `groups` keeps them.
+- A member's own `runtime.threads` counts against every budget it's in (more than a budget holds is a `check` problem). Members without one split what's left of their innermost budget equally, at least 1 each, within the budgets around it; what can't be divided evenly stays unused. A node whose share changes restarts with it.
+- A node's core count is its own value, else its group share, else the plugin manifest's default, else `[director] plugin_threads`. `GET …/check` shows the result and its source per node.
+- The budget is advisory: it sets how many threads each plugin is told to use, and pins nothing to a CPU. It applies to local nodes whose plugin takes a core count; other members get a warning and don't count.
+- **`placement` and `execution` groups are refused** in a scene: one server runs all its nodes, and each node is its own process, so they couldn't be honoured. A `.flwr` file that has them still imports, with a problem that keeps the scene from being enabled.
+
+**Device claims:** a plugin can mark a setting as naming a device its node opens exclusively (`x-flwrs-device`, see `docs/plugin-spec.md`; the vision source's camera does). Two local nodes claiming the same device, in a scene or across enabled scenes, are a `check` problem. Devices are compared by the string each node names, so two names for one camera aren't recognised as the same.
+
 **Scene defaults** (`defaults`, all optional) apply to every node that doesn't set its own: `durable` (durable queues, below), `remote_auth` (`token` or `mtls`) and `require_tls` (remote nodes, below).
 
 **Node config** (all optional):
@@ -251,7 +268,7 @@ Each change through the endpoints above is committed (and a running scene reload
 - **`auth`** (remote nodes): `token` (a pre-shared secret of at least 16 characters, in `token`) or `mtls` (a client certificate on the TLS listener: one that chains to `[hub.tls] client_ca` and names the `remote_id` in its SAN or CN, or the one pinned in `tls.client_cert_sha256`). Default: the scene's `remote_auth`, else `token`. **`require_tls`** (token nodes): only accept the plugin over the TLS listener; default: the scene's, else true when the hub has a TLS listener. A remote plugin built on the Rust SDK takes its TLS settings from `FLWRS_TLS_CA`, `FLWRS_TLS_SERVER_NAME`, `FLWRS_TLS_CERT` and `FLWRS_TLS_KEY`.
 - **`token`:** never returned by the API (`has_token` instead). Omitting it on update keeps the stored one.
 - **`launch_args`:** the node's settings, checked against the plugin's launch-args schema and delivery rules ([plugin spec](docs/plugin-spec.md#3-node-settings-the-launch-args-schema)); for code settings, the code's syntax too. **Secrets** (the schema's `writeOnly` properties) are never returned: responses list them in `launch_args_secrets` (`{"/api_key": true}`: set or not), an update that leaves one out keeps it, and `null` clears it. Settings that name an uploaded file need it uploaded (`…/uploads/{name}`) before the scene can be enabled. Local nodes; a remote node only carries them for its payload schemas, when its plugin takes those from its settings.
-- **`runtime`:** timeouts, restarts, the event queue, redelivery (`delivery`: `max_attempts`, 5, and `retry_delay_ms`, 1 000), and `threads`: the cores a local plugin may use (1 = single-threaded; 0 = the plugin decides; default: the plugin's `runtime_defaults.threads`, else `[director] plugin_threads`), passed as its manifest's `threads` says ([plugin spec](docs/plugin-spec.md#55-the-core-count)). Unknown keys are rejected. A node on a cycle can't use `"when_full": "block"`, because blocking can deadlock there.
+- **`runtime`:** `is_critical_path` (a critical node that fails stops the scene; any other goes offline while the scene runs on; default: the plugin's `runtime_defaults`, else off), timeouts, restarts (`max_restarts`: failed launches to retry before the node fails, 0 = fail on the first, -1 = try forever; unset = 5 until a critical or just-updated node first runs, otherwise no limit), the event queue, redelivery (`delivery`: `max_attempts`, 5, and `retry_delay_ms`, 1 000), and `threads`: the cores a local plugin may use (1 = single-threaded; 0 = the plugin decides; default: the plugin's `runtime_defaults.threads`, else `[director] plugin_threads`), passed as its manifest's `threads` says ([plugin spec](docs/plugin-spec.md#55-the-core-count)). Unknown keys are rejected. A node on a cycle can't use `"when_full": "block"`, because blocking can deadlock there.
 
 **Event queues.** Every node that receives events has an inbound queue. By default it holds up to 1 024 events or 64 MiB in memory; when it's full, `when_full` decides: `block` (the default: the producer waits, up to `block_timeout_ms`), `drop_newest` (the incoming event is dropped) or `drop_oldest` (as many of the oldest queued events as needed are evicted to fit it). `max_evictions` caps how many one incoming event may evict: if fitting it would take more, nothing is evicted and the incoming event is dropped instead, so one unexpectedly large event can't empty the queue (no limit by default). All queues share a hub-wide budget (`[hub] max_inflight_bytes`, 512 MiB); when it's used up, a `drop_oldest` queue evicts its own oldest events to make room (within `max_evictions`), never another queue's.
 

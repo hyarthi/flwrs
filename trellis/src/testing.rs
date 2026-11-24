@@ -410,7 +410,8 @@ impl Tester {
                 serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
             target = target.with_launch_args(substitute_json_vars(&args, port, &self.vars))?;
         } else if !target.launch_args.is_null() {
-            let args = substitute_json_vars(&target.launch_args, port, &self.vars);
+            // Set again, so the configurator's own fields are left to it.
+            let args = substitute_json_vars(&target.settable_launch_args(), port, &self.vars);
             target = target.with_launch_args(args)?;
         }
         target.args.extend(

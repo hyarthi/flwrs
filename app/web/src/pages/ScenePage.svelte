@@ -3,12 +3,14 @@
   // tabs, fed by the scene's stream (`…/by-id/{id}/stream`).
   import { SvelteFlowProvider } from '@xyflow/svelte';
   import ArrowLeft from '@lucide/svelte/icons/arrow-left';
+  import MonitorCheck from '@lucide/svelte/icons/monitor-check';
   import Page from '../components/Page.svelte';
   import SceneStats from '../components/scene/SceneStats.svelte';
   import Tabs from '../components/Tabs.svelte';
   import NodeModal from '../components/node/NodeModal.svelte';
   import Switch from '../components/Switch.svelte';
   import LayoutView from '../components/scene/LayoutView.svelte';
+  import PreflightDialog from '../components/scene/PreflightDialog.svelte';
   import { ApiError } from '../lib/api';
   import { navigate } from '../lib/router.svelte';
   import { openStream } from '../lib/stream.svelte';
@@ -51,15 +53,32 @@
   const shownState = $derived.by(() => {
     if (!view) return null;
     if (status?.state === 'FAILED') return { label: 'Failed', tone: 'danger', detail: status.errors.join('\n') };
+    if (status?.state === 'WAITING') {
+      const retry = status.preflight_retry;
+      const attempt = retry ? ` (check ${retry.attempt} of ${retry.max_attempts})` : '';
+      return {
+        label: 'Waiting',
+        tone: 'warn',
+        detail: status.errors.length ? `${status.errors.join('\n')}${attempt}` : `Pre-flight check running${attempt}`,
+      };
+    }
     if (!view.scene.enabled) return status?.state === 'RUNNING' ? { label: 'Stopping', tone: 'warn' } : { label: 'Disabled', tone: '' };
     if (status?.state === 'RUNNING') {
       const running = status.nodes.filter((n) => n.status.state === 'RUNNING').length;
       return running < status.nodes.length
         ? { label: `Running ${running}/${status.nodes.length}`, tone: 'warn', detail: 'Not every node is connected' }
-        : { label: 'Running', tone: 'ok' };
+        : status.failed_update
+          ? { label: 'Running (update failed)', tone: 'warn', detail: status.failed_update.errors.join('\n') }
+          : { label: 'Running', tone: 'ok' };
     }
     return { label: 'Starting', tone: 'warn' };
   });
+
+  let checking = $state(false);
+  function nodeName(nodeId: string): string {
+    const nodes = view?.draft?.nodes ?? view?.nodes ?? [];
+    return nodes.find((n) => n.id === nodeId)?.name ?? nodeId;
+  }
 
   let toggling = $state(false);
   let toggleError = $state<ApiError | null>(null);
@@ -96,6 +115,9 @@
         {/if}
       </div>
       <div class="enable">
+        <button class="btn" type="button" onclick={() => (checking = true)}>
+          <MonitorCheck size={16} strokeWidth={1.75} />Check this machine
+        </button>
         {#if view.check.problems.length && !view.scene.enabled}
           <span class="muted small" title={view.check.problems.join('\n')}>Live has problems: fix them to enable it</span>
         {/if}
@@ -122,6 +144,14 @@
     {#if streamError}
       <div class="notice danger" role="alert">{streamError}</div>
     {/if}
+    {#if status?.failed_update}
+      <div class="notice warn" role="status">
+        <div>
+          The latest update failed its pre-flight check, so the scene keeps running its previous version.
+          <ul>{#each status.failed_update.errors as e, i (i)}<li>{e}</li>{/each}</ul>
+        </div>
+      </div>
+    {/if}
 
     <Tabs
       tabs={[
@@ -139,6 +169,10 @@
     {/if}
   {/if}
 </Page>
+
+{#if checking && view}
+  <PreflightDialog sceneId={view.scene.id} draft={!!view.draft} nameOf={nodeName} onclose={() => (checking = false)} />
+{/if}
 
 {#if nodeId && view}
   <NodeModal {view} {status} {nodeId} onclose={() => navigate(base)} />

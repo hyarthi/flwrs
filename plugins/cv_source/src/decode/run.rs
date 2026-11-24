@@ -4,7 +4,7 @@
 
 use super::Decoder;
 use super::util::*;
-use crate::results::{Class, Keypoint, Map, MapSummary, Object, Results, Text};
+use crate::results::{Class, HAND_POSE, Keypoint, Map, MapSummary, Object, Results, Text};
 use crate::tensor::Outputs;
 
 fn object(class_id: u32, class_name: Option<String>, confidence: f32, bbox: [f32; 4]) -> Object {
@@ -564,6 +564,8 @@ impl Decoder {
                 visibility_index,
                 presence,
                 presence_sigmoid,
+                world,
+                handedness,
             } => {
                 let t = get(out, output)?;
                 ensure(t.data().len() >= points * per, || {
@@ -595,6 +597,26 @@ impl Decoder {
                 }
                 let mut o = object(0, cx.label(0), score, [0.0, 0.0, cx.width, cx.height]);
                 o.keypoints = kps;
+                if let (Some(world), Some(handedness)) = (world, handedness) {
+                    let w = get(out, world)?;
+                    ensure(w.data().len() >= points * 3, || {
+                        format!("output {world:?} has too few values for {points} points")
+                    })?;
+                    let right = get(out, handedness)?.data().first().copied().unwrap_or(0.5);
+                    let depth = (0..*points).map(|k| t.data()[k * per + 2]).collect();
+                    o.children.push((
+                        HAND_POSE.to_string(),
+                        Results::Tensor(vec![
+                            ("depth".into(), vec![*points], depth),
+                            (
+                                "world".into(),
+                                vec![*points, 3],
+                                w.data()[..points * 3].to_vec(),
+                            ),
+                            ("right".into(), vec![1], vec![right]),
+                        ]),
+                    ));
+                }
                 Results::Objects(vec![o])
             }
             Decoder::Semantic { output } => {

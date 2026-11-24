@@ -211,6 +211,20 @@ impl Target {
         self.configured.as_ref().map(|c| &c.values)
     }
 
+    /// The launch args without the fields the configurator sets, as a
+    /// caller gives them to [`Self::with_launch_args`].
+    pub(crate) fn settable_launch_args(&self) -> Value {
+        let mut args = self.launch_args.clone();
+        if let (Some(configurator), Some(object)) =
+            (&self.manifest.configurator, args.as_object_mut())
+        {
+            for field in &configurator.fields {
+                object.remove(field);
+            }
+        }
+        args
+    }
+
     /// Runs the plugin's configurator on `args` the way the server does
     /// (`docs/plugin-spec.md`), with this target's uploads, and returns its
     /// result. Values `args` gives for configured fields are refused, as the
@@ -263,6 +277,67 @@ impl Target {
             }
             _ => configure::configure(&inv),
         }
+    }
+
+    /// Runs the plugin's pre-flight check (manifest `configurator.preflight`)
+    /// on `args` the way the server does: the configurator first, for its
+    /// configured fields (so leave them out of `args`), then `--mode preflight`
+    /// with the whole settings. Errors: the check can't be run at all (no
+    /// declaration, a remote node, a failing configure run).
+    pub fn preflight(&self, args: &Value) -> Result<configure::PreflightReport, Vec<String>> {
+        self.preflight_releasing(args, &[])
+    }
+
+    /// [`Target::preflight`], with the running nodes the change would stop
+    /// (`releasing` in the request).
+    pub fn preflight_releasing(
+        &self,
+        args: &Value,
+        releasing: &[configure::ReleasingNode],
+    ) -> Result<configure::PreflightReport, Vec<String>> {
+        if !configure::has_preflight(&self.manifest) {
+            return Err(vec![
+                "the plugin doesn't declare a pre-flight check (manifest `configurator.preflight`)"
+                    .into(),
+            ]);
+        }
+        if self.remote_node() {
+            return Err(vec!["remote nodes aren't pre-flight checked".into()]);
+        }
+        let configured = self.configure(args)?;
+        let (schema, validator) = self.launch_schema().map_err(|e| vec![e])?;
+        let (spec, report) = LaunchSpec::new(&self.manifest, schema.as_ref());
+        if !report.errors.is_empty() {
+            return Err(report.errors);
+        }
+        let uploads = |name: &str| {
+            configured
+                .files
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.path.clone())
+                .or_else(|| {
+                    self.uploads
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, p)| p.clone())
+                })
+        };
+        Ok(configure::preflight_with(
+            &Invocation {
+                package_dir: &self.cwd,
+                executable: self.configurator_program.as_deref(),
+                manifest: &self.manifest,
+                spec: &spec,
+                schema: validator.as_ref(),
+                launch_args: &configured.launch_args,
+                uploads: &uploads,
+                node_id: self.instance_id(),
+                limits: &configure::Limits::default(),
+            },
+            releasing,
+            &std::sync::atomic::AtomicBool::new(false),
+        ))
     }
 
     /// The launch-args schema and its validator.

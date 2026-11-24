@@ -28,6 +28,14 @@ pub(crate) struct SceneCheckResponse {
     pub problems: Vec<String>,
     /// Worth knowing, but not blocking, e.g. a different plugin version.
     pub warnings: Vec<String>,
+    /// By node id: the core count each local node whose plugin takes one
+    /// effectively gets, and where it comes from.
+    #[serde(default)]
+    pub threads: std::collections::BTreeMap<String, crate::modules::scene::groups::NodeThreads>,
+    /// By node id: the devices each local node claims. Compared by the
+    /// string the node names.
+    #[serde(default)]
+    pub devices: std::collections::BTreeMap<String, Vec<crate::modules::scene::groups::NodeDevice>>,
 }
 
 impl From<SceneCheck> for SceneCheckResponse {
@@ -36,6 +44,8 @@ impl From<SceneCheck> for SceneCheckResponse {
             launchable: check.problems.is_empty(),
             problems: check.problems,
             warnings: check.warnings,
+            threads: check.threads,
+            devices: check.devices,
         }
     }
 }
@@ -323,7 +333,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             json_of(&check),
-            json!({"launchable": true, "problems": [], "warnings": []})
+            json!({"launchable": true, "problems": [], "warnings": [], "threads": {}, "devices": {}})
         );
 
         let (status, headers_export, file) =

@@ -1,0 +1,9 @@
+name = "a new track is one rule event, and the objects go out when they change"
+
+[[steps]]
+wait_ms = 900
+expect_outputs = [
+    { path = "event", eq = "detections" },  # the person, not tracked yet
+    { path = "event", eq = "track" },       # confirmed on its third frame
+    { path = "event", eq = "detections" },  # now with its track id
+]

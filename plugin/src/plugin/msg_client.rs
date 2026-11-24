@@ -22,16 +22,18 @@ use crate::plugin::credits::{Acquire, Credits, Grant};
 use crate::plugin::frame::{
     Frame, FrameError, SeqCounter, WireMessage, encode_frame, encode_message, read_frame,
 };
+use crate::plugin::live::LiveFeedPublisher;
 use crate::schema::payload::PluginPayload;
 use crate::schema::protocol::{
-    Ack, Credit, Event, FrameHeader, InitializeResponse, Nack, Ping, Pong, Shutdown,
-    capability::Enum as Capability, msg_code::Enum as MsgCode, plugin_type::Enum as PluginType,
+    Ack, Credit, Event, FrameHeader, InitializeResponse, LiveFeedControl, Nack, Ping, Pong,
+    Shutdown, capability::Enum as Capability, msg_code::Enum as MsgCode,
+    plugin_type::Enum as PluginType,
 };
 use prost::Message;
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -69,6 +71,8 @@ struct Conn {
     seqs: SeqCounter,
     /// The hub enabled ACKS on this connection.
     acks: bool,
+    /// The hub enabled LIVE_FEED on this connection.
+    live_feed: bool,
     /// Emitted events waiting for the hub's ACK / NACK.
     confirms: HashMap<u64, oneshot::Sender<Confirmation>>,
 }
@@ -93,6 +97,10 @@ pub(crate) struct HubClient {
     credits: Credits,
     next_id: AtomicU64,
     next_nonce: AtomicU64,
+    /// The plugin's live feed, if it offers the capability.
+    live_feed: OnceLock<LiveFeedPublisher>,
+    /// The connection the live feed may use now.
+    live_conn: watch::Sender<Option<u64>>,
 }
 
 /// How to open the byte stream to the hub.
@@ -114,6 +122,8 @@ impl HubClient {
             credits: Credits::default(),
             next_id: AtomicU64::new(1),
             next_nonce: AtomicU64::new(1),
+            live_feed: OnceLock::new(),
+            live_conn: watch::Sender::new(None),
         })
     }
 
@@ -147,11 +157,13 @@ impl HubClient {
         if let Some(old) = conn.take() {
             fail_confirms(old.confirms);
         }
+        self.live_feed_ended();
         *conn = Some(Conn {
             id,
             writer,
             seqs: SeqCounter::new(),
             acks: false,
+            live_feed: false,
             confirms: HashMap::new(),
         });
         self.stage.send_replace(Stage::Down);
@@ -368,7 +380,53 @@ impl HubClient {
             let has = |cap: Capability| response.capabilities.contains(&(cap as i32));
             self.credits.reset(id, has(Capability::Credits));
             conn.acks = has(Capability::Acks);
+            conn.live_feed = has(Capability::LiveFeed) && self.live_feed.get().is_some();
             self.stage.send_replace(Stage::Ready);
+            if conn.live_feed {
+                self.live_conn.send_replace(Some(id));
+            }
+        }
+    }
+
+    /// Connects the plugin's live feed: its task sends on every connection
+    /// where the hub enabled the capability.
+    pub(crate) fn attach_live_feed(self: &Arc<Self>, publisher: LiveFeedPublisher) {
+        if self.live_feed.set(publisher.clone()).is_ok() {
+            tokio::spawn(crate::plugin::live::run(
+                Arc::downgrade(self),
+                self.live_conn.subscribe(),
+                publisher,
+            ));
+        }
+    }
+
+    /// Sends a live feed frame on connection `id`, if it's still current.
+    pub(crate) async fn send_live_feed(&self, id: u64, frame: &[u8]) -> io::Result<()> {
+        self.send_frame_if(frame, Stage::Ready, Some(id), |c| c.live_feed)
+            .await
+    }
+
+    /// The hub's list of watched channels. `Err`: it wasn't negotiated.
+    async fn live_feed_control(&self, id: u64, control: LiveFeedControl) -> Result<(), String> {
+        let guard = self.conn.lock().await;
+        let Some(conn) = guard.as_ref().filter(|c| c.id == id) else {
+            return Ok(());
+        };
+        if !conn.live_feed {
+            return Err("protocol violation by the hub: LiveFeedControl without LIVE_FEED".into());
+        }
+        if let Some(publisher) = self.live_feed.get() {
+            publisher.set_watched(control.channels.into_iter().collect());
+        }
+        Ok(())
+    }
+
+    /// The connection is gone: nothing is being watched any more.
+    fn live_feed_ended(&self) {
+        self.live_conn
+            .send_if_modified(|conn| conn.take().is_some());
+        if let Some(publisher) = self.live_feed.get() {
+            publisher.set_watched(Default::default());
         }
     }
 
@@ -418,6 +476,7 @@ impl HubClient {
         if let Some(conn) = guard.take() {
             fail_confirms(conn.confirms);
         }
+        self.live_feed_ended();
         self.stage.send_replace(Stage::Down);
         self.credits.reset(0, false);
     }
@@ -496,6 +555,7 @@ fn allowed(plugin_type: PluginType, code: MsgCode) -> bool {
         MsgCode::InitializeResponse | MsgCode::Shutdown | MsgCode::Ping | MsgCode::Pong => true,
         MsgCode::Event => plugin_type != PluginType::Source,
         MsgCode::Credit | MsgCode::Ack | MsgCode::Nack => plugin_type != PluginType::Sink,
+        MsgCode::LiveFeedControl => true,
         _ => false,
     }
 }
@@ -592,6 +652,10 @@ async fn read_loop(
             MsgCode::Nack => {
                 let nack: Nack = decode(&frame)?;
                 client.confirm(conn_id, |_| false, Some(&nack)).await;
+                None
+            }
+            MsgCode::LiveFeedControl => {
+                client.live_feed_control(conn_id, decode(&frame)?).await?;
                 None
             }
             MsgCode::Event => {

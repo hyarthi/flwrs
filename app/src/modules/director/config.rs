@@ -1,3 +1,4 @@
+use crate::modules::node_config::PreflightRetryConfig;
 use flwrs_core::config::{self, main_config};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -35,6 +36,9 @@ pub(crate) struct DirectorConfig {
     /// and plugins whose manifest has no `runtime_defaults.threads`; `None` or
     /// 0: the plugins decide. Keeps cores free for other work on the machine.
     pub plugin_threads: Option<u32>,
+    /// How a scene waits out retryable pre-flight problems (state `WAITING`)
+    /// before it starts or fails; scenes can override it in their `defaults`.
+    pub preflight_retry: PreflightRetryConfig,
 }
 
 impl Default for DirectorConfig {
@@ -49,6 +53,7 @@ impl Default for DirectorConfig {
             nodes_dir: PathBuf::from("./nodes"),
             files_dir: PathBuf::from("./files"),
             plugin_threads: None,
+            preflight_retry: PreflightRetryConfig::default(),
         }
     }
 }

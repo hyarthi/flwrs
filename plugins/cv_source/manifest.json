@@ -12,6 +12,13 @@
   "payload_schemas": {
     "out": { "from_launch_args": "/out_schema", "default": "schema/out.json" }
   },
+  "configurator": {
+    "executable": "bin/flwrs-cv-source-config",
+    "fields": ["out_schema", "model_info"],
+    "preflight": true,
+    "describe": true
+  },
+  "runtime_defaults": { "is_critical_path": true },
   "ui": {
     "icon": "ui/cv.svg",
     "categories": ["Inputs", "Vision"],

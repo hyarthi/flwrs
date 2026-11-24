@@ -1,0 +1,6 @@
+name = "the out schema and model description follow the graph and the file"
+launch_args = "detector.json"
+values = "expected/detector.values.json"
+
+[uploads]
+"fixed_det.onnx" = "fixed_det.onnx"

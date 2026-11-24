@@ -37,7 +37,7 @@
       },
       "hand": {
         "type": "model",
-        "model": "mp_hand.onnx",
+        "model": "gesture_hand_lm.onnx",
         "pre": {
           "width": 224,
           "height": 224,
@@ -52,7 +52,9 @@
           "output": "Identity",
           "points": 21,
           "dims": 3,
-          "presence": "Identity_1"
+          "presence": "Identity_1",
+          "world": "Identity_3",
+          "handedness": "Identity_2"
         }
       },
       "hand_roi": {
@@ -70,13 +72,12 @@
         "type": "model",
         "model": "gesture_classifier.onnx",
         "tensor_input": {
-          "dims": 3,
-          "normalize": "wrist"
+          "embedder": "gesture_embedder.onnx"
         },
         "decode": {
           "type": "classify",
           "output": "Identity",
-          "softmax": true,
+          "softmax": false,
           "topk": 1
         },
         "labels": [

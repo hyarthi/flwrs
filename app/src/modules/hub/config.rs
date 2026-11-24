@@ -14,6 +14,10 @@ pub(crate) struct HubConfig {
     /// Largest data event accepted from a plugin (encoded payload). Nodes can
     /// lower it with `runtime.queue.max_event_bytes`.
     pub max_event_bytes: usize,
+    /// Largest live feed frame (a stats sample, a preview image) the hub
+    /// keeps. Larger ones are dropped; the connection and its data carry on.
+    /// A node's event size limit, if lower, also applies.
+    pub max_live_feed_bytes: usize,
     /// Hub-wide budget for event bytes waiting in node queues, across all
     /// scenes. When it's used up, `block` producers wait and `drop_*` queues drop.
     pub max_inflight_bytes: usize,
@@ -82,6 +86,7 @@ impl Default for HubConfig {
             host: "127.0.0.1".into(),
             port: 0,
             max_event_bytes: 16 * 1024 * 1024,
+            max_live_feed_bytes: 4 * 1024 * 1024,
             max_inflight_bytes: 512 * 1024 * 1024,
             handshake_timeout_ms: 10_000,
             max_handshake_bytes: 1024 * 1024,

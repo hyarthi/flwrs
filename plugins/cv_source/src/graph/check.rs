@@ -197,6 +197,7 @@ pub fn check(graph: &GraphConfig) -> Result<Checked, Vec<String>> {
         }
     }
     problems.extend(placement_problems(graph, &scope));
+    problems.extend(super::groups::problems(graph));
     if problems.is_empty() {
         Ok(Checked { order, scope })
     } else {
@@ -212,7 +213,17 @@ fn own_problems(node: &NodeConfig) -> Vec<String> {
             match (&m.pre, &m.tensor_input) {
                 (Some(pre), None) => problems.extend(pre.problems()),
                 (None, Some(t)) => {
-                    if !(2..=3).contains(&t.dims) {
+                    if t.embedder.is_some() {
+                        if t.dims != 0
+                            || t.keypoints.is_some()
+                            || t.normalize != super::config::Normalize::None
+                        {
+                            problems.push(
+                                "tensor_input.embedder takes no dims, normalize or keypoints"
+                                    .into(),
+                            );
+                        }
+                    } else if !(2..=3).contains(&t.dims) {
                         problems.push("tensor_input.dims must be 2 or 3".into());
                     }
                 }
@@ -278,6 +289,11 @@ fn own_problems(node: &NodeConfig) -> Vec<String> {
         NodeConfig::Filter(f) => {
             if f.min_confidence.is_some_and(|s| !(0.0..=1.0).contains(&s)) {
                 problems.push("min_confidence must be between 0 and 1".into());
+            }
+        }
+        NodeConfig::Emit(e) => {
+            if e.max_objects == 0 {
+                problems.push("max_objects must be at least 1".into());
             }
         }
         NodeConfig::Tracker(t) => problems.extend(tracker_problems(t)),
@@ -451,10 +467,23 @@ fn placement_problems(
     scope: &BTreeMap<String, Option<String>>,
 ) -> Vec<String> {
     let mut out = vec![];
+    let emits = graph
+        .nodes
+        .values()
+        .filter(|n| matches!(n, NodeConfig::Emit(_)))
+        .count();
+    if emits > 1 {
+        out.push(format!("the graph can have one emit node (it has {emits})"));
+    }
     let per_region = |id: &str| scope.get(id).is_some_and(Option::is_some);
     for (id, node) in &graph.nodes {
         match node {
-            NodeConfig::Tracker(_) | NodeConfig::Rule(_) | NodeConfig::Lua(_) if per_region(id) => {
+            NodeConfig::Tracker(_)
+            | NodeConfig::Rule(_)
+            | NodeConfig::Lua(_)
+            | NodeConfig::Emit(_)
+                if per_region(id) =>
+            {
                 out.push(format!(
                     "nodes.{id}: a {} node runs once per frame, not per region",
                     node.type_name()

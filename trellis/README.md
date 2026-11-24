@@ -61,6 +61,7 @@ The cases:
 | `stops-when-rejected` | `SHUTDOWN` instead of `InitializeResponse`: exits, no reconnect |
 | `reconnects` | after a dropped connection: reconnects with the same `Initialize` |
 | `closes-on-violation` | a frame with an unknown framing version closes the connection |
+| `live-feed` | a plugin offering `LIVE_FEED` sends none while the hub hasn't enabled it |
 
 ### Remote plugins
 
@@ -181,7 +182,22 @@ warnings_contain = ["webhooks"]              # optional
 # errors_contain = ["oneOf"]                 # with expect = "error"
 ```
 
-In Rust, `Target::with_configurator_executable(env!("CARGO_BIN_EXE_<name>-config"))` runs the configurator cargo built, and `Target::configure(&args)` runs it alone.
+A plugin whose manifest declares `configurator.preflight` also answers "can this node run on this machine right now?". `mode = "preflight"` tests that answer (the configurator first runs for its fields, as on the server):
+
+```toml
+# tests/no-camera.configure.toml
+mode = "preflight"
+launch_args = "devices.json"
+expect = "error"                             # "ok": no problems at all
+problems_contain = ["no camera"]             # optional
+retryable = true                             # optional: every problem is retryable (false: at least one is permanent)
+
+[[releasing]]                                # optional: running nodes this change stops first
+node_id = "old-camera"
+launch_args = { device = "/dev/video0" }
+```
+
+In Rust, `Target::with_configurator_executable(env!("CARGO_BIN_EXE_<name>-config"))` runs the configurator cargo built, `Target::configure(&args)` runs it alone, and `Target::preflight(&args)` runs its pre-flight check (`Target::preflight_releasing` also passes `releasing`).
 
 ## `bench`
 

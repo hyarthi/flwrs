@@ -110,6 +110,35 @@ pub fn load(path: &Path, options: &Options) -> Result<TractModel, String> {
     })
 }
 
+/// Multiply-adds of one run, summed over the decluttered graph's operators.
+pub fn flops(path: &Path, shape: &[usize], dtype: DType) -> Option<u64> {
+    let model = tract_onnx::onnx().model_for_path(path).ok()?;
+    let fact = match dtype {
+        DType::F32 => f32::fact(shape),
+        DType::I32 => i32::fact(shape),
+        DType::U8 => u8::fact(shape),
+    };
+    let typed = model
+        .with_input_fact(0, fact.into())
+        .ok()?
+        .into_typed()
+        .ok()?
+        .into_decluttered()
+        .ok()?;
+    let mut total = 0u64;
+    for id in typed.eval_order().ok()? {
+        let node = typed.node(id);
+        let inputs = typed.node_input_facts(id).ok()?;
+        for (cost, count) in node.op.cost(&inputs).ok()? {
+            if matches!(cost, tract_onnx::tract_core::ops::Cost::FMA(_)) {
+                total = total.saturating_add(u64::try_from(count.to_i64().ok()?).ok()?);
+            }
+        }
+    }
+    // Nothing counted: its operators don't report a cost.
+    (total > 0).then_some(total)
+}
+
 impl Session for TractModel {
     fn input_names(&self) -> &[String] {
         &self.inputs

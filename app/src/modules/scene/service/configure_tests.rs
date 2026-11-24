@@ -214,6 +214,124 @@ async fn check_shows_the_warnings_of_the_run_behind_the_settings() {
 }
 
 #[tokio::test]
+async fn a_draft_keeps_settings_its_configurator_refuses() {
+    let (f, scene) = setup().await;
+    let node = f
+        .service
+        .create_node(
+            &scene.id,
+            node_input(PLUGIN, json!({"launch_args": {"spec": "good"}})),
+        )
+        .await
+        .unwrap();
+    assert!(node.config.launch_args.get("out_schema").is_some());
+    let live_args = node.config.launch_args.clone();
+
+    // Live still refuses.
+    let e = f
+        .service
+        .update_node(
+            &scene.id,
+            &node.id,
+            node_input(PLUGIN, json!({"launch_args": {"spec": "fail live"}})),
+        )
+        .await;
+    assert!(e.is_err());
+
+    // A draft keeps it, without the values of the earlier settings.
+    let saved = f
+        .service
+        .save_node(
+            Store::Draft,
+            &scene.id,
+            Some(&node.id),
+            node_input(PLUGIN, json!({"launch_args": {"spec": "fail now"}})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.config.launch_args, json!({"spec": "fail now"}));
+    let check = f.service.check_draft(&scene.id).await.unwrap();
+    let said: Vec<_> = check
+        .problems
+        .iter()
+        .filter(|p| p.contains("spec says fail"))
+        .collect();
+    assert_eq!(said.len(), 1, "{:?}", check.problems);
+    assert!(said[0].contains("aren't set"), "{said:?}");
+    assert!(
+        !check.problems.iter().any(|p| p.contains("hasn't set")),
+        "said once"
+    );
+    assert_eq!(
+        f.service
+            .get_node(&scene.id, &node.id)
+            .await
+            .unwrap()
+            .config
+            .launch_args,
+        live_args
+    );
+
+    // Saved again unchanged, it's still reported.
+    f.service
+        .save_node(
+            Store::Draft,
+            &scene.id,
+            Some(&node.id),
+            node_input(PLUGIN, json!({"launch_args": {"spec": "fail now"}})),
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.service
+            .check_draft(&scene.id)
+            .await
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.contains("spec says fail"))
+    );
+
+    // A value of its own for a configured field is still refused.
+    assert!(
+        f.service
+            .save_node(
+                Store::Draft,
+                &scene.id,
+                Some(&node.id),
+                node_input(
+                    PLUGIN,
+                    json!({"launch_args": {"spec": "x", "out_schema": {"fields": []}}})
+                ),
+            )
+            .await
+            .is_err()
+    );
+
+    // Fixed: configured again, and the problem is gone.
+    let fixed = f
+        .service
+        .save_node(
+            Store::Draft,
+            &scene.id,
+            Some(&node.id),
+            node_input(PLUGIN, json!({"launch_args": {"spec": "good again"}})),
+        )
+        .await
+        .unwrap();
+    assert!(fixed.config.launch_args.get("out_schema").is_some());
+    assert!(
+        !f.service
+            .check_draft(&scene.id)
+            .await
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.contains("spec says fail"))
+    );
+}
+
+#[tokio::test]
 async fn a_failing_configurator_refuses_the_node() {
     let (f, scene) = setup().await;
     let e = invalid(
@@ -392,6 +510,78 @@ async fn a_draft_node_is_configured_again_in_the_draft_only() {
         .await
         .unwrap();
     assert_eq!(marker(&in_draft), marker(&draft));
+}
+
+#[tokio::test]
+async fn an_upgrade_skips_nodes_whose_configurator_already_refused() {
+    let (f, scene) = setup().await;
+    let good = f
+        .node(&scene.id, PLUGIN, json!({"launch_args": {"spec": "a"}}))
+        .await;
+    // Unfinished work, taken by the (disabled) scene from a draft.
+    let unfinished = f
+        .service
+        .save_node(
+            Store::Draft,
+            &scene.id,
+            None,
+            node_input(PLUGIN, json!({"launch_args": {"spec": "fail later"}})),
+        )
+        .await
+        .unwrap();
+    f.service
+        .submit_draft(&scene.id, None, false)
+        .await
+        .unwrap();
+    let refused = |c: &SceneCheck| {
+        c.problems
+            .iter()
+            .any(|p| p.contains(&unfinished.id) && p.contains("spec says fail"))
+    };
+    assert!(refused(&f.service.check(&scene.id).await.unwrap()));
+
+    // A version that breaks the good node is still refused, naming only it.
+    let breaking = package(
+        &f,
+        "2.0.0",
+        "#!/bin/sh\necho '{\"errors\": [\"no\"]}' > response.json\n",
+    );
+    let e = format!(
+        "{:?}",
+        f.plugins
+            .service
+            .upgrade(PLUGIN, &breaking)
+            .await
+            .unwrap_err()
+    );
+    assert!(
+        e.contains(&good.id) && e.contains("configurator: no"),
+        "{e}"
+    );
+    assert!(!e.contains(&unfinished.id), "{e}");
+
+    // One that works: the good node is re-configured, the unfinished one
+    // skipped, and both take the new version.
+    f.plugins
+        .service
+        .upgrade(PLUGIN, &package(&f, "2.0.0", &script("2.0.0")))
+        .await
+        .unwrap();
+    let upgraded = f.service.get_node(&scene.id, &good.id).await.unwrap();
+    assert!(
+        marker(&upgraded).starts_with("2.0.0||"),
+        "{}",
+        marker(&upgraded)
+    );
+    let skipped = f.service.get_node(&scene.id, &unfinished.id).await.unwrap();
+    assert_eq!(skipped.plugin_version.as_deref(), Some("2.0.0"));
+    assert_eq!(skipped.config.launch_args, json!({"spec": "fail later"}));
+    let check = f.service.check(&scene.id).await.unwrap();
+    assert!(refused(&check), "{check:?}");
+    assert!(
+        !check.problems.iter().any(|p| p.contains("another version")),
+        "{check:?}"
+    );
 }
 
 #[tokio::test]
@@ -759,4 +949,25 @@ mod remote {
         ));
         server.shutdown(std::time::Duration::from_secs(1)).await;
     }
+}
+
+#[tokio::test]
+async fn existing_configurators_are_never_run_in_preflight_mode() {
+    // This package declares no pre-flight: its script would treat the mode's
+    // arguments as a normal run, so it must not be started at all.
+    let (f, scene) = setup().await;
+    let node = f
+        .node(&scene.id, PLUGIN, json!({"launch_args": {"spec": "a"}}))
+        .await;
+    let run = f.service.preflight(&scene.id, None, false).await.unwrap();
+    assert!(run.ok);
+    assert!(!run.nodes[0].checked);
+    assert_eq!(
+        run.nodes[0].skipped.as_deref(),
+        Some("its plugin has no pre-flight check")
+    );
+    // Enabling doesn't run it either: the stored settings stay.
+    f.service.set_enabled(&scene.id, true).await.unwrap();
+    let after = f.service.get_node(&scene.id, &node.id).await.unwrap();
+    assert_eq!(marker(&after), marker(&node));
 }

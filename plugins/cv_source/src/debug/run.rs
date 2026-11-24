@@ -5,6 +5,7 @@ use super::compose::Scene;
 use super::facts::{self, Layouts};
 use super::record::{Recorded, Recorder};
 use crate::backend::Device;
+use crate::emit::{self, Emission, Emitter, FrameInfo};
 use crate::graph::config::{Execution, GraphConfig, NodeConfig};
 use crate::graph::exec::{self, Plan, Tick};
 use crate::graph::{self, Checked};
@@ -360,6 +361,7 @@ fn frame_loop(
     let layouts: Layouts = facts::layouts_of(&loaded.graph);
     let devices = plan.devices();
     let shapes = Arc::new(facts::shapes_of(&loaded.graph));
+    let mut emitter = Emitter::new(emit::config_of(&loaded.graph));
     let mut recent = std::collections::VecDeque::new();
     let mut rate = Rate::default();
     let mut shown = 0u64;
@@ -427,6 +429,20 @@ fn frame_loop(
             }
         }
         let mut frame_facts = facts::facts(&tick, &layouts);
+        let info = FrameInfo {
+            seq: item.seq + 1,
+            capture_time: item.captured.capture_time,
+            width: frame.width(),
+            height: frame.height(),
+        };
+        frame_facts.emitted = emitter
+            .on_tick(&tick, &info, time)
+            .into_iter()
+            .filter_map(|e| {
+                let (Emission::Event(v) | Emission::Frame(v)) = e;
+                flwrs_types::json::to_json(&v).ok()
+            })
+            .collect();
         frame_facts
             .notes
             .extend(differences.iter().map(|d| format!("vs CPU: {d}")));

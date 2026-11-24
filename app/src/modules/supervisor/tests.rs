@@ -49,6 +49,7 @@ fn timings() -> Timings {
         backoff: None,
         kill_grace: Duration::from_millis(500),
         max_restarts: None,
+        first_run_max_restarts: None,
         shutdown_grace: Duration::from_secs(5),
     }
 }
@@ -120,6 +121,7 @@ impl Env {
             _ => (Some(text_schema()), None),
         };
         NodeSpec {
+            critical: false,
             scene_id: "scene".into(),
             node_id: "node".into(),
             instance_id: "node".into(),
@@ -475,8 +477,51 @@ async fn missing_executable_counts_as_a_failed_launch() {
         },
     ));
     let status = wait_state(&handle, NodeState::Failed).await;
-    assert_eq!(status.launches, 1);
+    assert_eq!(status.launches, 1, "no retry");
     assert!(status.last_error.unwrap().contains("couldn't start"));
+    handle.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn max_restarts_minus_one_tries_forever_despite_a_first_run_limit() {
+    let env = Env::new().await;
+    let (handle, _out) = env.start(env.spec(
+        PluginType::Sink,
+        env.dir.path().join("does-not-exist"),
+        Timings {
+            max_restarts: Some(-1),
+            first_run_max_restarts: Some(1),
+            restart_delay: Duration::from_millis(1),
+            ..timings()
+        },
+    ));
+    let mut status = handle.watch();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while status.borrow_and_update().launches < 5 {
+        assert_ne!(status.borrow().state, NodeState::Failed);
+        assert!(tokio::time::Instant::now() < deadline);
+        let _ = tokio::time::timeout(Duration::from_millis(100), status.changed()).await;
+    }
+    assert_ne!(handle.status().state, NodeState::Failed);
+    handle.stop().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_first_run_limit_applies_without_max_restarts() {
+    let env = Env::new().await;
+    let (handle, _out) = env.start(env.spec(
+        PluginType::Sink,
+        env.dir.path().join("does-not-exist"),
+        Timings {
+            first_run_max_restarts: Some(2),
+            restart_delay: Duration::from_millis(1),
+            ..timings()
+        },
+    ));
+    let status = wait_state(&handle, NodeState::Failed).await;
+    assert_eq!(status.launches, 3);
     handle.stop().await;
 }
 
@@ -698,6 +743,7 @@ async fn spec_from_an_installed_plugin() {
             files_dir: Path::new("files"),
             uploads: &[],
             plugin_threads: None,
+            group_threads: None,
         },
     )
     .unwrap();
@@ -740,6 +786,7 @@ async fn spec_from_an_installed_plugin() {
             files_dir: Path::new("files"),
             uploads: &[],
             plugin_threads: None,
+            group_threads: None,
         },
     )
     .unwrap();
@@ -765,6 +812,7 @@ async fn spec_from_an_installed_plugin() {
             files_dir: Path::new("files"),
             uploads: &[],
             plugin_threads: None,
+            group_threads: None,
         },
     )
     .unwrap_err();
@@ -824,6 +872,7 @@ fn local_nodes_get_their_uploads_and_files() {
                 files_dir: Path::new("/data/files"),
                 uploads,
                 plugin_threads: None,
+                group_threads: None,
             },
         )
     };

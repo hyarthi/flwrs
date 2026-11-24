@@ -22,11 +22,55 @@ pub(crate) enum DirectorError {
 #[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
 pub(crate) struct SceneStatus {
     pub state: SceneState,
-    /// Why the scene couldn't start (state `FAILED`).
+    /// Why the scene couldn't start (state `FAILED`), or what it's waiting
+    /// out (state `WAITING`).
     pub errors: Vec<String>,
     /// The hop limit in effect while running (the scene's or the default).
     pub max_hops: Option<u32>,
     pub nodes: Vec<NodeReport>,
+    /// The last pre-flight check's problems, by node (states `WAITING` and
+    /// `FAILED`).
+    pub preflight: Vec<PreflightIssue>,
+    /// Where the retries stand (state `WAITING`).
+    pub preflight_retry: Option<PreflightRetryStatus>,
+    /// The stored graph failed its pre-flight check while the scene ran, so
+    /// the scene keeps running its previous graph. A later good reload clears it.
+    pub failed_update: Option<FailedUpdate>,
+}
+
+/// An update a running scene couldn't take.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub(crate) struct FailedUpdate {
+    /// What went wrong, as lines.
+    pub errors: Vec<String>,
+    pub problems: Vec<PreflightIssue>,
+    /// When it failed (Unix milliseconds).
+    pub fail_time: i64,
+}
+
+/// A problem a node's pre-flight check found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub(crate) struct PreflightIssue {
+    pub node_id: String,
+    pub message: String,
+    /// It may go away by itself; otherwise it's permanent.
+    pub retryable: bool,
+}
+
+impl PreflightIssue {
+    /// As a load error.
+    pub(crate) fn line(&self) -> String {
+        format!("node {}: {}", self.node_id, self.message)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+pub(crate) struct PreflightRetryStatus {
+    /// The check under way, or the last one (from 1).
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// When the next check runs (Unix milliseconds); `null` while one runs.
+    pub next_attempt_time: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
@@ -34,6 +78,10 @@ pub(crate) struct SceneStatus {
 pub(crate) enum SceneState {
     Running,
     Stopped,
+    /// A pre-flight check is running or waiting out retryable problems. On a
+    /// reload of a running scene, its nodes keep running the old graph
+    /// meanwhile.
+    Waiting,
     /// The scene failed its load-time checks; nothing of it runs.
     Failed,
 }

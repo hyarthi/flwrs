@@ -16,6 +16,7 @@
     "executable": "bin/flwrs-http-source-config",
     "fields": ["out_schema"]
   },
+  "runtime_defaults": { "is_critical_path": false },
   "ui": {
     "icon": "ui/http-source.svg",
     "categories": ["Inputs", "HTTP", "OpenAPI"],

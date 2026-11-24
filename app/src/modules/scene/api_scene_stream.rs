@@ -14,6 +14,7 @@
 //! The stream ends when the HTTP server starts shutting down.
 
 use super::api::Scene;
+use super::api::Svc;
 use super::api_draft::DraftResponse;
 use super::api_graph::{Edge, Node};
 use super::api_stream::{COALESCE, StreamState, json_event};
@@ -313,19 +314,11 @@ pub(crate) struct NodeLogs {
 }
 
 /// A node of the scene, live or in its draft.
-async fn scene_node(state: &StreamState, id: &str, node_id: &str) -> Result<(), ApiError> {
+pub(super) async fn scene_node(scenes: Svc, id: &str, node_id: &str) -> Result<(), ApiError> {
     use crate::modules::scene::service::Store;
-    state.scenes.get_scene(id).await?;
-    if state
-        .scenes
-        .get_node_in(Store::Live, id, node_id)
-        .await
-        .is_ok()
-        || state
-            .scenes
-            .get_node_in(Store::Draft, id, node_id)
-            .await
-            .is_ok()
+    scenes.get_scene(id).await?;
+    if scenes.get_node_in(Store::Live, id, node_id).await.is_ok()
+        || scenes.get_node_in(Store::Draft, id, node_id).await.is_ok()
     {
         Ok(())
     } else {
@@ -349,7 +342,7 @@ async fn logs(
     State(state): State<StreamState>,
     Path((id, node_id)): Path<(String, String)>,
 ) -> Result<axum::Json<NodeLogs>, ApiError> {
-    scene_node(&state, &id, &node_id).await?;
+    scene_node(state.scenes, &id, &node_id).await?;
     Ok(axum::Json(NodeLogs {
         records: crate::modules::node_logs::snapshot(&node_id),
     }))
@@ -372,7 +365,7 @@ async fn logs_stream(
     Path((id, node_id)): Path<(String, String)>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     use tokio::sync::broadcast::error::RecvError;
-    scene_node(&state, &id, &node_id).await?;
+    scene_node(state.scenes, &id, &node_id).await?;
     let (records, rx) = crate::modules::node_logs::subscribe(&node_id);
     let first = json_event("logs", &NodeLogs { records });
     let stopping = state.stopping.clone();

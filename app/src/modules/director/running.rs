@@ -19,15 +19,17 @@ use crate::modules::node_config::WhenFull;
 use crate::modules::plugin::manifest::PluginType;
 use crate::modules::rate_limit::RateLimit;
 use crate::modules::scene::graph::nodes_in_cycles;
+use crate::modules::scene::groups::{Member, Split};
 use crate::modules::scene::service::{Edge, SceneSnapshot};
 use crate::modules::supervisor::{
     DeliverySpec, Launch, NodeHandle, NodeOutput, NodeSpec, NodeState, NodeStatus, Output,
     Surroundings, supervise, workdir,
 };
+use flwrs_plugin::package::configure::ReleasingNode;
 use flwrs_plugin::schema::payload::PluginPayload;
 use flwrs_plugin::schema::protocol::EventMetadata;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +62,8 @@ pub(crate) struct Context {
     pub files_dir: PathBuf,
     /// `[director] plugin_threads`.
     pub plugin_threads: Option<u32>,
+    /// `[director] preflight_retry`.
+    pub preflight_retry: crate::modules::node_config::PreflightRetryConfig,
 }
 
 /// A node's run-time report, for status.
@@ -126,6 +130,23 @@ pub(crate) struct NodeCounters {
     pub restarts: u64,
 }
 
+/// Restarts of a critical node or one a reload started, while it has never
+/// run and its settings give no `max_restarts`: a node that can't start ends
+/// in `Failed` instead of relaunching forever (`max_restarts: -1` asks for that).
+const FIRST_RUN_MAX_RESTARTS: u64 = 5;
+
+/// A node's config as far as a reload cares: whether it's critical is read
+/// by the director alone, and groups only matter through the threads they
+/// give the node (`NodeKey::threads`), so changing them doesn't restart the
+/// plugin.
+fn restart_config(config: &NodeConfig) -> NodeConfig {
+    let mut config = config.clone();
+    config.runtime.is_critical_path = None;
+    config.runtime.threads = None;
+    config.groups = vec![];
+    config
+}
+
 /// What a node needs to keep running across a reload. If any of it
 /// changes, the node restarts.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +158,8 @@ struct NodeKey {
     install_path: String,
     node_type: String,
     config: NodeConfig,
+    /// The core count as the plugin is given it, wherever it comes from.
+    threads: Option<crate::modules::supervisor::ThreadsDelivery>,
     /// The queue policy in effect: its default depends on whether the node
     /// is on a cycle, which edge changes can alter.
     when_full: Option<WhenFull>,
@@ -173,6 +196,15 @@ impl Plan {
         let scene_id = &snapshot.scene.id;
         let mut errors = vec![];
 
+        // --- groups ---
+        let members: Vec<Member> = snapshot
+            .nodes
+            .iter()
+            .map(|n| Member::of(n, snapshot.plugins.get(&n.plugin_id)))
+            .collect();
+        let split = Split::of(&snapshot.scene.groups, &members);
+        errors.extend(split.problems());
+
         // --- nodes ---
         let mut specs: Vec<NodeSpec> = vec![];
         for node in &snapshot.nodes {
@@ -192,6 +224,7 @@ impl Plan {
                 files_dir: &ctx.files_dir,
                 uploads: &node.uploads,
                 plugin_threads: ctx.plugin_threads,
+                group_threads: split.shares.get(&node.id).map(|s| s.0),
             };
             match NodeSpec::resolve(scene_id, &node.id, &node.config, plugin, &at) {
                 Ok(spec) if spec.plugin_type.as_str() != node.node_type => errors.push(format!(
@@ -309,7 +342,11 @@ impl Plan {
                     archive_sha256: plugin.archive_sha256.clone(),
                     install_path: plugin.install_path.clone(),
                     node_type: node.node_type.clone(),
-                    config: node.config.clone(),
+                    config: restart_config(&node.config),
+                    threads: match &spec.launch {
+                        Launch::Local(local) => local.threads.clone(),
+                        Launch::Remote { .. } => None,
+                    },
                     when_full: queue.as_ref().map(|q| q.when_full),
                     kind: queue.is_some().then_some(kind),
                     uploads: node
@@ -368,6 +405,10 @@ struct RunningNode {
     plugin_type: PluginType,
     key: NodeKey,
     remote: bool,
+    /// The scene fails if this node does.
+    critical: bool,
+    /// Failed and taken out of the routing; the next reload relaunches it.
+    offline: bool,
     /// A local node's folder (deleted with the node).
     node_dir: Option<PathBuf>,
     handle: NodeHandle,
@@ -399,6 +440,16 @@ impl DelivererHandle {
 }
 
 impl RunningNode {
+    /// Whether a load of `planned` leaves this node running. An offline node
+    /// relaunches; so does one still trying to start whose criticality
+    /// changed, since that decides its restart limit.
+    fn stays_for(&self, planned: &PlannedNode) -> bool {
+        self.key == planned.key
+            && !self.offline
+            && (self.critical == planned.spec.critical
+                || self.handle.status().state == NodeState::Running)
+    }
+
     async fn stop_deliverer(&mut self) {
         if let Some(deliverer) = self.deliverer.take() {
             deliverer.stop().await;
@@ -413,6 +464,9 @@ pub(crate) struct RunningScene {
     /// `<spool_dir>/<scene-id>`: removed when the scene stops.
     spool_dir: std::path::PathBuf,
     nodes: Vec<RunningNode>,
+    /// Nodes just started, until they're watched; `true`: a reload replaced
+    /// or added this local node.
+    unwatched: Vec<(String, bool)>,
 }
 
 /// One producer's out-edges and the hop limit, as one swappable table.
@@ -422,6 +476,7 @@ struct Routes {
 }
 
 /// One out-edge, resolved for routing.
+#[derive(Clone)]
 struct Target {
     edge_id: String,
     node_id: String,
@@ -491,8 +546,13 @@ fn launch(
     queue: Option<Arc<NodeQueue>>,
     routes: Arc<Routes>,
     ctx: &Context,
+    swap: bool,
 ) -> RunningNode {
-    let spec = &planned.spec;
+    let mut spec = planned.spec.clone();
+    if swap || spec.critical {
+        spec.timings.first_run_max_restarts = Some(FIRST_RUN_MAX_RESTARTS);
+    }
+    let spec = &spec;
     let (tx, rx) = mpsc::channel(OUTPUT_CAPACITY);
     let handle = supervise(spec.clone(), &ctx.hub, tx);
     let (routes_tx, routes_rx) = watch::channel(routes);
@@ -532,6 +592,8 @@ fn launch(
         plugin_type: spec.plugin_type,
         key: planned.key.clone(),
         remote: matches!(spec.launch, Launch::Remote { .. }),
+        critical: spec.critical,
+        offline: false,
         node_dir: match &spec.launch {
             Launch::Local(local) => Some(local.workdir.dir.clone()),
             Launch::Remote { .. } => None,
@@ -597,6 +659,120 @@ async fn stop_nodes(nodes: Vec<RunningNode>, remove: bool) {
     }
 }
 
+/// A node that reached `Failed`, for the scene's worker.
+pub(crate) struct NodeFailure {
+    pub node_id: String,
+    /// A reload's new version, which never reached `Running`.
+    pub after_swap: bool,
+}
+
+/// A running node as seen from outside the scene's worker: what a pre-flight
+/// check needs to know about what a change would stop.
+#[derive(Clone, Debug)]
+pub(crate) struct RunningNodeView {
+    id: String,
+    plugin_id: String,
+    remote: bool,
+    offline: bool,
+    key: NodeKey,
+}
+
+impl RunningNodeView {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// This node as a holder of its resources, for a check of itself.
+    pub(crate) fn as_releasing(&self) -> Option<ReleasingNode> {
+        (!self.remote).then(|| ReleasingNode {
+            node_id: self.id.clone(),
+            launch_args: self.key.config.launch_args.clone(),
+        })
+    }
+}
+
+/// The running local nodes that loading `snapshot` would stop (changed or
+/// removed), by plugin. Nodes that keep running aren't listed. A graph that
+/// doesn't plan (an unfinished draft) is compared by node settings.
+pub(crate) fn releasing_nodes(
+    running: &[RunningNodeView],
+    snapshot: &SceneSnapshot,
+    ctx: &Context,
+) -> HashMap<String, Vec<ReleasingNode>> {
+    let planned: Option<HashMap<String, NodeKey>> = Plan::new(snapshot, ctx).ok().map(|plan| {
+        plan.nodes
+            .into_iter()
+            .map(|p| (p.spec.node_id, p.key))
+            .collect()
+    });
+    let mut out: HashMap<String, Vec<ReleasingNode>> = HashMap::new();
+    for node in running.iter().filter(|n| !n.remote) {
+        let stays = match &planned {
+            Some(keys) => keys.get(&node.id) == Some(&node.key),
+            None => snapshot
+                .nodes
+                .iter()
+                .any(|n| n.id == node.id && restart_config(&n.config) == node.key.config),
+        };
+        if !stays {
+            out.entry(node.plugin_id.clone())
+                .or_default()
+                .push(ReleasingNode {
+                    node_id: node.id.clone(),
+                    launch_args: node.key.config.launch_args.clone(),
+                });
+        }
+    }
+    out
+}
+
+/// The running nodes that loading `snapshot` leaves running, whatever else
+/// about them changed (being critical, group membership). Empty for a graph
+/// that doesn't plan.
+pub(crate) fn nodes_kept(
+    running: &[RunningNodeView],
+    snapshot: &SceneSnapshot,
+    ctx: &Context,
+) -> HashSet<String> {
+    let Ok(plan) = Plan::new(snapshot, ctx) else {
+        return HashSet::new();
+    };
+    plan.nodes
+        .iter()
+        .filter(|p| {
+            running
+                .iter()
+                .any(|n| n.id == p.spec.node_id && !n.offline && n.key == p.key)
+        })
+        .map(|p| p.spec.node_id.clone())
+        .collect()
+}
+
+/// The nodes a load of `snapshot` would start: every node, or with a running
+/// scene those added or changed. `None`: the graph fails its checks (the load
+/// itself reports that).
+pub(crate) fn nodes_to_start(
+    running: Option<&RunningScene>,
+    snapshot: &SceneSnapshot,
+    ctx: &Context,
+) -> Option<HashSet<String>> {
+    let plan = Plan::new(snapshot, ctx).ok()?;
+    Some(
+        plan.nodes
+            .iter()
+            .filter(|p| {
+                !running.is_some_and(|scene| {
+                    scene
+                        .nodes
+                        .iter()
+                        .any(|n| n.id == p.spec.node_id && n.stays_for(p))
+                })
+            })
+            .map(|p| p.spec.node_id.clone())
+            .collect(),
+    )
+}
+
 impl RunningScene {
     /// Checks the graph, then starts every node and the routing. Nothing is
     /// started if any check fails; every problem is returned.
@@ -611,6 +787,7 @@ impl RunningScene {
             max_hops: plan.max_hops,
             scene_id,
             nodes: vec![],
+            unwatched: vec![],
         };
         scene.clean_spool(&plan).await;
         scene.apply(plan, ctx, true).await;
@@ -649,14 +826,20 @@ impl RunningScene {
         for planned in &plan.nodes {
             let id = &planned.spec.node_id;
             match old.get(id) {
-                Some(node) if node.key == planned.key => {
-                    kept.extend(old.remove_entry(id));
+                // An offline node relaunches: a reload is a way back for it.
+                Some(node) if node.stays_for(planned) => {
+                    let entry = old.remove_entry(id);
+                    kept.extend(entry.map(|(id, mut node)| {
+                        node.critical = planned.spec.critical;
+                        (id, node)
+                    }));
                 }
                 Some(_) => summary.restarted += 1,
                 None => summary.added += 1,
             }
         }
         summary.kept = kept.len();
+        let kept_ids: HashSet<String> = kept.keys().cloned().collect();
         summary.removed = old.len() - summary.restarted;
 
         // A changed node keeps its queue (with the new limits), so what's
@@ -704,6 +887,7 @@ impl RunningScene {
                 queues.get(&id).cloned(),
                 plan.routes(&id, &queues),
                 ctx,
+                !fresh && matches!(planned.spec.launch, Launch::Local(_)),
             );
             started.insert(id, node);
         };
@@ -745,7 +929,94 @@ impl RunningScene {
             })
             .collect();
         self.max_hops = plan.max_hops;
+        self.unwatched = plan
+            .nodes
+            .iter()
+            .filter(|p| !kept_ids.contains(&p.spec.node_id))
+            .map(|p| {
+                let swap = !fresh && matches!(p.spec.launch, Launch::Local(_));
+                (p.spec.node_id.clone(), swap)
+            })
+            .collect();
         summary
+    }
+
+    /// The nodes running now, for pre-flight checks.
+    pub(crate) fn view(&self) -> Vec<RunningNodeView> {
+        self.nodes
+            .iter()
+            .map(|n| RunningNodeView {
+                id: n.id.clone(),
+                plugin_id: n.plugin_id.clone(),
+                remote: n.remote,
+                offline: n.offline,
+                key: n.key.clone(),
+            })
+            .collect()
+    }
+
+    /// Watches the nodes just started: one that reaches `Failed` is sent on
+    /// `failed`, saying whether a reload's new version never got to run.
+    pub(crate) fn watch_started(&mut self, failed: &mpsc::UnboundedSender<NodeFailure>) {
+        for (id, swap) in std::mem::take(&mut self.unwatched) {
+            let Some(node) = self.nodes.iter().find(|n| n.id == id) else {
+                continue;
+            };
+            let (mut status, failed) = (node.handle.watch(), failed.clone());
+            tokio::spawn(async move {
+                let mut has_run = false;
+                loop {
+                    let state = status.borrow_and_update().state;
+                    match state {
+                        NodeState::Running => has_run = true,
+                        NodeState::Stopped => return,
+                        NodeState::Failed => {
+                            let _ = failed.send(NodeFailure {
+                                node_id: id,
+                                after_swap: swap && !has_run,
+                            });
+                            return;
+                        }
+                        _ => {}
+                    }
+                    if status.changed().await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Whether a node that's failed and still in the scene is critical.
+    /// `None`: it isn't failed (replaced since), or is already offline.
+    pub(crate) fn failed_critical(&self, node_id: &str) -> Option<bool> {
+        self.nodes
+            .iter()
+            .find(|n| n.id == node_id && !n.offline && n.handle.status().state == NodeState::Failed)
+            .map(|n| n.critical)
+    }
+
+    /// Takes a failed node out of the scene's flow: no producer routes to it
+    /// (a full `block` queue would hold them up) and its delivery stops. What
+    /// was queued for it stays, for when a reload relaunches it.
+    pub(crate) async fn take_offline(&mut self, node_id: &str) {
+        for node in &self.nodes {
+            node.routes.send_modify(|routes| {
+                *routes = Arc::new(Routes {
+                    targets: routes
+                        .targets
+                        .iter()
+                        .filter(|t| t.node_id != node_id)
+                        .cloned()
+                        .collect(),
+                    max_hops: routes.max_hops,
+                });
+            });
+        }
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
+            node.offline = true;
+            node.stop_deliverer().await;
+        }
     }
 
     pub(crate) fn max_hops(&self) -> u32 {

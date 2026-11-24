@@ -268,6 +268,30 @@ pub fn open(
     }
 }
 
+/// Finds the configured camera among those the OS lists, opening none, so
+/// it's safe while something else (a running node) holds the device. Returns
+/// its name.
+pub fn find(config: &CameraConfig) -> Result<String, IngestError> {
+    #[cfg(target_os = "macos")]
+    let listed = macos::list()?;
+    #[cfg(target_os = "linux")]
+    let listed = v4l2::list();
+    #[cfg(windows)]
+    let listed = windows::list()?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    let listed: Vec<Listed> = {
+        let _ = config;
+        return Err(IngestError::fatal(
+            "this build has no camera support on this OS; use a file input",
+        ));
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    {
+        let i = pick(config.device.as_deref(), &listed)?;
+        Ok(listed[i].name.clone())
+    }
+}
+
 /// What an OS callback delivered.
 #[cfg_attr(
     not(any(target_os = "macos", windows)),

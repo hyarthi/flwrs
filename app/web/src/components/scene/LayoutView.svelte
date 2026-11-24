@@ -11,6 +11,7 @@
     Controls,
     ControlButton,
     MiniMap,
+    Panel,
     useSvelteFlow,
     type Connection,
     type Edge,
@@ -26,6 +27,11 @@
   import EdgeDialog from './EdgeDialog.svelte';
   import Palette, { PLUGIN_DRAG_TYPE } from './Palette.svelte';
   import DraftBar from './DraftBar.svelte';
+  import GroupFrames from './GroupFrames.svelte';
+  import GroupLegend from './GroupLegend.svelte';
+  import { provideGroupFocus } from '../../lib/groupFocus.svelte';
+  import { bubbleOutline, centerOf, dragOutcome, type Frame, type Point, type Rect } from '../../lib/groupFrames';
+  import { deviceClash, groupColors, groupsOf, isEditable, joinGroup, leaveGroup, membersByGroup, nesting, withGroups, type SceneGroup } from '../../lib/groups';
   import { ApiError } from '../../lib/api';
   import { navigate } from '../../lib/router.svelte';
   import { theme } from '../../lib/theme.svelte';
@@ -41,6 +47,7 @@
     restoreDraftEdge,
     restoreDraftNode,
     setLayout,
+    updateDraftNode,
     type Change,
     type Conflict,
     type GraphEdge,
@@ -87,6 +94,19 @@
   const states = $derived(new Map((status?.nodes ?? []).map((n) => [n.node_id, n.status.state])));
   const queues = $derived(view.draft_queues ?? view.queues);
 
+  // ---- groups: chips, the legend and the shown family's frames ----
+
+  const focus = provideGroupFocus();
+  const sceneGroups = $derived<SceneGroup[]>((view.draft?.settings ?? view.scene).groups ?? []);
+  const groupMembers = $derived(membersByGroup(graphNodes));
+  const groupColor = $derived(groupColors(sceneGroups.map((g) => g.id)));
+  const groupLevels = $derived(nesting(sceneGroups, groupMembers));
+  /** Whose frames show; `null` = none. */
+  let frameFamily = $state<string | null>('resources');
+  const frameGroups = $derived(
+    sceneGroups.filter((g) => g.family === frameFamily).map((g) => ({ id: g.id, height: groupLevels.get(g.id)?.height ?? 0 })),
+  );
+
   // ---- flow states: what the motes and glows show ----
 
   /** A receiving node's queue between the last two `status` samples. */
@@ -125,11 +145,14 @@
   const liveNodeIds = $derived(new Set(view.nodes.map((n) => n.id)));
   const liveEdgeIds = $derived(new Set(view.edges.map((e) => e.id)));
   /** The scene runs: edges animate. */
-  const flowing = $derived(view.scene.enabled && status?.state === 'RUNNING');
+  const flowing = $derived(
+    view.scene.enabled && (status?.state === 'RUNNING' || (status?.state === 'WAITING' && status.nodes.length > 0)),
+  );
 
   function healthOf(n: Row<GraphNode>, state: NodeState | undefined): FlowNodeData['health'] {
     if (!view.scene.enabled || n.change === 'removed' || !liveNodeIds.has(n.id)) return null;
     if (state === 'RUNNING') return 'ok';
+    if (!state && status?.state === 'WAITING') return 'warn';
     if (state === 'DISCONNECTED' || state === 'LAUNCHING' || state === 'WAITING' || state === 'STOPPING') return 'warn';
     return 'bad';
   }
@@ -202,10 +225,18 @@
   $effect(() => {
     const list = graphNodes;
     const edgeList = graphEdges;
-    const problems = check.problems;
+    const problems = [
+      ...check.problems,
+      ...[...(status?.preflight ?? []), ...(status?.failed_update?.problems ?? []), ...(view.draft?.submit?.problems ?? [])].map(
+        (p) => `node ${p.node_id}: ${p.message}`,
+      ),
+    ];
     const warnings = check.warnings;
     const live = states;
     const byId = pluginById;
+    const groupList = sceneGroups;
+    const colorOf = groupColor;
+    const claims = check.devices ?? {};
     void [queues, trends, flowing, liveNodeIds, liveEdgeIds];
     untrack(() => {
       let selected = new Set(nodes.filter((n) => n.selected).map((n) => n.id));
@@ -247,6 +278,16 @@
             health: healthOf(n, live.get(n.id)),
             problems: messagesFor(problems, n.id),
             warnings: messagesFor(warnings, n.id),
+            chips: groupsOf(n.config).map((id) => ({
+              id,
+              color: colorOf.get(id) ?? 1,
+              family: groupList.find((g) => g.id === id)?.family ?? 'unknown',
+            })),
+            devices: (claims[n.id] ?? []).map((d) => ({
+              kind: d.kind,
+              device: d.device,
+              clash: deviceClash(messagesFor(problems, n.id), d),
+            })),
             onopen: openNode,
             onrestore: restoreNode,
           },
@@ -360,6 +401,8 @@
             health: null,
             problems: [],
             warnings: [],
+            chips: [],
+            devices: [],
             onopen: openNode,
             onrestore: restoreNode,
           },
@@ -461,6 +504,132 @@
     }
   }
 
+  // ---- group membership: deliberate edits, to the draft ----
+
+  const nodeRects = $derived(
+    new Map<string, Rect>(
+      nodes.map((n) => [
+        n.id,
+        { x: n.position.x, y: n.position.y, width: n.measured?.width ?? NODE_WIDTH, height: n.measured?.height ?? NODE_HEIGHT },
+      ]),
+    ),
+  );
+  let framesLayer: { current: () => Frame[] } | undefined = $state();
+  let dragging = $state(false);
+  let dropTarget = $state<string | null>(null);
+  /** The single node being dragged, and the frames as they were when it began. */
+  let drag: { id: string; start: Point; frames: Frame[] } | null = null;
+
+  const editableGroup = (id: string) => {
+    const g = sceneGroups.find((x) => x.id === id);
+    return !!g && isEditable(g);
+  };
+  const groupSize = (id: string) => groupMembers.get(id)?.size ?? 0;
+
+  function outcomeOf(id: string, end: Point, modifier: boolean) {
+    if (!drag || drag.id !== id) return null;
+    const row = graphNodes.find((n) => n.id === id);
+    if (!row || row.change === 'removed') return null;
+    const current = groupsOf(row.config);
+    const outcome = dragOutcome({
+      frames: drag.frames,
+      start: drag.start,
+      end,
+      current,
+      editable: editableGroup,
+      size: groupSize,
+      modifier,
+      without: (group) => frameWithout(group, id),
+    });
+    // Landing on a frame it can't join is just a move.
+    if (outcome && 'join' in outcome && joinGroup(sceneGroups, groupMembers, id, current, outcome.join).problem) return null;
+    return outcome;
+  }
+
+  /** The group's outline around its members other than this node. */
+  function frameWithout(group: string, nodeId: string): Frame | null {
+    const others = groupMembers.get(group);
+    const members: Rect[] = [];
+    const rest: Rect[] = [];
+    for (const [id, r] of nodeRects) {
+      if (id === nodeId) continue;
+      (others?.has(id) ? members : rest).push(r);
+    }
+    return members.length ? bubbleOutline(group, members, rest, groupLevels.get(group)?.height ?? 0) : null;
+  }
+
+  const centerOfNode = (n: Node): Point =>
+    centerOf({ x: n.position.x, y: n.position.y, width: n.measured?.width ?? NODE_WIDTH, height: n.measured?.height ?? NODE_HEIGHT });
+
+  function dragStart(dragged: Node[]) {
+    dragging = true;
+    closeMenu();
+    // Several nodes moved together are only moved.
+    drag = dragged.length === 1 ? { id: dragged[0].id, start: centerOfNode(dragged[0]), frames: framesLayer?.current() ?? [] } : null;
+  }
+
+  function dragMove(dragged: Node[], event: MouseEvent | TouchEvent) {
+    if (!drag || dragged.length !== 1) return;
+    // A modifier-drag never joins, so there's no frame to mark.
+    const outcome = event.altKey ? null : outcomeOf(dragged[0].id, centerOfNode(dragged[0]), false);
+    dropTarget = outcome && 'join' in outcome ? outcome.join : null;
+  }
+
+  function dragStop(dragged: Node[], event: MouseEvent | TouchEvent) {
+    const outcome = dragged.length === 1 ? outcomeOf(dragged[0].id, centerOfNode(dragged[0]), event.altKey) : null;
+    dragging = false;
+    dropTarget = null;
+    drag = null;
+    moved(dragged);
+    if (!outcome) return;
+    if ('join' in outcome) joinNode(dragged[0].id, outcome.join);
+    else leaveNode(dragged[0].id, outcome.leave);
+  }
+
+  async function saveMembership(id: string, groups: string[], label: string) {
+    const row = graphNodes.find((n) => n.id === id);
+    if (!row || row.change === 'removed') return;
+    try {
+      await updateDraftNode(
+        sceneId,
+        id,
+        { name: row.name, plugin_id: row.plugin_id, config: withGroups(row.config, groups) },
+        { group: `membership-${Date.now()}-${Math.random().toString(36).slice(2)}`, label },
+      );
+    } catch (e) {
+      fail("Couldn't change the node's groups", e);
+    }
+  }
+
+  function joinNode(id: string, group: string) {
+    const row = graphNodes.find((n) => n.id === id);
+    if (!row) return;
+    const joined = joinGroup(sceneGroups, groupMembers, id, groupsOf(row.config), group);
+    if (joined.problem) {
+      notice = { title: `Couldn't add it to ${group}`, details: [joined.problem] };
+      return;
+    }
+    saveMembership(id, joined.ids, `Add to ${group}`);
+  }
+
+  function leaveNode(id: string, group: string) {
+    const row = graphNodes.find((n) => n.id === id);
+    if (row) saveMembership(id, leaveGroup(sceneGroups, groupMembers, groupsOf(row.config), group), `Remove from ${group}`);
+  }
+
+  /** The node's right-click menu: leave one of its groups. */
+  let menu = $state<{ id: string; x: number; y: number; groups: string[] } | null>(null);
+  const closeMenu = () => (menu = null);
+
+  function openMenu(node: Node, event: MouseEvent) {
+    const row = graphNodes.find((n) => n.id === node.id);
+    const groups = row && row.change !== 'removed' ? groupsOf(row.config).filter(editableGroup) : [];
+    if (!groups.length) return;
+    event.preventDefault();
+    const box = canvas.getBoundingClientRect();
+    menu = { id: node.id, x: event.clientX - box.left, y: event.clientY - box.top, groups };
+  }
+
   // ---- keyboard: undo / redo, copy / paste ----
 
   let draftBar: { step: (back: boolean) => Promise<void> } | undefined = $state();
@@ -511,7 +680,8 @@
       nodes: chosen.map((n) => {
         const row = rows.get(n.id)!;
         // Tokens and secrets never leave the server: pasted nodes need them set again.
-        const { token: _, ...config } = row.config as Record<string, unknown>;
+        // Group membership is a deliberate edit: a copy starts outside the groups.
+        const { token: _, groups: __, ...config } = row.config as Record<string, unknown>;
         // A local node's configured fields are its configurator's: it sets them again.
         const configured = pluginById.get(row.plugin_id)?.configured_fields ?? [];
         if (config.launch !== 'remote' && configured.length && config.launch_args && typeof config.launch_args === 'object') {
@@ -604,6 +774,7 @@
     {/if}
     <div
       class="canvas"
+      class:focusing={focus.id !== null}
       bind:this={canvas}
       role="application"
       aria-label="Scene canvas"
@@ -634,10 +805,20 @@
           await remove(gone);
           return false;
         }}
-        onnodedragstop={({ nodes: dragged }) => moved(dragged)}
+        onnodedragstart={({ nodes: dragged }) => dragStart(dragged)}
+        onnodedrag={({ nodes: dragged, event }) => dragMove(dragged, event)}
+        onnodedragstop={({ nodes: dragged, event }) => dragStop(dragged, event)}
+        onnodecontextmenu={({ node, event }) => openMenu(node, event)}
+        onpaneclick={closeMenu}
         proOptions={{ hideAttribution: true }}
       >
         <Background gap={16} />
+        <GroupFrames bind:this={framesLayer} groups={frameGroups} members={groupMembers} rects={nodeRects} colors={groupColor} {dragging} {dropTarget} focused={focus.id} />
+        {#if sceneGroups.length}
+          <Panel position="top-left">
+            <GroupLegend groups={sceneGroups} members={groupMembers} colors={groupColor} problems={check.problems} bind:family={frameFamily} />
+          </Panel>
+        {/if}
         <Controls showLock={false}>
           <ControlButton class="help-button" onclick={() => (helpOpen = true)} title="How to work with the editor (?)" aria-label="How to work with the editor">
             <Info size={14} strokeWidth={2} />
@@ -645,6 +826,13 @@
         </Controls>
         <MiniMap pannable zoomable />
       </SvelteFlow>
+      {#if menu}
+        <div class="menu" role="menu" style:left={`${menu.x}px`} style:top={`${menu.y}px`}>
+          {#each menu.groups as g (g)}
+            <button type="button" role="menuitem" onclick={() => { leaveNode(menu!.id, g); closeMenu(); }}>Remove from group <span class="mono">{g}</span></button>
+          {/each}
+        </div>
+      {/if}
       {#if helpOpen}
         <EditorHelp onclose={() => (helpOpen = false)} />
       {/if}
@@ -703,6 +891,43 @@
     left: 50%;
     transform: translate(-50%, -50%);
     pointer-events: none;
+  }
+
+  .menu {
+    position: absolute;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    min-width: 180px;
+    padding: var(--space-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+  }
+
+  .menu button {
+    padding: var(--space-1) var(--space-2);
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text);
+    font: inherit;
+    font-size: var(--text-sm);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .menu button:hover,
+  .menu button:focus-visible {
+    background: var(--surface-hover);
+  }
+
+  /* Hovering a group: what isn't in it steps back. */
+  .canvas.focusing :global(.svelte-flow__edge),
+  .canvas.focusing :global(.svelte-flow__edgelabel-renderer) {
+    opacity: 0.2;
+    transition: opacity var(--dur-fast) var(--ease);
   }
 
   /* Svelte Flow in our tokens. */

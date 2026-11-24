@@ -411,7 +411,8 @@ fn open(plugin: &PluginArgs, default_profile: Profile) -> Result<(Target, Option
         None => None,
     };
     let buildable = path.is_dir()
-        && (config.as_ref().is_some_and(|c| c.build.is_some()) || path.join("Cargo.toml").is_file());
+        && (config.as_ref().is_some_and(|c| c.build.is_some())
+            || path.join("Cargo.toml").is_file());
     let profile = plugin.profile.unwrap_or(default_profile);
     let mut target = if path.is_file() {
         Target::from_zip(path)?

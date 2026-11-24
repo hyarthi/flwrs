@@ -7,8 +7,8 @@ use crate::stimulus::{Stimulus, StimulusCtx};
 use crate::target::Target;
 use flwrs_plugin::plugin::frame::{PROTOCOL_VERSION, encode_frame, header};
 use flwrs_plugin::schema::protocol::{
-    Ack, Credit, Event, Exit, Nack, Ping, Pong, Shutdown, msg_code::Enum as MsgCode,
-    plugin_type::Enum as PluginType,
+    Ack, Credit, Event, Exit, Nack, Ping, Pong, Shutdown, capability::Enum as Capability,
+    msg_code::Enum as MsgCode, plugin_type::Enum as PluginType,
 };
 use flwrs_plugin::schema::rules;
 use prost::Message;
@@ -66,6 +66,10 @@ pub const CASES: &[(&str, &str)] = &[
     (
         "closes-on-violation",
         "a frame with an unknown framing version closes the connection",
+    ),
+    (
+        "live-feed",
+        "a plugin offering LIVE_FEED sends none while the hub hasn't enabled it",
     ),
 ];
 
@@ -142,6 +146,7 @@ impl Audit {
             "stops-when-rejected" => stops_when_rejected(&mut fixture).await,
             "reconnects" => reconnects(&mut fixture).await,
             "closes-on-violation" => closes_on_violation(&mut fixture).await,
+            "live-feed" => live_feed(&mut fixture).await,
             other => Err(format!("unknown case {other}")),
         };
         fixture.stop().await;
@@ -161,12 +166,17 @@ async fn handshake(f: &mut Fixture) -> CaseResultInner {
             "instance_id {:?}, expected {:?} (from --id{})",
             init.instance_id,
             f.target.instance_id(),
-            if f.target.remote.is_some() { ", or [remote] id" } else { "" }
+            if f.target.remote.is_some() {
+                ", or [remote] id"
+            } else {
+                ""
+            }
         ));
     }
     if init.token != f.token {
         problems.push(if f.target.remote.is_some() {
-            "token isn't the one it was given (${token} / FLWRS_TOKEN, or [remote] token)".to_string()
+            "token isn't the one it was given (${token} / FLWRS_TOKEN, or [remote] token)"
+                .to_string()
         } else {
             "token isn't FLWRS_TOKEN".to_string()
         });
@@ -500,6 +510,30 @@ async fn closes_on_violation(f: &mut Fixture) -> CaseResultInner {
     conn.writer.raw(&frame).await?;
     conn.reader.closed(Duration::from_secs(5)).await?;
     Ok(Outcome::Pass)
+}
+
+/// The fake hub never enables `LIVE_FEED`, so a plugin offering it must keep
+/// quiet about it: not even an announcement.
+async fn live_feed(f: &mut Fixture) -> CaseResultInner {
+    let (mut conn, init, _) = f.accepted().await?;
+    if !init.capabilities.contains(&(Capability::LiveFeed as i32)) {
+        return Ok(Outcome::Pass); // nothing to break
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Ok(Outcome::Pass);
+        }
+        match conn.reader.next(left).await {
+            Ok(Some(frame)) if frame.code() == MsgCode::LiveFeed => {
+                return Err("LIVE_FEED sent though the hub didn't enable it".into());
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return Err("the plugin closed the connection".into()),
+            Err(_) => return Ok(Outcome::Pass), // quiet until the deadline
+        }
+    }
 }
 
 /// A report for people: one line per case.

@@ -2,10 +2,12 @@
 //! plugin instance. Shared by the scene service (validation), the plugin
 //! registry (manifest `runtime_defaults`) and, later, the director.
 
+use crate::modules::duration::parse_duration;
 use crate::modules::plugin::manifest::{self, LaunchSpec};
 use crate::modules::plugin::node_rules::NodeRules;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 /// Plugins back off up to this long between reconnect attempts (protocol rule),
 /// so the hub's reconnect timeout must be longer.
@@ -33,6 +35,10 @@ pub(crate) struct NodeConfig {
     pub launch: LaunchMode,
     #[serde(default, skip_serializing_if = "RuntimeConfig::is_empty")]
     pub runtime: RuntimeConfig,
+    /// The scene groups this node is in, by id. Changing it alone doesn't
+    /// restart the node (a change to the threads it then gets does).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
     /// Pre-shared token (remote nodes only). Write-only in the API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -245,8 +251,12 @@ pub(crate) struct RuntimeConfig {
     pub restart_backoff: Option<BackoffConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kill_grace_ms: Option<u64>,
+    /// Consecutive failed launches to retry before the node fails: 0 = fail
+    /// on the first, -1 = try forever. `None`: the plugin's default, else 5
+    /// until a critical node or one a reload started first runs, and no
+    /// limit otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_restarts: Option<u64>,
+    pub max_restarts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shutdown_grace_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,6 +267,12 @@ pub(crate) struct RuntimeConfig {
     /// decides), delivered as its manifest's `threads` says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<u32>,
+    /// Whether the scene fails with this node. A critical node that fails
+    /// stops the scene; any other is taken offline and the scene runs on.
+    /// `None`: the plugin's default, else not critical. Changing it doesn't
+    /// restart the node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_critical_path: Option<bool>,
 }
 
 /// Redelivery of events to a plugin that acknowledges them (capability ACKS).
@@ -361,11 +377,167 @@ pub(crate) struct SceneDefaults {
     /// `require_tls`). Default: true when the hub has a TLS listener.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_tls: Option<bool>,
+    /// How long this scene waits out retryable pre-flight problems; what's
+    /// left out comes from `[director] preflight_retry`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight_retry: Option<PreflightRetryOverride>,
 }
 
 impl SceneDefaults {
     pub(crate) fn parse(json: &str) -> Result<Self, String> {
         serde_json::from_str(json).map_err(|e| format!("defaults: {e}"))
+    }
+
+    /// Range checks of what the scene sets itself.
+    pub(crate) fn validate(&self) -> Vec<String> {
+        self.preflight_retry
+            .as_ref()
+            .map(|o| {
+                o.validate()
+                    .into_iter()
+                    .map(|e| format!("defaults.preflight_retry.{e}"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Upper bound for `preflight_retry.max_attempts`.
+pub(crate) const MAX_PREFLIGHT_ATTEMPTS: u32 = 10_000;
+
+/// `[director] preflight_retry`: how a scene waits out retryable pre-flight
+/// problems. It gives up at whichever limit comes first.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, utoipa::ToSchema)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct PreflightRetryConfig {
+    /// Checks before giving up, the first one included (1 to 10000).
+    pub max_attempts: u32,
+    /// How long to keep trying, e.g. `5m` (units: s, m, h, d, w).
+    pub max_wait: String,
+    /// The wait before the second check; it doubles after each one.
+    pub initial_delay: String,
+    /// The longest wait between two checks.
+    pub max_delay: String,
+}
+
+impl Default for PreflightRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 10,
+            max_wait: "5m".into(),
+            initial_delay: "1s".into(),
+            max_delay: "30s".into(),
+        }
+    }
+}
+
+/// A scene's own `preflight_retry`: each key optional.
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreflightRetryOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wait: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_delay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delay: Option<String>,
+}
+
+impl PreflightRetryOverride {
+    fn validate(&self) -> Vec<String> {
+        let mut errors = vec![];
+        if let Some(n) = self.max_attempts {
+            errors.extend(check_attempts(n));
+        }
+        let mut parsed = |name: &str, text: &Option<String>| match text.as_deref() {
+            None => None,
+            Some(t) => match parse_duration(t) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    errors.push(format!("{name}: {e}"));
+                    None
+                }
+            },
+        };
+        parsed("max_wait", &self.max_wait);
+        let initial = parsed("initial_delay", &self.initial_delay);
+        let max = parsed("max_delay", &self.max_delay);
+        if let (Some(initial), Some(max)) = (initial, max)
+            && initial > max
+        {
+            errors.push("initial_delay: longer than max_delay".into());
+        }
+        errors
+    }
+}
+
+fn check_attempts(n: u32) -> Option<String> {
+    (!(1..=MAX_PREFLIGHT_ATTEMPTS).contains(&n))
+        .then(|| format!("max_attempts must be between 1 and {MAX_PREFLIGHT_ATTEMPTS}"))
+}
+
+/// The limits in effect for a scene.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreflightRetry {
+    pub max_attempts: u32,
+    pub max_wait: Duration,
+    pub initial_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl PreflightRetryConfig {
+    /// Checks the settings and parses their durations.
+    pub(crate) fn resolve(&self) -> Result<PreflightRetry, Vec<String>> {
+        let mut errors: Vec<String> = check_attempts(self.max_attempts).into_iter().collect();
+        let mut parsed = |name: &str, text: &str| {
+            parse_duration(text).unwrap_or_else(|e| {
+                errors.push(format!("{name}: {e}"));
+                Duration::ZERO
+            })
+        };
+        let max_wait = parsed("max_wait", &self.max_wait);
+        let initial_delay = parsed("initial_delay", &self.initial_delay);
+        let max_delay = parsed("max_delay", &self.max_delay);
+        if initial_delay > max_delay {
+            errors.push("initial_delay: longer than max_delay".into());
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        Ok(PreflightRetry {
+            max_attempts: self.max_attempts,
+            max_wait,
+            initial_delay,
+            max_delay,
+        })
+    }
+
+    /// The limits for a scene: its own over these. An `initial_delay` beyond
+    /// the merged `max_delay` is capped by it; settings that don't resolve
+    /// (they're checked when saved) fall back to the built-in defaults.
+    pub(crate) fn for_scene(&self, defaults: &SceneDefaults) -> PreflightRetry {
+        let mut merged = self.clone();
+        if let Some(o) = &defaults.preflight_retry {
+            merged.max_attempts = o.max_attempts.unwrap_or(merged.max_attempts);
+            merged.max_wait = o.max_wait.clone().unwrap_or(merged.max_wait);
+            merged.initial_delay = o.initial_delay.clone().unwrap_or(merged.initial_delay);
+            merged.max_delay = o.max_delay.clone().unwrap_or(merged.max_delay);
+            if let (Ok(initial), Ok(max)) = (
+                parse_duration(&merged.initial_delay),
+                parse_duration(&merged.max_delay),
+            ) && initial > max
+            {
+                merged.initial_delay = merged.max_delay.clone();
+            }
+        }
+        merged.resolve().unwrap_or_else(|errors| {
+            log::warn!("preflight_retry: {}; using the defaults", errors.join("; "));
+            Self::default()
+                .resolve()
+                .expect("the default limits are valid")
+        })
     }
 }
 
@@ -393,6 +565,11 @@ impl RuntimeConfig {
     /// Range and consistency checks; `prefix` labels the errors (e.g. `runtime`).
     pub(crate) fn validate(&self, prefix: &str) -> Vec<String> {
         let mut errors = vec![];
+        if self.max_restarts.is_some_and(|max| max < -1) {
+            errors.push(format!(
+                "{prefix}.max_restarts must be -1 (try forever), 0 or more"
+            ));
+        }
         let mut positive = |name: &str, value: Option<u64>| {
             if value == Some(0) {
                 errors.push(format!("{prefix}.{name} must be at least 1"));
@@ -855,12 +1032,16 @@ mod tests {
     #[test]
     fn runtime_ranges() {
         let cfg = NodeConfig::parse(&json!({"runtime": {
-            "init_timeout_ms": 0, "reconnect_timeout_ms": 30000,
+            "init_timeout_ms": 0, "reconnect_timeout_ms": 30000, "max_restarts": -2,
             "restart_backoff": {"multiplier": 1.0},
             "queue": {"max_event_bytes": 10, "max_bytes": 5, "max_evictions": 0, "spill": {"refill_watermark": 1.5, "write_batch": 0}}
         }}))
         .unwrap();
         let errors = cfg.validate(&no_schema(), &SceneDefaults::default());
+        assert!(
+            errors.iter().any(|e| e.contains("max_restarts must be -1")),
+            "{errors:?}"
+        );
         for fragment in [
             "runtime.init_timeout_ms must be at least 1",
             "reconnect_timeout_ms must be longer",

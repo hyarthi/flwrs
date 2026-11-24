@@ -2,6 +2,9 @@
 //! plugin processes. The plugins are this test binary, re-run as children in
 //! a chosen mode, built on the Rust SDK.
 
+mod groups;
+mod preflight;
+
 use super::engine::Engine;
 use super::handle::{DirectorCommand, DirectorHandle, SceneState, SceneStatus};
 use super::queue::{Budget, SpillShared};
@@ -486,6 +489,7 @@ impl Setup {
             nodes_dir: self.dir.path().join("nodes"),
             files_dir: self.dir.path().join("files"),
             plugin_threads: None,
+            preflight_retry: Default::default(),
         };
         let (handle, commands): (DirectorHandle, mpsc::Receiver<DirectorCommand>) =
             DirectorHandle::channel();
@@ -820,6 +824,45 @@ async fn fan_out_and_fan_in() {
     let lines = s.wait_lines(9).await;
     assert_eq!(texts(&lines, &both), ["a", "a", "b", "b", "c", "c"]);
     assert_eq!(texts(&lines, &only_first), ["a", "b", "c"]);
+}
+
+#[tokio::test]
+async fn a_failed_node_that_isnt_critical_doesnt_hold_up_the_others() {
+    let mut s = setup().await;
+    s.start_director(32).await;
+    let scene = s.enabled_scene().await;
+    let source = s.node(&scene, "t-ticker").await;
+    let healthy = s.node(&scene, "t-sink").await;
+    // Never starts in time, and a full queue would block its producer.
+    let failing = s
+        .node_with(
+            &scene,
+            "t-sink",
+            json!({"runtime": {
+                "init_timeout_ms": 1,
+                "max_restarts": 0,
+                "queue": {"capacity": 1, "when_full": "block", "block_timeout_ms": 60000},
+            }}),
+        )
+        .await;
+    s.edge(&scene, &source, &failing).await;
+    s.edge(&scene, &source, &healthy).await;
+    s.director.reload(&scene).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let status = s.director.status(&scene).await.unwrap().unwrap();
+        if status.nodes.iter().any(|n| {
+            n.node_id == failing && n.status.state == crate::modules::supervisor::NodeState::Failed
+        }) {
+            assert_eq!(status.state, SceneState::Running, "{status:?}");
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{status:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let before = s.lines().len();
+    s.wait_lines(before + 10).await;
 }
 
 #[tokio::test]

@@ -87,11 +87,14 @@ impl<T: Sink> SinkRunner<T> {
     /// Returns [`Error::Rejected`] if the hub answers `Initialize` with
     /// `Shutdown` (unknown instance id, wrong token, a mismatch).
     pub async fn run(&mut self) -> Result<(), Error> {
-        let mut init = self
+        let request = self
             .plugin
             .initialize(self.plugin_id.clone(), self.log_level)
-            .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?
-            .into_initialize(PluginType::Sink);
+            .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?;
+        if let Some(publisher) = request.live_feed() {
+            self.client.attach_live_feed(publisher);
+        }
+        let mut init = request.into_initialize(PluginType::Sink);
         init.token = self.connection.resolved_token();
         init.max_unacked = self.max_unacked;
 

@@ -352,7 +352,11 @@ async fn a_remote_plugin_is_started_by_commands_and_configured_at_its_endpoint()
                 if let Some(end) = text.find("\r\n\r\n") {
                     let length: usize = text
                         .lines()
-                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap())
+                        })
                         .unwrap_or(0);
                     if len >= end + 4 + length || n == 0 {
                         seen.lock().unwrap().push(text[end + 4..].to_string());
@@ -411,8 +415,7 @@ async fn a_remote_plugin_is_started_by_commands_and_configured_at_its_endpoint()
         .with_launch_args(serde_json::json!({"source": "s"}))
         .unwrap();
     assert!(target.in_schema.is_some(), "the endpoint's schema");
-    let request: serde_json::Value =
-        serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
+    let request: serde_json::Value = serde_json::from_str(&requests.lock().unwrap()[0]).unwrap();
     assert_eq!(request["node_id"], "edge-1");
     assert_eq!(request["fields"], serde_json::json!(["in_schema"]));
     let results = Audit::new(target).run().await;

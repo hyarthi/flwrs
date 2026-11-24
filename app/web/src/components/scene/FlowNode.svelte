@@ -17,6 +17,10 @@
     health: 'ok' | 'warn' | 'bad' | null;
     problems: string[];
     warnings: string[];
+    /** The groups it's in, of every family. */
+    chips: { id: string; color: number; family: string }[];
+    /** The devices it claims. */
+    devices: { kind: string; device: string; clash: boolean }[];
     onopen: (id: string) => void;
     onrestore: (id: string) => void;
   }
@@ -30,12 +34,19 @@
   import CircleAlert from '@lucide/svelte/icons/circle-alert';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
+  import Camera from '@lucide/svelte/icons/camera';
+  import Cpu from '@lucide/svelte/icons/cpu';
+  import { useGroupFocus } from '../../lib/groupFocus.svelte';
 
   let { id, data, selected }: { id: string; data: FlowNodeData; selected?: boolean } = $props();
 
   const removed = $derived(data.change === 'removed');
   const TypeIcon = $derived(data.nodeType === 'SOURCE' ? Zap : data.nodeType === 'SINK' ? Inbox : Shuffle);
   let iconFailed = $state(false);
+
+  const focus = useGroupFocus();
+  const inFocus = $derived(!!focus?.id && data.chips.some((c) => c.id === focus.id));
+  const dimmed = $derived(!!focus?.id && !inFocus);
 
   const stateTone = $derived.by(() => {
     switch (data.state) {
@@ -76,6 +87,8 @@
   class:changed={data.change === 'changed'}
   class:removed
   class:conflict={data.conflict}
+  class:in-focus={inFocus}
+  class:dimmed
   class:glow-ok={data.health === 'ok'}
   class:glow-warn={data.health === 'warn'}
   class:glow-bad={data.health === 'bad'}
@@ -113,6 +126,29 @@
     {/if}
   </span>
 
+  {#if data.chips.length || data.devices.length}
+    <span class="chips">
+      {#each data.chips as c (c.id)}
+        <button
+          class="chip"
+          type="button"
+          style:--chip-color={`var(--group-${c.color})`}
+          title={`${c.family} group ${c.id}`}
+          onpointerenter={() => focus && (focus.id = c.id)}
+          onpointerleave={() => focus && (focus.id = null)}
+          onfocus={() => focus && (focus.id = c.id)}
+          onblur={() => focus && (focus.id = null)}
+        >{c.id}</button>
+      {/each}
+      {#each data.devices as d (`${d.kind}:${d.device}`)}
+        <span class="device" class:clash={d.clash} title={d.clash ? `${d.kind} ${d.device}: claimed by another node too` : `Claims ${d.kind} ${d.device}`}>
+          {#if d.kind === 'camera'}<Camera size={11} strokeWidth={2} />{:else}<Cpu size={11} strokeWidth={2} />{/if}
+          {d.device}
+        </span>
+      {/each}
+    </span>
+  {/if}
+
   {#if data.conflict}
     <span class="tag conflict-tag">conflict</span>
   {:else if data.change === 'added'}
@@ -138,6 +174,7 @@
     position: relative;
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: var(--space-2);
     width: 220px;
     min-height: 48px;
@@ -214,6 +251,57 @@
   .node.removed > :not(.restore),
   .node.removed::before {
     opacity: 0.45;
+  }
+
+  .node.dimmed {
+    opacity: 0.25;
+  }
+
+  .node.in-focus {
+    border-color: var(--text);
+  }
+
+  .chips {
+    display: flex;
+    flex: 0 0 100%;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    min-width: 0;
+  }
+
+  .chip,
+  .device {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    max-width: 100%;
+    padding: 0 5px;
+    overflow: hidden;
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 16px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chip {
+    border: 1px solid var(--chip-color);
+    background: color-mix(in srgb, var(--chip-color) 14%, transparent);
+    color: var(--text);
+    cursor: inherit;
+  }
+
+  .device {
+    border: 1px solid var(--border-strong);
+    background: var(--surface-2);
+    color: var(--text-muted);
+  }
+
+  .device.clash {
+    border-color: var(--danger);
+    background: var(--danger-soft);
+    color: var(--danger);
   }
 
   .icon {

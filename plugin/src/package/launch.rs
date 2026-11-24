@@ -23,6 +23,9 @@
 //! - `x-flwrs-listen: true` on a top-level string property: an address the
 //!   plugin listens on (`host:port`), so a server can warn when two nodes
 //!   would bind the same one.
+//! - `x-flwrs-device` on a top-level property: `{"kind", "field"?, "when"?,
+//!   "default"?}`: the setting names a device a node opens exclusively (a
+//!   camera), so a server can report two nodes claiming the same one.
 //!
 //! Version 1 manifests ignore them; their `launch_args` all go on the command
 //! line, as before.
@@ -151,6 +154,16 @@ pub struct CodeField {
     pub signature: Option<String>,
 }
 
+/// A field holding a graph (`x-flwrs-graph`): an editor draws it with the
+/// node types its catalog lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphField {
+    /// JSON pointer of the property in the launch args.
+    pub pointer: String,
+    /// The catalog's path in the package.
+    pub catalog: String,
+}
+
 /// A field with a template (`x-flwrs-template`): a package file an editor
 /// fills the empty field with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,7 +186,9 @@ pub struct LaunchSpec {
     fields: BTreeMap<String, LaunchField>,
     code: Vec<CodeField>,
     templates: Vec<TemplateField>,
+    graphs: Vec<GraphField>,
     listen: Vec<ListenField>,
+    devices: Vec<DeviceField>,
     input_pointer: Option<String>,
     output_pointer: Option<String>,
     /// The fields the plugin's configurator sets.
@@ -187,6 +202,34 @@ pub struct ListenField {
     pub name: String,
     /// The schema's `default`: what the plugin binds when the node leaves it out.
     pub default: Option<String>,
+}
+
+/// A setting naming a device its node opens exclusively (`x-flwrs-device`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceField {
+    /// The top-level property.
+    pub name: String,
+    /// What sort of device (`camera`): claims compare within a kind.
+    pub kind: String,
+    /// The key holding the device's name, when the property is an object;
+    /// `None`: the property's own string value.
+    pub field: Option<String>,
+    /// For an object: the sibling values that make it claim a device (a
+    /// `type` of `camera`). Any other value claims nothing.
+    pub when: Map<String, Value>,
+    /// What the node claims when it names no device (the default camera).
+    /// `None`: it claims nothing.
+    pub default: Option<String>,
+}
+
+/// A device a node's settings claim.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeviceClaim {
+    /// The top-level property it comes from.
+    pub field: String,
+    pub kind: String,
+    /// The device, as the node names it (or the annotation's `default`).
+    pub device: String,
 }
 
 /// A file the server writes to (or links into) the node's `config/` folder.
@@ -235,7 +278,9 @@ impl LaunchSpec {
             fields: BTreeMap::new(),
             code: vec![],
             templates: vec![],
+            graphs: vec![],
             listen: Vec::new(),
+            devices: Vec::new(),
             input_pointer: pointer(&manifest.payload_schemas.input),
             output_pointer: pointer(&manifest.payload_schemas.output),
             configured: manifest
@@ -254,6 +299,7 @@ impl LaunchSpec {
             &mut Found {
                 code: &mut spec.code,
                 templates: &mut spec.templates,
+                graphs: &mut spec.graphs,
             },
             &mut report,
         );
@@ -267,6 +313,11 @@ impl LaunchSpec {
                             .and_then(Value::as_str)
                             .map(str::to_string),
                     });
+                }
+                if let Some(value) = prop.get("x-flwrs-device")
+                    && let Ok(device) = device_field(name, value)
+                {
+                    spec.devices.push(device);
                 }
             }
         }
@@ -346,7 +397,9 @@ impl LaunchSpec {
             fields: BTreeMap::new(),
             code: vec![],
             templates: vec![],
+            graphs: vec![],
             listen: Vec::new(),
+            devices: vec![],
             input_pointer: None,
             output_pointer: None,
             configured: vec![],
@@ -407,6 +460,45 @@ impl LaunchSpec {
             .collect()
     }
 
+    /// The properties naming a device their node opens exclusively.
+    pub fn device_fields(&self) -> &[DeviceField] {
+        &self.devices
+    }
+
+    /// The devices a node's `launch_args` claim. An object setting claims
+    /// one only when its `when` values match; a setting left out claims
+    /// nothing, unless it's a plain string with a `default`.
+    pub fn device_claims(&self, args: &Value) -> Vec<DeviceClaim> {
+        self.devices
+            .iter()
+            .filter_map(|f| {
+                let value = args.get(&f.name);
+                let device = match &f.field {
+                    None => value
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| f.default.clone()),
+                    Some(key) => {
+                        let object = value?.as_object()?;
+                        if !f.when.iter().all(|(k, v)| object.get(k) == Some(v)) {
+                            return None;
+                        }
+                        object
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .or_else(|| f.default.clone())
+                    }
+                }?;
+                Some(DeviceClaim {
+                    field: f.name.clone(),
+                    kind: f.kind.clone(),
+                    device,
+                })
+            })
+            .collect()
+    }
+
     /// JSON pointers of the per-node payload schemas (`in`, `out`).
     pub fn schema_pointers(&self) -> (Option<&str>, Option<&str>) {
         (
@@ -420,8 +512,13 @@ impl LaunchSpec {
         &self.templates
     }
 
+    /// The fields holding a graph (`x-flwrs-graph`).
+    pub fn graph_fields(&self) -> &[GraphField] {
+        &self.graphs
+    }
+
     /// Package files the schema refers to (`x-flwrs-code.definitions`,
-    /// `x-flwrs-template`).
+    /// `x-flwrs-template`, `x-flwrs-graph`).
     pub fn file_references(&self) -> Vec<(String, &str)> {
         let definitions = self.code.iter().filter_map(|c| {
             let path = c.definitions.as_deref()?;
@@ -436,7 +533,13 @@ impl LaunchSpec {
                 t.path.as_str(),
             )
         });
-        definitions.chain(templates).collect()
+        let graphs = self.graphs.iter().map(|g| {
+            (
+                format!("launch_args_schema {}: x-flwrs-graph", g.pointer),
+                g.catalog.as_str(),
+            )
+        });
+        definitions.chain(templates).chain(graphs).collect()
     }
 
     /// The launch plan for a node's `launch_args`; file arguments point into
@@ -598,6 +701,7 @@ enum Place {
 struct Found<'a> {
     code: &'a mut Vec<CodeField>,
     templates: &'a mut Vec<TemplateField>,
+    graphs: &'a mut Vec<GraphField>,
 }
 
 fn walk(node: &Value, pointer: &str, place: Place, found: &mut Found, report: &mut SchemaReport) {
@@ -645,6 +749,18 @@ fn walk(node: &Value, pointer: &str, place: Place, found: &mut Found, report: &m
                             ));
                         }
                     }
+                    "x-flwrs-device" if place != Place::Property(1) => report.errors.push(format!(
+                        "launch_args_schema at {}: x-flwrs-device is only allowed on top-level properties",
+                        at(pointer)
+                    )),
+                    "x-flwrs-device" => {
+                        if let Err(e) = device_field("", value) {
+                            report.errors.push(format!(
+                                "launch_args_schema at {}: x-flwrs-device: {e}",
+                                at(pointer)
+                            ));
+                        }
+                    }
                     "x-flwrs-code" if !property => report.errors.push(format!(
                         "launch_args_schema at {}: x-flwrs-code is only allowed on properties",
                         at(pointer)
@@ -663,6 +779,17 @@ fn walk(node: &Value, pointer: &str, place: Place, found: &mut Found, report: &m
                         Ok(t) => found.templates.push(t),
                         Err(e) => report.errors.push(format!(
                             "launch_args_schema at {}: x-flwrs-template: {e}",
+                            at(pointer)
+                        )),
+                    },
+                    "x-flwrs-graph" if place != Place::Property(1) => report.errors.push(format!(
+                        "launch_args_schema at {}: x-flwrs-graph is only allowed on top-level properties",
+                        at(pointer)
+                    )),
+                    "x-flwrs-graph" => match graph_field(pointer, map, value) {
+                        Ok(g) => found.graphs.push(g),
+                        Err(e) => report.errors.push(format!(
+                            "launch_args_schema at {}: x-flwrs-graph: {e}",
                             at(pointer)
                         )),
                     },
@@ -702,6 +829,49 @@ fn walk(node: &Value, pointer: &str, place: Place, found: &mut Found, report: &m
         }
         _ => {}
     }
+}
+
+/// Reads an `x-flwrs-device` annotation of the property `name`.
+fn device_field(name: &str, value: &Value) -> Result<DeviceField, String> {
+    let map = value
+        .as_object()
+        .ok_or("must be an object: {\"kind\", \"field\"?, \"when\"?, \"default\"?}")?;
+    if let Some(key) = map
+        .keys()
+        .find(|k| !["kind", "field", "when", "default"].contains(&k.as_str()))
+    {
+        return Err(format!("unknown key {key:?}"));
+    }
+    let text = |key: &str| -> Result<Option<String>, String> {
+        match map.get(key) {
+            None => Ok(None),
+            Some(Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
+            Some(_) => Err(format!("{key} must be a non-empty string")),
+        }
+    };
+    let kind = text("kind")?.ok_or("kind is required")?;
+    let field = text("field")?;
+    let default = text("default")?;
+    let when = match map.get("when") {
+        None => Map::new(),
+        Some(Value::Object(when)) => {
+            if field.is_none() {
+                return Err("when needs field (it applies to an object's keys)".into());
+            }
+            if when.values().any(|v| v.is_object() || v.is_array()) {
+                return Err("when's values must be strings, numbers, booleans or null".into());
+            }
+            when.clone()
+        }
+        Some(_) => return Err("when must be an object".into()),
+    };
+    Ok(DeviceField {
+        name: name.to_string(),
+        kind,
+        field,
+        when,
+        default,
+    })
 }
 
 /// Whether a schema uses any of the annotations that need named fields.
@@ -899,6 +1069,32 @@ fn template_field(
         pointer: pointer.to_string(),
         path: path.to_string(),
         text,
+    })
+}
+
+/// `x-flwrs-graph`: `{"catalog": "<file in the package>"}`, on an object.
+fn graph_field(
+    pointer: &str,
+    property: &Map<String, Value>,
+    value: &Value,
+) -> Result<GraphField, String> {
+    if types(property) != ["object"] {
+        return Err("the property must be an object".into());
+    }
+    let map = value
+        .as_object()
+        .ok_or("must be an object naming its catalog")?;
+    if let Some(other) = map.keys().find(|k| *k != "catalog") {
+        return Err(format!("unknown key {other:?}"));
+    }
+    let path = map
+        .get("catalog")
+        .and_then(Value::as_str)
+        .ok_or("catalog must be the path of a file in the package")?;
+    check_relative_path(path).map_err(|e| format!("{path:?}: {e}"))?;
+    Ok(GraphField {
+        pointer: pointer.to_string(),
+        catalog: path.to_string(),
     })
 }
 
@@ -1478,6 +1674,126 @@ mod tests {
         }});
         let (_, report) = LaunchSpec::new(&manifest(2), Some(&bad));
         assert_eq!(report.errors.len(), 2, "{:?}", report.errors);
+    }
+
+    #[test]
+    fn device_claims_follow_the_annotation() {
+        let schema = json!({"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+            "input": {"$ref": "#/$defs/input", "x-flwrs-device": {
+                "kind": "camera", "field": "device", "when": {"type": "camera"}, "default": "default"
+            }},
+            "serial_port": {"type": "string", "x-flwrs-device": {"kind": "serial"}}
+        }, "$defs": {"input": {"type": "object"}}});
+        let (spec, report) = LaunchSpec::new(&manifest(2), Some(&schema));
+        assert!(
+            report.errors.is_empty() && report.warnings.is_empty(),
+            "{report:?}"
+        );
+        let names = |args: Value| -> Vec<(String, String)> {
+            spec.device_claims(&args)
+                .into_iter()
+                .map(|c| (c.kind, c.device))
+                .collect()
+        };
+        let camera = |d: &str| vec![("camera".to_string(), d.to_string())];
+        assert_eq!(
+            names(json!({"input": {"type": "camera", "device": "/dev/video2"}})),
+            camera("/dev/video2")
+        );
+        assert_eq!(
+            names(json!({"input": {"type": "camera"}})),
+            camera("default")
+        );
+        // A file input, or no input at all, claims nothing.
+        assert!(names(json!({"input": {"type": "images", "device": "x"}})).is_empty());
+        assert!(names(json!({})).is_empty());
+        assert_eq!(
+            names(json!({"serial_port": "/dev/ttyUSB0"})),
+            [("serial".to_string(), "/dev/ttyUSB0".to_string())]
+        );
+    }
+
+    #[test]
+    fn device_annotations_are_checked() {
+        for bad in [
+            json!(true),
+            json!({}),
+            json!({"kind": ""}),
+            json!({"kind": "camera", "extra": 1}),
+            json!({"kind": "camera", "when": {"type": "camera"}}),
+            json!({"kind": "camera", "field": "d", "when": {"type": ["camera"]}}),
+        ] {
+            let schema = json!({"type": "object", "properties": {
+                "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+                "input": {"type": "object", "x-flwrs-device": bad}
+            }});
+            let (spec, report) = LaunchSpec::new(&manifest(2), Some(&schema));
+            assert_eq!(report.errors.len(), 1, "{bad}: {:?}", report.errors);
+            assert!(spec.device_fields().is_empty(), "{bad}");
+        }
+        let nested = json!({"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+            "a": {"type": "object", "properties": {"b": {"type": "string", "x-flwrs-device": {"kind": "camera"}}}}
+        }});
+        let (_, report) = LaunchSpec::new(&manifest(2), Some(&nested));
+        assert!(
+            report.errors[0].contains("top-level"),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn graph_fields_name_a_catalog() {
+        let with = |props: Value| {
+            let mut props = props;
+            props["schemas"] = json!({"type": "object", "properties": {"in": {"type": "object"}}});
+            LaunchSpec::new(
+                &manifest(2),
+                Some(&json!({"type": "object", "properties": props})),
+            )
+        };
+        let (spec, report) = with(json!({
+            "graph": {"type": "object", "x-flwrs-graph": {"catalog": "schema/c.json"}}
+        }));
+        assert_eq!(report.errors, Vec::<String>::new());
+        assert_eq!(spec.graph_fields()[0].catalog, "schema/c.json");
+        assert!(
+            spec.file_references()
+                .iter()
+                .any(|(_, p)| *p == "schema/c.json")
+        );
+        for (schema, expected) in [
+            (
+                json!({"g": {"type": "string", "x-flwrs-graph": {"catalog": "c.json"}}}),
+                "must be an object",
+            ),
+            (
+                json!({"g": {"type": "object", "x-flwrs-graph": "c.json"}}),
+                "naming its catalog",
+            ),
+            (
+                json!({"g": {"type": "object", "x-flwrs-graph": {"catalog": "../c.json"}}}),
+                "x-flwrs-graph",
+            ),
+            (
+                json!({"g": {"type": "object", "x-flwrs-graph": {"catalog": "c.json", "x": 1}}}),
+                "unknown key",
+            ),
+            (
+                json!({"a": {"type": "object", "properties": {
+                "g": {"type": "object", "x-flwrs-graph": {"catalog": "c.json"}}}}}),
+                "top-level",
+            ),
+        ] {
+            let (_, report) = with(schema);
+            let errors = report.errors;
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{expected}: {errors:?}"
+            );
+        }
     }
 
     #[test]

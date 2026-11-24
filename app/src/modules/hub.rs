@@ -4,6 +4,7 @@
 
 pub(crate) mod config;
 mod link_stats;
+pub(crate) mod live;
 mod pending;
 mod service;
 #[cfg(test)]

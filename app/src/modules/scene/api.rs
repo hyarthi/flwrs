@@ -1,13 +1,15 @@
 use crate::modules::api_error::{ApiError, ErrorBody, api_error, internal};
 use crate::modules::node_config::SceneDefaults;
+use crate::modules::scene::groups::SceneGroup;
 use crate::modules::scene::service::{self, ListFilters, Service, ServiceError};
 use crate::modules::scene::{
-    api_draft, api_graph, api_mapping, api_status, api_transfer, api_uploads,
+    api_draft, api_graph, api_mapping, api_preflight, api_status, api_transfer, api_uploads,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use flwrs_types::groups::Group;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -47,6 +49,11 @@ pub(crate) struct Scene {
     pub max_hops: Option<u32>,
     /// Defaults for the scene's nodes; a node's own setting wins.
     pub defaults: SceneDefaults,
+    /// Groups of the scene's nodes. A node names the ones it's in
+    /// (`config.groups`).
+    #[serde(default)]
+    #[schema(value_type = Vec<SceneGroup>)]
+    pub groups: Vec<Group>,
     /// Counts committed changes to the live graph (settings, nodes, edges,
     /// uploads). A draft records the one it's based on; the bulk endpoint
     /// can require it (`base_revision`).
@@ -63,6 +70,7 @@ impl From<service::Scene> for Scene {
             enabled: value.enabled,
             max_hops: value.max_hops,
             defaults: value.defaults,
+            groups: value.groups,
             revision: value.revision,
             create_time: value.create_time.timestamp_millis(),
             update_time: value.update_time.timestamp_millis(),
@@ -83,6 +91,12 @@ pub(crate) struct SceneRequest {
     /// Omitted = none. Changing them on an enabled scene reloads it.
     #[serde(default)]
     pub defaults: SceneDefaults,
+    /// The scene's groups, replacing the ones it has. Omitted = kept. Only
+    /// `resources` groups are accepted: a scene has no use for `placement`
+    /// or `execution` policies, and refuses them.
+    #[serde(default)]
+    #[schema(value_type = Option<Vec<SceneGroup>>)]
+    pub groups: Option<Vec<Group>>,
 }
 
 impl From<SceneRequest> for service::SceneInput {
@@ -91,6 +105,7 @@ impl From<SceneRequest> for service::SceneInput {
             name: req.name,
             max_hops: req.max_hops,
             defaults: req.defaults,
+            groups: req.groups,
         }
     }
 }
@@ -150,7 +165,7 @@ async fn create_scene(
     put,
     path = "/by-id/{id}",
     operation_id = "update-scene",
-    summary = "Replace a scene's settings (name, hop limit)",
+    summary = "Replace a scene's settings (name, hop limit, defaults, groups)",
     request_body(content = SceneRequest, content_type = "application/json"),
     params(("id" = String, Path, description = "ID of the scene to update")),
     responses(
@@ -215,7 +230,7 @@ async fn list_scenes(
     path = "/by-id/{id}/enable",
     operation_id = "enable-scene",
     summary = "Enable a scene: the director starts its workflow",
-    description = "Every node's plugin must be registered and installed. Enabling an enabled scene does nothing.",
+    description = "Every node's plugin must be registered and installed, and local nodes whose plugin declares a pre-flight check must have no permanent problem on this machine (retryable ones don't refuse it: the scene goes to WAITING). Enabling an enabled scene does nothing.",
     params(("id" = String, Path, description = "Scene ID")),
     responses(
         (status = 200, description = "Enabled scene", body = Scene),
@@ -292,6 +307,9 @@ async fn undo_group(
         api_status::scene_status,
         api_status::purge_scene_spool,
         api_status::purge_node_spool,
+        api_preflight::preflight_scene,
+        api_preflight::preflight_node,
+        api_preflight::describe_node,
         api_graph::list_nodes,
         api_graph::create_node,
         api_graph::get_node,
@@ -328,6 +346,15 @@ async fn undo_group(
         api_transfer::ExportFormat,
         api_status::SceneStatusResponse,
         api_status::PurgeResponse,
+        crate::modules::director::handle::PreflightIssue,
+        crate::modules::director::handle::FailedUpdate,
+        service::draft::submit::DraftSubmit,
+        service::draft::submit::DraftSubmitState,
+        crate::modules::director::handle::PreflightRetryStatus,
+        crate::modules::node_config::PreflightRetryOverride,
+        service::preflight::PreflightRun,
+        service::preflight::NodePreflight,
+        service::preflight::NodePreflightProblem,
         api_uploads::Upload,
     ))
 )]
@@ -346,6 +373,7 @@ impl Api {
             .merge(api_graph::routes())
             .merge(api_transfer::routes())
             .merge(api_status::routes())
+            .merge(api_preflight::routes())
             .merge(api_uploads::routes())
             .merge(api_draft::routes())
             .merge(api_mapping::routes())

@@ -4,6 +4,7 @@
 pub(crate) mod config;
 mod engine;
 pub(crate) mod handle;
+pub(crate) mod preflight;
 pub(crate) mod queue;
 pub(crate) mod running;
 mod service;

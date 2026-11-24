@@ -20,19 +20,49 @@
 //!
 //! The result is checked: only requested fields, files only for upload
 //! fields, and the merged launch args against the launch-args rules.
+//!
+//! **Pre-flight** (manifest `configurator.preflight`, contract version 2) is
+//! a second, read-only mode of the same program: "can this node run on this
+//! machine right now?". It runs the same way, with `--mode preflight` before
+//! the other arguments, the node's whole launch args (configured fields
+//! included, secrets left out) and `"mode": "preflight"` in the request. It
+//! answers `{"problems": [{"message", "retryable"}], "warnings": [...]}`; any
+//! values or files in the answer are refused. A program that can't start,
+//! crashes or answers garbage is a permanent problem carrying its stderr; a
+//! timeout is a retryable one. `releasing` in the request lists the running
+//! nodes of the same plugin and scene that the change stops first: a resource
+//! one of them holds will be free, so it isn't reported as busy.
+//!
+//! **Describe** (manifest `configurator.describe`, contract version 3) is a
+//! third, read-only mode, for editors: what the configured fields would say
+//! about the node's uploaded files. It runs with `--mode describe`, `"mode":
+//! "describe"` and only the node's upload settings in `launch_args`, since
+//! the rest may still be incomplete. It answers `{"values": {field: value}}`
+//! with requested fields only, or `{"errors": [...]}`; nothing is stored.
 
-use super::launch::{ConfigContent, LaunchSpec, Via, check_file_name, validate_launch_args};
+use super::launch::{
+    ConfigContent, LaunchPlan, LaunchSpec, Via, check_file_name, validate_launch_args,
+};
 use super::manifest::Manifest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// The contract version this module speaks.
 pub const CONTRACT: u32 = 1;
+/// The contract version of a pre-flight run.
+pub const PREFLIGHT_CONTRACT: u32 = 2;
+/// The value of `--mode` (and the request's `mode`) for a pre-flight run.
+pub const PREFLIGHT_MODE: &str = "preflight";
+/// The contract version of a describe run.
+pub const DESCRIBE_CONTRACT: u32 = 3;
+/// The value of `--mode` (and the request's `mode`) for a describe run.
+pub const DESCRIBE_MODE: &str = "describe";
 pub const REQUEST_FILE: &str = "request.json";
 pub const RESPONSE_FILE: &str = "response.json";
 
@@ -337,22 +367,7 @@ pub fn configure(inv: &Invocation) -> Result<Configured, Vec<String>> {
         .prefix("flwrs-configure-")
         .tempdir()
         .map_err(|e| vec![format!("a temporary folder: {e}")])?;
-    let config_dir = dir.path().join(super::launch::CONFIG_DIR);
-    std::fs::create_dir(&config_dir).map_err(|e| vec![format!("{}: {e}", config_dir.display())])?;
-
-    // config/ and the environment, as the plugin would get them.
-    let plan = inv.spec.plan(&base, &config_dir)?;
-    for file in &plan.files {
-        let target = config_dir.join(&file.name);
-        let written = match &file.content {
-            ConfigContent::Data(bytes) => std::fs::write(&target, bytes),
-            ConfigContent::Upload(name) => match (inv.uploads)(name) {
-                Some(stored) => std::fs::copy(&stored, &target).map(|_| ()),
-                None => return Err(vec![format!("the uploaded file {name:?} is missing")]),
-            },
-        };
-        written.map_err(|e| vec![format!("config/{}: {e}", file.name)])?;
-    }
+    let plan = lay_out(inv, &base, dir.path())?;
     let request = Request {
         contract: CONTRACT,
         plugin: PluginRef {
@@ -367,9 +382,94 @@ pub fn configure(inv: &Invocation) -> Result<Configured, Vec<String>> {
     std::fs::write(dir.path().join(REQUEST_FILE), request_text)
         .map_err(|e| vec![format!("{REQUEST_FILE}: {e}")])?;
 
+    let args = ["--request", REQUEST_FILE, "--response", RESPONSE_FILE];
+    let (status, stderr) = run_program(
+        inv,
+        &configurator.executable,
+        dir.path(),
+        &plan,
+        &args,
+        None,
+    )
+    .map_err(|failure| vec![failure.message()])?;
+    let response = read_response(dir.path(), inv.limits);
+    let response = match (status.success(), response) {
+        (true, Ok(r)) => r,
+        (_, Ok(r)) if !r.errors.is_empty() => return Err(r.errors),
+        (true, Err(e)) => return Err(vec![e]),
+        (false, _) => {
+            return Err(vec![format!(
+                "the configurator failed ({status}){}",
+                stderr_detail(&stderr)
+            )]);
+        }
+    };
+    if !response.errors.is_empty() {
+        return Err(response.errors);
+    }
+    check(inv, dir, &fields, base, response)
+}
+
+/// Writes `config/` into the run's folder, as the plugin would get it, and
+/// returns the launch plan (its environment).
+fn lay_out(inv: &Invocation, args: &Value, dir: &Path) -> Result<LaunchPlan, Vec<String>> {
+    let config_dir = dir.join(super::launch::CONFIG_DIR);
+    std::fs::create_dir(&config_dir).map_err(|e| vec![format!("{}: {e}", config_dir.display())])?;
+    let plan = inv.spec.plan(args, &config_dir)?;
+    for file in &plan.files {
+        let target = config_dir.join(&file.name);
+        let written = match &file.content {
+            ConfigContent::Data(bytes) => std::fs::write(&target, bytes),
+            ConfigContent::Upload(name) => match (inv.uploads)(name) {
+                Some(stored) => std::fs::copy(&stored, &target).map(|_| ()),
+                None => return Err(vec![format!("the uploaded file {name:?} is missing")]),
+            },
+        };
+        written.map_err(|e| vec![format!("config/{}: {e}", file.name)])?;
+    }
+    Ok(plan)
+}
+
+/// Why a run of the program didn't get to an exit status.
+enum RunFailure {
+    Start(String),
+    Timeout(Duration),
+    Wait(String),
+    Cancelled,
+}
+
+impl RunFailure {
+    fn message(&self) -> String {
+        match self {
+            RunFailure::Start(e) => e.clone(),
+            RunFailure::Timeout(limit) => format!(
+                "the configurator didn't finish within {} s",
+                limit.as_secs_f64()
+            ),
+            RunFailure::Wait(e) => format!("waiting for the configurator: {e}"),
+            RunFailure::Cancelled => "the run was cancelled".to_string(),
+        }
+    }
+}
+
+/// How long the end of stderr is waited for once the program has exited: a
+/// process it left behind may keep the pipe open.
+const STDERR_GRACE: Duration = Duration::from_millis(500);
+
+/// Runs the configurator in `dir` with a clean environment, until it exits,
+/// its time is up or `cancel` is set (then it's killed). Returns its status
+/// and the end of its stderr.
+fn run_program(
+    inv: &Invocation,
+    executable: &str,
+    dir: &Path,
+    plan: &LaunchPlan,
+    args: &[&str],
+    cancel: Option<&AtomicBool>,
+) -> Result<(ExitStatus, String), RunFailure> {
     let executable = match inv.executable {
         Some(program) => program.to_path_buf(),
-        None => inv.package_dir.join(&configurator.executable),
+        None => inv.package_dir.join(executable),
     };
     // It runs in the temporary folder: a relative path (e.g. a server whose
     // plugins folder is configured relative to its working directory) would
@@ -377,13 +477,13 @@ pub fn configure(inv: &Invocation) -> Result<Configured, Vec<String>> {
     let executable = std::path::absolute(&executable).unwrap_or(executable);
     let mut command = Command::new(&executable);
     command
-        .args(["--request", REQUEST_FILE, "--response", RESPONSE_FILE])
-        .current_dir(dir.path())
+        .args(args)
+        .current_dir(dir)
         .env_clear()
         .envs(plan.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-        .env("TMPDIR", dir.path())
-        .env("TEMP", dir.path())
-        .env("TMP", dir.path())
+        .env("TMPDIR", dir)
+        .env("TEMP", dir)
+        .env("TMP", dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -393,14 +493,15 @@ pub fn configure(inv: &Invocation) -> Result<Configured, Vec<String>> {
         }
     }
     let mut child = command.spawn().map_err(|e| {
-        vec![format!(
+        RunFailure::Start(format!(
             "starting the configurator {}: {e}",
             executable.display()
-        )]
+        ))
     })?;
     // Read stderr meanwhile (a full pipe would block the child); keep its end.
     let mut stderr = child.stderr.take().expect("piped");
-    let reader = std::thread::spawn(move || {
+    let (tail_tx, tail_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut tail = Vec::new();
         let mut buf = [0u8; 4096];
         while let Ok(n) = stderr.read(&mut buf) {
@@ -412,46 +513,378 @@ pub fn configure(inv: &Invocation) -> Result<Configured, Vec<String>> {
                 tail.drain(..tail.len() - 4096);
             }
         }
-        String::from_utf8_lossy(&tail).trim().to_string()
+        let _ = tail_tx.send(String::from_utf8_lossy(&tail).trim().to_string());
     });
     let started = Instant::now();
     let status = loop {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RunFailure::Cancelled);
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() >= inv.limits.timeout => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(vec![format!(
-                    "the configurator didn't finish within {} s",
-                    inv.limits.timeout.as_secs_f64()
-                )]);
+                return Err(RunFailure::Timeout(inv.limits.timeout));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(vec![format!("waiting for the configurator: {e}")]),
+            Err(e) => return Err(RunFailure::Wait(e.to_string())),
         }
     };
-    let stderr = reader.join().unwrap_or_default();
-    let response = read_response(dir.path(), inv.limits);
-    let response = match (status.success(), response) {
-        (true, Ok(r)) => r,
-        (_, Ok(r)) if !r.errors.is_empty() => return Err(r.errors),
-        (true, Err(e)) => return Err(vec![e]),
-        (false, _) => {
-            let detail = if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
-            };
-            return Err(vec![format!("the configurator failed ({status}){detail}")]);
-        }
-    };
-    if !response.errors.is_empty() {
-        return Err(response.errors);
+    Ok((
+        status,
+        tail_rx.recv_timeout(STDERR_GRACE).unwrap_or_default(),
+    ))
+}
+
+fn stderr_detail(stderr: &str) -> String {
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
     }
-    check(inv, dir, &fields, base, response)
+}
+
+/// The request of a pre-flight run (`request.json`).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PreflightRequest {
+    /// [`PREFLIGHT_CONTRACT`].
+    pub contract: u32,
+    /// [`PREFLIGHT_MODE`].
+    pub mode: String,
+    pub plugin: PluginRef,
+    pub node_id: String,
+    /// The node's launch args, configured fields included, without secrets.
+    pub launch_args: Value,
+    pub fields: Vec<String>,
+    /// Nodes of the same plugin and scene, running now, that this change
+    /// stops before the new version starts: what they hold will be free.
+    #[serde(default)]
+    pub releasing: Vec<ReleasingNode>,
+}
+
+/// A running node that will have stopped by the time the checked node starts.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReleasingNode {
+    pub node_id: String,
+    /// Its current launch args. A run sends only the fields the plugin
+    /// declares as non-secret.
+    pub launch_args: Value,
+}
+
+/// Something that keeps the node from running on this machine.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreflightProblem {
+    pub message: String,
+    /// It may go away by itself (a device still starting up): worth trying
+    /// again. Otherwise it's permanent until someone changes something.
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+impl PreflightProblem {
+    fn permanent(message: String) -> Self {
+        Self {
+            message,
+            retryable: false,
+        }
+    }
+}
+
+/// A pre-flight run's answer. No problems: the node can run.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct PreflightReport {
+    pub problems: Vec<PreflightProblem>,
+    pub warnings: Vec<String>,
+}
+
+impl PreflightReport {
+    fn failed(problem: PreflightProblem) -> Self {
+        Self {
+            problems: vec![problem],
+            warnings: vec![],
+        }
+    }
+
+    /// Whether any problem is permanent.
+    pub fn is_permanent(&self) -> bool {
+        self.problems.iter().any(|p| !p.retryable)
+    }
+}
+
+/// Whether the plugin answers pre-flight checks.
+pub fn has_preflight(manifest: &Manifest) -> bool {
+    manifest
+        .configurator
+        .as_ref()
+        .is_some_and(|c| c.preflight && !c.executable.is_empty())
+}
+
+/// Runs the pre-flight check. A plugin that doesn't declare it isn't run,
+/// and reports nothing.
+pub fn preflight(inv: &Invocation) -> PreflightReport {
+    preflight_cancellable(inv, &AtomicBool::new(false))
+}
+
+/// [`preflight`], killing the program once `cancel` is set (the report then
+/// holds a retryable problem saying so).
+pub fn preflight_cancellable(inv: &Invocation, cancel: &AtomicBool) -> PreflightReport {
+    preflight_with(inv, &[], cancel)
+}
+
+/// Only what the plugin declares as a non-secret setting: a running node may
+/// come from another version, whose secrets this one's schema doesn't name.
+fn releasing_args(spec: &LaunchSpec, args: &Value) -> Value {
+    match args {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| spec.field(k).is_some_and(|f| !f.secret))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        _ => Value::Object(Map::new()),
+    }
+}
+
+/// [`preflight_cancellable`], telling the program which running nodes will
+/// have stopped by the time this one starts (`releasing`).
+pub fn preflight_with(
+    inv: &Invocation,
+    releasing: &[ReleasingNode],
+    cancel: &AtomicBool,
+) -> PreflightReport {
+    let Some(configurator) = inv
+        .manifest
+        .configurator
+        .as_ref()
+        .filter(|_| has_preflight(inv.manifest))
+    else {
+        return PreflightReport::default();
+    };
+    // Trouble with the server's own temporary folder says nothing about the
+    // node: worth another try.
+    let transient = |message: String| {
+        PreflightReport::failed(PreflightProblem {
+            message,
+            retryable: true,
+        })
+    };
+    let dir = match tempfile::Builder::new()
+        .prefix("flwrs-preflight-")
+        .tempdir()
+    {
+        Ok(dir) => dir,
+        Err(e) => return transient(format!("a temporary folder: {e}")),
+    };
+    let plan = match lay_out(inv, inv.launch_args, dir.path()) {
+        Ok(plan) => plan,
+        Err(errors) => {
+            return PreflightReport {
+                problems: errors
+                    .into_iter()
+                    .map(PreflightProblem::permanent)
+                    .collect(),
+                warnings: vec![],
+            };
+        }
+    };
+    let request = PreflightRequest {
+        contract: PREFLIGHT_CONTRACT,
+        mode: PREFLIGHT_MODE.to_string(),
+        plugin: PluginRef {
+            id: inv.manifest.id.clone(),
+            version: inv.manifest.version.clone(),
+        },
+        node_id: inv.node_id.to_string(),
+        launch_args: without_secrets(inv.spec, inv.launch_args),
+        fields: configurator.fields.clone(),
+        releasing: releasing
+            .iter()
+            .map(|r| ReleasingNode {
+                node_id: r.node_id.clone(),
+                launch_args: releasing_args(inv.spec, &r.launch_args),
+            })
+            .collect(),
+    };
+    let text = serde_json::to_vec_pretty(&request).expect("a request serializes");
+    if let Err(e) = std::fs::write(dir.path().join(REQUEST_FILE), text) {
+        return transient(format!("{REQUEST_FILE}: {e}"));
+    }
+    let args = [
+        "--mode",
+        PREFLIGHT_MODE,
+        "--request",
+        REQUEST_FILE,
+        "--response",
+        RESPONSE_FILE,
+    ];
+    let (status, stderr) = match run_program(
+        inv,
+        &configurator.executable,
+        dir.path(),
+        &plan,
+        &args,
+        Some(cancel),
+    ) {
+        Ok(ran) => ran,
+        Err(failure @ (RunFailure::Timeout(_) | RunFailure::Cancelled)) => {
+            return transient(failure.message());
+        }
+        Err(failure) => {
+            return PreflightReport::failed(PreflightProblem::permanent(failure.message()));
+        }
+    };
+    let response = read_response_bytes(dir.path(), inv.limits).and_then(|b| parse_preflight(&b));
+    match (status.success(), response) {
+        // A check that found something may well exit non-zero.
+        (_, Ok(report)) if !report.problems.is_empty() => report,
+        (true, Ok(report)) => report,
+        (true, Err(e)) => PreflightReport::failed(PreflightProblem::permanent(format!(
+            "the configurator's pre-flight answer: {e}{}",
+            stderr_detail(&stderr)
+        ))),
+        (false, _) => PreflightReport::failed(PreflightProblem::permanent(format!(
+            "the configurator failed ({status}){}",
+            stderr_detail(&stderr)
+        ))),
+    }
+}
+
+/// Whether the plugin answers describe requests.
+pub fn has_describe(manifest: &Manifest) -> bool {
+    manifest
+        .configurator
+        .as_ref()
+        .is_some_and(|c| c.describe && !c.executable.is_empty())
+}
+
+/// The node's upload settings: all a describe run may depend on.
+pub fn upload_args(spec: &LaunchSpec, args: &Value) -> Value {
+    match args {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| spec.field(k).is_some_and(|f| f.upload && !f.secret))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        _ => Value::Object(Map::new()),
+    }
+}
+
+/// Runs the describe mode on the node's uploads. `Ok(None)`: the plugin
+/// doesn't declare it.
+pub fn describe(inv: &Invocation) -> Result<Option<Map<String, Value>>, Vec<String>> {
+    let Some(configurator) = inv
+        .manifest
+        .configurator
+        .as_ref()
+        .filter(|_| has_describe(inv.manifest))
+    else {
+        return Ok(None);
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("flwrs-describe-")
+        .tempdir()
+        .map_err(|e| vec![format!("a temporary folder: {e}")])?;
+    let launch_args = upload_args(inv.spec, inv.launch_args);
+    let plan = lay_out(inv, &launch_args, dir.path())?;
+    let request = serde_json::json!({
+        "contract": DESCRIBE_CONTRACT,
+        "mode": DESCRIBE_MODE,
+        "plugin": PluginRef {
+            id: inv.manifest.id.clone(),
+            version: inv.manifest.version.clone(),
+        },
+        "node_id": inv.node_id,
+        "launch_args": launch_args,
+        "fields": configurator.fields,
+    });
+    let text = serde_json::to_vec_pretty(&request).expect("a request serializes");
+    std::fs::write(dir.path().join(REQUEST_FILE), text)
+        .map_err(|e| vec![format!("{REQUEST_FILE}: {e}")])?;
+    let args = [
+        "--mode",
+        DESCRIBE_MODE,
+        "--request",
+        REQUEST_FILE,
+        "--response",
+        RESPONSE_FILE,
+    ];
+    let (status, stderr) = run_program(
+        inv,
+        &configurator.executable,
+        dir.path(),
+        &plan,
+        &args,
+        None,
+    )
+    .map_err(|f| vec![f.message()])?;
+    let response = read_response(dir.path(), inv.limits);
+    match response {
+        Ok(r) if !r.errors.is_empty() => Err(r.errors),
+        Ok(r) if status.success() => {
+            if !r.files.is_empty() {
+                return Err(vec![
+                    "a describe run is read-only: it can't return files".into(),
+                ]);
+            }
+            if let Some(key) = r.values.keys().find(|k| !configurator.fields.contains(k)) {
+                return Err(vec![format!(
+                    "the describe answer sets {key:?}, which the configurator doesn't declare"
+                )]);
+            }
+            Ok(Some(r.values))
+        }
+        Ok(_) => Err(vec![format!(
+            "the configurator failed ({status}){}",
+            stderr_detail(&stderr)
+        )]),
+        Err(e) => Err(vec![format!(
+            "the describe answer: {e}{}",
+            stderr_detail(&stderr)
+        )]),
+    }
+}
+
+/// A pre-flight answer. It's read-only: values or files are refused.
+fn parse_preflight(bytes: &[u8]) -> Result<PreflightReport, String> {
+    let mut value: Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("{RESPONSE_FILE}: {e}"))?;
+    let map = value
+        .as_object_mut()
+        .ok_or_else(|| format!("{RESPONSE_FILE} isn't a JSON object"))?;
+    for key in ["values", "files"] {
+        let empty = match map.remove(key) {
+            None | Some(Value::Null) => true,
+            Some(Value::Object(o)) => o.is_empty(),
+            Some(_) => false,
+        };
+        if !empty {
+            return Err(format!(
+                "a pre-flight run is read-only: its response can't carry {key:?}"
+            ));
+        }
+    }
+    let report: PreflightReport =
+        serde_json::from_value(value).map_err(|e| format!("{RESPONSE_FILE}: {e}"))?;
+    if report.problems.iter().any(|p| p.message.trim().is_empty()) {
+        return Err(format!("{RESPONSE_FILE}: a problem has an empty message"));
+    }
+    Ok(report)
 }
 
 fn read_response(dir: &Path, limits: &Limits) -> Result<Response, String> {
+    let text = read_response_bytes(dir, limits)?;
+    serde_json::from_slice(&text).map_err(|e| format!("{RESPONSE_FILE}: {e}"))
+}
+
+fn read_response_bytes(dir: &Path, limits: &Limits) -> Result<Vec<u8>, String> {
     let path = dir.join(RESPONSE_FILE);
     let size = std::fs::metadata(&path)
         .map_err(|_| format!("the configurator wrote no {RESPONSE_FILE}"))?
@@ -462,8 +895,7 @@ fn read_response(dir: &Path, limits: &Limits) -> Result<Response, String> {
             limits.max_response_bytes
         ));
     }
-    let text = std::fs::read(&path).map_err(|e| format!("{RESPONSE_FILE}: {e}"))?;
-    serde_json::from_slice(&text).map_err(|e| format!("{RESPONSE_FILE}: {e}"))
+    std::fs::read(&path).map_err(|e| format!("{RESPONSE_FILE}: {e}"))
 }
 
 fn without_secrets(spec: &LaunchSpec, args: &Value) -> Value {
@@ -860,6 +1292,223 @@ mod tests {
         })
         .unwrap_err();
         assert!(e[0].contains("didn't finish"), "{e:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Runs the fixture's script in pre-flight mode (declared in its manifest).
+    fn preflight_of(script: &str, args: Value, timeout: Duration) -> PreflightReport {
+        let mut f = Fixture::new(script);
+        f.manifest.configurator.as_mut().unwrap().preflight = true;
+        let (spec, _) = LaunchSpec::new(&f.manifest, Some(&f.schema));
+        let limits = Limits {
+            timeout,
+            ..Limits::default()
+        };
+        preflight(&Invocation {
+            package_dir: f.dir.path(),
+            executable: None,
+            manifest: &f.manifest,
+            spec: &spec,
+            schema: None,
+            launch_args: &args,
+            uploads: &|_| None,
+            node_id: "n1",
+            limits: &limits,
+        })
+    }
+
+    const T: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn preflight_gets_its_mode_and_the_whole_settings() {
+        let report = preflight_of(
+            r#"[ "$1" = --mode ] && [ "$2" = preflight ] && [ "$3" = --request ] || exit 9
+               grep -q '"contract": 2' request.json || exit 8
+               grep -q '"mode": "preflight"' request.json || exit 7
+               grep -q '"out_schema"' request.json || exit 6
+               grep -q hunter2 request.json && exit 5
+               [ "$TOKEN" = hunter2 ] || exit 4
+               echo '{"problems": [{"message": "no camera", "retryable": true}, {"message": "no GPU"}], "warnings": ["slow"]}' > response.json"#,
+            json!({"spec": "x", "token": "hunter2", "out_schema": {"fields": []}}),
+            T,
+        );
+        assert_eq!(report.warnings, ["slow"]);
+        assert_eq!(report.problems.len(), 2, "{report:?}");
+        assert!(report.problems[0].retryable);
+        assert!(!report.problems[1].retryable);
+        assert!(report.is_permanent());
+    }
+
+    fn describe_of(
+        script: &str,
+        declared: bool,
+        args: Value,
+    ) -> Result<Option<Map<String, Value>>, Vec<String>> {
+        let mut f = Fixture::new(script);
+        f.manifest.configurator.as_mut().unwrap().describe = declared;
+        let (spec, _) = LaunchSpec::new(&f.manifest, Some(&f.schema));
+        let stored = f.dir.path().join("stored-doc");
+        std::fs::write(&stored, "x").unwrap();
+        let uploads = move |name: &str| (name == "doc.yaml").then(|| stored.clone());
+        let limits = Limits {
+            timeout: T,
+            ..Limits::default()
+        };
+        describe(&Invocation {
+            package_dir: f.dir.path(),
+            executable: None,
+            manifest: &f.manifest,
+            spec: &spec,
+            schema: None,
+            launch_args: &args,
+            uploads: &uploads,
+            node_id: "n1",
+            limits: &limits,
+        })
+    }
+
+    #[test]
+    fn describe_sees_only_uploads_and_returns_declared_fields() {
+        let values = describe_of(
+            r#"[ "$1" = --mode ] && [ "$2" = describe ] || exit 9
+               grep -q '"contract": 3' request.json || exit 8
+               grep -q '"doc": "doc.yaml"' request.json || exit 7
+               grep -q incomplete request.json && exit 6
+               [ -f config/doc.yaml ] || exit 5
+               echo '{"values": {"out_schema": {"fields": []}}}' > response.json"#,
+            true,
+            json!({"doc": "doc.yaml", "spec": "incomplete"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(values["out_schema"], json!({"fields": []}));
+        // Not declared: not run.
+        assert_eq!(describe_of("exit 1", false, json!({})).unwrap(), None);
+        // What it may not answer.
+        for (script, expected) in [
+            (
+                r#"echo '{"values": {"other": 1}}' > response.json"#,
+                "doesn't declare",
+            ),
+            (
+                r#"echo '{"files": {"doc": "x"}}' > response.json"#,
+                "read-only",
+            ),
+            (
+                r#"echo '{"errors": ["bad file"]}' > response.json"#,
+                "bad file",
+            ),
+            ("exit 3", "wrote no"),
+        ] {
+            let errors = describe_of(script, true, json!({})).unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{expected}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_failures_are_problems() {
+        let one = |script: &str| {
+            let r = preflight_of(script, json!({"spec": "x"}), T);
+            assert_eq!(r.problems.len(), 1, "{r:?}");
+            r.problems.into_iter().next().unwrap()
+        };
+        assert!(
+            preflight_of("echo '{}' > response.json", json!({}), T)
+                .problems
+                .is_empty()
+        );
+        // A check may exit non-zero with its findings.
+        let p = one(
+            r#"echo '{"problems": [{"message": "busy", "retryable": true}]}' > response.json; exit 1"#,
+        );
+        assert_eq!((p.message.as_str(), p.retryable), ("busy", true));
+        // A crash carries its stderr.
+        let p = one("echo 'GLIBC_2.38 not found' >&2; exit 127");
+        assert!(p.message.contains("GLIBC_2.38") && !p.retryable, "{p:?}");
+        let p = one("exit 0");
+        assert!(
+            p.message.contains("no response.json") && !p.retryable,
+            "{p:?}"
+        );
+        let p = one("echo nonsense > response.json");
+        assert!(!p.retryable, "{p:?}");
+        // Read-only: values and files are refused.
+        let p = one(r#"echo '{"values": {"out_schema": {}}}' > response.json"#);
+        assert!(p.message.contains("read-only") && !p.retryable, "{p:?}");
+        let p = one(r#"echo '{"files": {"descriptor": "a"}}' > response.json"#);
+        assert!(p.message.contains("read-only"), "{p:?}");
+        // A timeout is the one failure worth retrying.
+        let r = preflight_of("exec sleep 30", json!({}), Duration::from_millis(200));
+        assert!(r.problems[0].retryable, "{r:?}");
+        assert!(r.problems[0].message.contains("didn't finish"), "{r:?}");
+    }
+
+    #[test]
+    fn a_program_that_cant_start_is_a_permanent_problem() {
+        let mut f = Fixture::new("exit 0");
+        let c = f.manifest.configurator.as_mut().unwrap();
+        c.preflight = true;
+        c.executable = "bin/missing".into();
+        let (spec, _) = LaunchSpec::new(&f.manifest, Some(&f.schema));
+        let r = preflight(&Invocation {
+            package_dir: f.dir.path(),
+            executable: None,
+            manifest: &f.manifest,
+            spec: &spec,
+            schema: None,
+            launch_args: &json!({}),
+            uploads: &|_| None,
+            node_id: "n",
+            limits: &Limits::default(),
+        });
+        assert!(r.is_permanent(), "{r:?}");
+        assert!(
+            r.problems[0].message.contains("starting the configurator"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_only_runs_when_declared_and_can_be_cancelled() {
+        // Not declared: not run at all.
+        let f = Fixture::new("touch ran; exit 1");
+        let (spec, _) = LaunchSpec::new(&f.manifest, Some(&f.schema));
+        let inv = Invocation {
+            package_dir: f.dir.path(),
+            executable: None,
+            manifest: &f.manifest,
+            spec: &spec,
+            schema: None,
+            launch_args: &json!({}),
+            uploads: &|_| None,
+            node_id: "n",
+            limits: &Limits::default(),
+        };
+        assert_eq!(preflight(&inv), PreflightReport::default());
+
+        let mut f = Fixture::new("exec sleep 30");
+        f.manifest.configurator.as_mut().unwrap().preflight = true;
+        let (spec, _) = LaunchSpec::new(&f.manifest, Some(&f.schema));
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        let r = preflight_cancellable(
+            &Invocation {
+                package_dir: f.dir.path(),
+                executable: None,
+                manifest: &f.manifest,
+                spec: &spec,
+                schema: None,
+                launch_args: &json!({}),
+                uploads: &|_| None,
+                node_id: "n",
+                limits: &Limits::default(),
+            },
+            &cancel,
+        );
+        assert!(r.problems[0].retryable, "{r:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 

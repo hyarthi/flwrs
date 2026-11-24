@@ -13,6 +13,13 @@ pub struct Keypoint {
     pub confidence: f32,
 }
 
+/// An object's `children` key for what a hand's landmarks model reports
+/// beyond its keypoints, for a gesture embedder: `depth`, `world`, `right`.
+pub const HAND_POSE: &str = "hand_pose";
+
+/// MediaPipe's scale for a hand model's depth (`normalize_z`).
+const HAND_DEPTH_SCALE: f32 = 0.4;
+
 /// A detected object.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Object {
@@ -129,6 +136,27 @@ impl Results {
                 o.bbox = affine.map_box(o.bbox);
                 for k in &mut o.keypoints {
                     (k.x, k.y) = affine.apply(k.x, k.y);
+                }
+                let pose = o.children.iter_mut().find(|(id, _)| id == HAND_POSE);
+                if let Some((_, Results::Tensor(parts))) = pose {
+                    let scale = affine.a.hypot(affine.d);
+                    for (name, _, values) in parts {
+                        match name.as_str() {
+                            // In frame pixels, like x.
+                            "depth" => values.iter_mut().for_each(|z| {
+                                *z *= scale / HAND_DEPTH_SCALE;
+                            }),
+                            // Metres: turned with the region, not scaled.
+                            "world" if scale > 0.0 => {
+                                for p in values.as_chunks_mut::<3>().0 {
+                                    let (x, y) = (p[0], p[1]);
+                                    p[0] = (affine.a * x + affine.b * y) / scale;
+                                    p[1] = (affine.d * x + affine.e * y) / scale;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }

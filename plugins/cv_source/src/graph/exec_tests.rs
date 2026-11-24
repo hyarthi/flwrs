@@ -186,6 +186,69 @@ fn models_on_keypoints_run_per_object() {
     }
 }
 
+#[cfg(feature = "ort")]
+#[test]
+fn a_gesture_classifier_runs_on_its_embedder() {
+    let lm: Vec<f32> = (0..63).map(|i| i as f32 / 8.0).collect();
+    let mut f = files(&[
+        (
+            "hand.onnx",
+            &[1, 3, 16, 16],
+            vec![
+                ("lm", vec![1, 63], lm),
+                ("right", vec![1, 1], vec![0.9]),
+                ("world", vec![1, 63], (0..63).map(|i| i as f32).collect()),
+            ],
+        ),
+        (
+            "gesture.onnx",
+            &[1, 4],
+            vec![("probs", vec![1, 3], vec![0.1, 0.2, 0.7])],
+        ),
+    ]);
+    let path = f._dir.path().join("embedder.onnx");
+    std::fs::write(&path, crate::testing::hand_embedder(4)).unwrap();
+    f.files.insert("embedder.onnx".into(), path);
+    let graph = |world: Value| {
+        json!({
+            "nodes": {
+                "camera": {"type": "source"},
+                "hand": {"type": "model", "model": "hand.onnx", "pre": pre(16, 16),
+                         "decode": {"type": "landmarks", "output": "lm", "points": 21, "dims": 3,
+                                    "world": world, "handedness": "right"}},
+                "gesture": {"type": "model", "model": "gesture.onnx", "tensor_input": {"embedder": "embedder.onnx"},
+                            "decode": {"type": "classify", "output": "probs", "softmax": false, "topk": 1}}
+            },
+            "links": [
+                {"from": "camera.frame", "to": "hand.frame"},
+                {"from": "hand.objects", "to": "gesture.objects"}
+            ]
+        })
+    };
+    let (config, checked) = parse(&graph(json!("world"))).unwrap();
+    let frame = Frame::filled(16, 16, [0, 0, 0]).unwrap();
+    let (mut plan, _) = compile(&config, &checked, &f.files, &execution(Runtime::Ort), 1).unwrap();
+    let tick = plan.tick(&frame);
+    assert!(tick.errors.is_empty(), "{:?}", tick.errors);
+    let hand = objects(&tick.results.iter().find(|(id, _)| id == "hand").unwrap().1);
+    let gesture = hand[0].children.iter().find(|(id, _)| id == "gesture");
+    let Some((_, Results::Classes(c))) = gesture else {
+        panic!("{:?}", hand[0].children)
+    };
+    assert_eq!(c[0].class_id, 2);
+
+    // Without what the embedder takes, the graph is refused.
+    let mut no_pose = graph(json!("world"));
+    let decode = no_pose["nodes"]["hand"]["decode"].as_object_mut().unwrap();
+    decode.remove("world");
+    decode.remove("handedness");
+    let (config, checked) = parse(&no_pose).unwrap();
+    let problems = compile(&config, &checked, &f.files, &execution(Runtime::Ort), 1)
+        .err()
+        .unwrap();
+    assert!(problems[0].contains("embedder"), "{problems:?}");
+}
+
 #[test]
 fn sampling_reuses_the_last_results() {
     let f = files(&[detector()]);
@@ -477,5 +540,300 @@ fn control_frames_run_the_detector_less_and_the_crop_model_always() {
         // Three runs in a row confirm the track; then one in six.
         assert_eq!(det_runs, [0, 1, 2, 7, 12, 17], "background: {background}");
         assert_eq!(cls_runs, 20);
+    }
+}
+
+/// `tests/trellis/fixed_det.onnx`: the detector the package tests run. A
+/// generated model, kept in step with the generator.
+#[test]
+fn the_trellis_fixture_is_current() {
+    let (_, input, outputs) = detector();
+    let outputs: Vec<(&str, Output)> = outputs
+        .iter()
+        .map(|(n, s, d)| (*n, Output::new(s.clone(), d.clone()).unwrap()))
+        .collect();
+    let named: Vec<(&str, &Output)> = outputs.iter().map(|(n, o)| (*n, o)).collect();
+    let bytes = testing::constant_outputs(input, &named, &[], &[]);
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/trellis/fixed_det.onnx");
+    if std::env::var_os("FLWRS_UPDATE").is_some() {
+        std::fs::write(&path, &bytes).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "FLWRS_UPDATE=1 rewrites it"
+    );
+}
+
+/// Execution groups: the same graph under different policies.
+#[cfg(feature = "ort")]
+mod groups {
+    use super::*;
+    use crate::graph::exec::{Plan, compile_probe};
+
+    /// An object's box and its classes.
+    type Item = (Vec<f32>, Vec<(u32, f32)>);
+
+    /// A frame of four colour bands, one per detection.
+    fn bands() -> Frame {
+        let (w, h) = (64usize, 16usize);
+        let colours = [[250, 10, 10], [10, 250, 10], [10, 10, 250], [200, 200, 20]];
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for _ in 0..h {
+            for x in 0..w {
+                rgb.extend_from_slice(&colours[x / 16]);
+            }
+        }
+        Frame::new(w as u32, h as u32, rgb).unwrap()
+    }
+
+    fn detector_of_bands() -> TestModel {
+        let mut rows = vec![];
+        for i in 0..4 {
+            let x = i as f32 * 16.0;
+            rows.extend([x + 2.0, 2.0, x + 14.0, 14.0, 0.9 - i as f32 * 0.05, 0.0]);
+        }
+        (
+            "det.onnx",
+            &[1, 3, 16, 64],
+            vec![("rows", vec![1, 4, 6], rows)],
+        )
+    }
+
+    /// The detector, and a mean-colour model on each object's crop.
+    fn setup(batch: Option<usize>) -> Files {
+        let f = files(&[detector_of_bands()]);
+        let path = f._dir.path().join("colour.onnx");
+        std::fs::write(&path, testing::mean_colour(batch, 8, 8)).unwrap();
+        let mut f = f;
+        f.files.insert("colour.onnx".into(), path);
+        f
+    }
+
+    fn graph(groups: Value, members: Value) -> Value {
+        let colour_pre = json!({"width": 8, "height": 8, "resize": "stretch", "color": "rgb",
+                                "dtype": "f32", "layout": "nchw", "scale": 0.00392156862});
+        json!({
+            "groups": groups,
+            "nodes": {
+                "camera": {"type": "source"},
+                "det": {"type": "model", "model": "det.onnx", "pre": pre(64, 16),
+                        "decode": {"type": "detections_e2e", "output": "rows"}},
+                "roi": {"type": "crop"},
+                "colour": {"type": "model", "model": "colour.onnx", "pre": colour_pre,
+                           "groups": members,
+                           "decode": {"type": "classify", "output": "y", "softmax": false, "topk": 3}}
+            },
+            "links": [
+                {"from": "camera.frame", "to": "det.frame"},
+                {"from": "camera.frame", "to": "roi.frame"},
+                {"from": "det.objects", "to": "roi.objects"},
+                {"from": "roi.regions", "to": "colour.frame"}
+            ]
+        })
+    }
+
+    fn policy(v: Value) -> Value {
+        json!([{"id": "g", "family": "execution", "policy": v}])
+    }
+
+    /// Per object in order: its box and its colour classes.
+    fn summary(plan: &mut Plan) -> Vec<Item> {
+        let tick = plan.tick(&bands());
+        assert!(tick.errors.is_empty(), "{:?}", tick.errors);
+        let det = &tick.results.iter().find(|(id, _)| id == "det").unwrap().1;
+        objects(det)
+            .iter()
+            .map(|o| {
+                let (_, r) = o.children.iter().find(|(id, _)| id == "colour").unwrap();
+                let Results::Classes(c) = r else {
+                    panic!("{r:?}")
+                };
+                (
+                    o.bbox.to_vec(),
+                    c.iter().map(|k| (k.class_id, k.confidence)).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_same(a: &[Item], b: &[Item], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}");
+        for (x, y) in a.iter().zip(b) {
+            assert_eq!(x.0, y.0, "{what}: boxes");
+            assert_eq!(x.1.len(), y.1.len(), "{what}");
+            for (p, q) in x.1.iter().zip(&y.1) {
+                assert_eq!(p.0, q.0, "{what}: classes");
+                assert!((p.1 - q.1).abs() < 1e-4, "{what}: {p:?} {q:?}");
+            }
+        }
+    }
+
+    fn plan(f: &Files, v: &Value, threads: usize) -> (Plan, Vec<String>) {
+        let (g, checked) = parse(v).unwrap();
+        compile(&g, &checked, &f.files, &execution(Runtime::Ort), threads).unwrap()
+    }
+
+    #[test]
+    fn every_mode_gives_the_same_results() {
+        let f = setup(None);
+        let (mut base, _) = plan(&f, &graph(json!([]), json!([])), 1);
+        let want = summary(&mut base);
+        assert_eq!(want.len(), 4);
+        // The bands differ, so a mix-up between items would show.
+        assert_ne!(want[0].1[0].0, want[1].1[0].0);
+        for p in [
+            json!({"mode": "sequential", "threads": 1}),
+            json!({"mode": "sequential", "threads": 2}),
+            json!({"mode": "parallel", "threads": 4}),
+            json!({"mode": "parallel", "threads": 2}),
+            json!({"mode": "batched", "threads": 2}),
+            json!({"mode": "batched"}),
+        ] {
+            let (mut plan, warnings) = plan(&f, &graph(policy(p.clone()), json!(["g"])), 4);
+            assert_eq!(warnings, Vec::<String>::new(), "{p}");
+            for _ in 0..3 {
+                assert_same(&want, &summary(&mut plan), &p.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn a_fixed_batch_model_runs_one_by_one_with_a_warning() {
+        let f = setup(Some(1));
+        let (mut base, _) = plan(&f, &graph(json!([]), json!([])), 1);
+        let want = summary(&mut base);
+        let v = graph(
+            policy(json!({"mode": "batched", "threads": 1})),
+            json!(["g"]),
+        );
+        let (mut batched, warnings) = plan(&f, &v, 2);
+        assert!(
+            warnings.iter().any(|w| w.contains("fixed batch size")),
+            "{warnings:?}"
+        );
+        assert_same(&want, &summary(&mut batched), "fixed batch");
+    }
+
+    #[test]
+    fn the_model_then_the_group_then_the_plugin() {
+        let f = setup(None);
+        let refused = |e: &Execution, v: &Value| {
+            let (g, checked) = parse(v).unwrap();
+            compile(&g, &checked, &f.files, e, 1).is_err()
+        };
+        let bad_plugin = Execution {
+            runtime: Some(Runtime::Ort),
+            provider: Some("NoSuchExecutionProvider".into()),
+            ..Execution::default()
+        };
+        // The plugin's provider alone doesn't exist.
+        assert!(refused(&bad_plugin, &graph(json!([]), json!([]))));
+        // The group's replaces it (for its member; the detector keeps it).
+        let mut v = graph(
+            policy(json!({"provider": "CPUExecutionProvider"})),
+            json!(["g"]),
+        );
+        assert!(refused(&bad_plugin, &v), "the detector has no group");
+        v["nodes"]["det"]["groups"] = json!(["g"]);
+        assert!(!refused(&bad_plugin, &v));
+        // The model's own wins over its group's.
+        let mut v = graph(policy(json!({"provider": "NoSuch"})), json!(["g"]));
+        assert!(refused(&execution(Runtime::Ort), &v));
+        v["nodes"]["colour"]["execution"] = json!({"provider": "CPUExecutionProvider"});
+        assert!(!refused(&execution(Runtime::Ort), &v));
+        // The group's allow_fallback takes effect.
+        let v = graph(
+            policy(json!({"provider": "NoSuch", "allow_fallback": true})),
+            json!(["g"]),
+        );
+        let (g, checked) = parse(&v).unwrap();
+        let (_, warnings) = compile(&g, &checked, &f.files, &execution(Runtime::Ort), 1).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("on the CPU instead")));
+    }
+
+    #[test]
+    fn the_groups_threads_must_fit_the_nodes() {
+        let f = setup(None);
+        let v = graph(policy(json!({"threads": 3})), json!(["g"]));
+        let (g, checked) = parse(&v).unwrap();
+        let problems = compile(&g, &checked, &f.files, &execution(Runtime::Ort), 2)
+            .err()
+            .unwrap();
+        assert!(problems[0].contains("add up to 3"), "{problems:?}");
+        assert!(compile(&g, &checked, &f.files, &execution(Runtime::Ort), 3).is_ok());
+        // Where the node's core count isn't known, nothing to hold it to.
+        assert!(compile_probe(&g, &checked, &f.files, &execution(Runtime::Ort), 1).is_ok());
+    }
+
+    #[test]
+    fn a_late_frame_skips_only_what_sampling_could_reuse() {
+        let f = setup(None);
+        let mut v = graph(
+            json!([
+                {"id": "first", "family": "execution", "policy": {"priority": 10}},
+                {"id": "later", "family": "execution", "policy": {"priority": 1}}
+            ]),
+            json!([]),
+        );
+        v["nodes"]["det"]["groups"] = json!(["later"]);
+        v["nodes"]["det"]["sampling"] = json!({"every_n_frames": 2});
+        v["nodes"]["colour"]["groups"] = json!(["first"]);
+        let frame = bands();
+        let run = |deterministic: bool| {
+            let (mut p, _) = plan(&f, &v, 2);
+            p.set_deterministic(deterministic);
+            // Frames a nanosecond apart: every frame is over its time.
+            (0..7)
+                .map(|i| {
+                    let tick = p.tick_at(&frame, i as f64 * 1e-9);
+                    (
+                        !tick.yielded.is_empty(),
+                        tick.timing.get("det").map_or(0, |t| t.runs),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        // Due on even frames. 0 runs (nothing to reuse); 2 yields; 4 runs
+        // (one skip in a row at most); 6 yields.
+        let live = run(false);
+        assert_eq!(
+            live,
+            vec![
+                (false, 1),
+                (false, 0),
+                (true, 0),
+                (false, 0),
+                (false, 1),
+                (false, 0),
+                (true, 0)
+            ]
+        );
+        // A file's run never yields: it must repeat exactly.
+        assert!(run(true).iter().all(|(yielded, _)| !yielded));
+    }
+
+    #[test]
+    fn a_core_budget_caps_the_session() {
+        let f = setup(None);
+        let v = graph(
+            json!([
+                {"id": "g", "family": "execution", "policy": {"mode": "parallel", "threads": 2}},
+                {"id": "cap", "family": "resources", "policy": {"limits": {"cpu": 2}}}
+            ]),
+            json!(["g", "cap"]),
+        );
+        let (mut p, _) = plan(&f, &v, 4);
+        assert_eq!(summary(&mut p).len(), 4);
+        let bad = graph(
+            json!([
+                {"id": "g", "family": "execution", "policy": {"threads": 3}},
+                {"id": "cap", "family": "resources", "policy": {"limits": {"cpu": 2}}}
+            ]),
+            json!(["g", "cap"]),
+        );
+        let problems = parse(&bad).map(|_| ()).unwrap_err();
+        assert!(problems.iter().any(|p| p.contains("limits.cpu is 2")));
     }
 }

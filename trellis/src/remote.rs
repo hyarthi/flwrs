@@ -76,9 +76,17 @@ pub struct RemoteConfigurator {
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Auth {
-    Basic { username: String, password: Option<String> },
-    Bearer { token: String },
-    Mtls { cert: PathBuf, key: PathBuf },
+    Basic {
+        username: String,
+        password: Option<String>,
+    },
+    Bearer {
+        token: String,
+    },
+    Mtls {
+        cert: PathBuf,
+        key: PathBuf,
+    },
 }
 
 impl RemoteLaunch {
@@ -91,9 +99,14 @@ impl RemoteLaunch {
         for s in self.start.iter_mut().chain(self.stop.iter_mut()) {
             env(s)?;
         }
-        for s in [&mut self.host, &mut self.advertise, &mut self.id, &mut self.token]
-            .into_iter()
-            .flatten()
+        for s in [
+            &mut self.host,
+            &mut self.advertise,
+            &mut self.id,
+            &mut self.token,
+        ]
+        .into_iter()
+        .flatten()
         {
             env(s)?;
         }
@@ -208,8 +221,11 @@ pub(crate) fn configure_remote(
             text.chars().take(500).collect::<String>()
         )]);
     }
-    let response: RemoteResponse = serde_json::from_slice(&body)
-        .map_err(|e| vec![format!("{url}: the answer isn't a configurator response: {e}")])?;
+    let response: RemoteResponse = serde_json::from_slice(&body).map_err(|e| {
+        vec![format!(
+            "{url}: the answer isn't a configurator response: {e}"
+        )]
+    })?;
     let download = |url: &str, dest: &Path, max: u64| -> Result<(), String> {
         on_thread(endpoint, limits.timeout, |client, runtime| {
             runtime.block_on(async {
@@ -251,9 +267,14 @@ fn on_thread<T: Send>(
     })
 }
 
-fn authorize(request: reqwest::RequestBuilder, endpoint: &RemoteConfigurator) -> reqwest::RequestBuilder {
+fn authorize(
+    request: reqwest::RequestBuilder,
+    endpoint: &RemoteConfigurator,
+) -> reqwest::RequestBuilder {
     match &endpoint.auth {
-        Some(Auth::Basic { username, password }) => request.basic_auth(username, password.as_deref()),
+        Some(Auth::Basic { username, password }) => {
+            request.basic_auth(username, password.as_deref())
+        }
         Some(Auth::Bearer { token }) => request.bearer_auth(token),
         _ => request,
     }
@@ -335,7 +356,15 @@ mod tests {
         assert_eq!(remote.hub_host(), "127.0.0.1");
         assert_eq!(
             remote.command(&remote.start, 7401, "edge", "t"),
-            ["start", "--host", "127.0.0.1", "--port", "7401", "--id", "edge"]
+            [
+                "start",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "7401",
+                "--id",
+                "edge"
+            ]
         );
         assert_eq!(
             remote.configurator.unwrap().auth,

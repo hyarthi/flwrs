@@ -327,6 +327,15 @@ pub(super) mod tests {
             }
         }
 
+        /// Reads to the end of the stream; what was left as text.
+        pub(crate) async fn rest(&mut self) -> String {
+            use futures_util::StreamExt;
+            while let Some(Ok(chunk)) = self.body.next().await {
+                self.buffer.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            std::mem::take(&mut self.buffer)
+        }
+
         /// The next event (keep-alive comments skipped): its name and data.
         pub(crate) async fn next_any(&mut self) -> (String, Value) {
             let wait = async {

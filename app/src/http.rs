@@ -1,6 +1,6 @@
 use crate::modules::api_error::{ApiError, api_error};
 use crate::modules::auth::api::SecuritySchemes;
-use crate::modules::{auth, director, lua_api, plugin, scene, server_config, status_api};
+use crate::modules::{auth, director, hub, lua_api, plugin, scene, server_config, status_api};
 use axum::Router;
 use axum::http::StatusCode;
 use flwrs_core::http::{HttpServer, ServerConfig};
@@ -19,6 +19,11 @@ static HTTP_SERVER: LazyLock<HttpServer> = LazyLock::new(|| {
 /// The management API (under `/api`): everything behind the auth guard, but
 /// for the public auth routes (login, logout, providers).
 fn api(auth: &'static auth::Auth, stopping: CancellationToken) -> Router {
+    let live = scene::api_live::LiveState {
+        scenes: scene::service(),
+        feeds: hub::get().live(),
+        stopping: stopping.clone(),
+    };
     let stream = scene::api_stream::StreamState {
         scenes: scene::service(),
         stopping,
@@ -29,6 +34,7 @@ fn api(auth: &'static auth::Auth, stopping: CancellationToken) -> Router {
         .merge(scene::api::Api::build_router(scene::service()))
         .merge(scene::api_stream::router(stream.clone()))
         .merge(scene::api_scene_stream::router(stream))
+        .merge(scene::api_live::router(live))
         .merge(plugin::api::Api::build_router(plugin::service()))
         .merge(status_api::Api::build_router(director::init()))
         .merge(lua_api::router())
@@ -94,6 +100,7 @@ pub fn server() -> &'static HttpServer {
         (path = "/api/scenes", api = scene::api_scene_stream::Api),
         (path = "/api/scenes", api = scene::api_draft::Api),
         (path = "/api/scenes", api = scene::api_mapping::Api),
+        (path = "/api/scenes", api = scene::api_live::Api),
         (path = "/api/plugins", api = plugin::api::Api),
         (path = "/api/plugins", api = scene::api_usage::Api),
         (path = "/api/status", api = status_api::Api),

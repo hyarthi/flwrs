@@ -10,6 +10,7 @@
 //! - [`lua`] (feature `lua`): the Lua 5.4 sandbox, its limits, and
 //!   schema-guided conversion between Lua and values.
 
+pub mod groups;
 pub mod json;
 #[cfg(feature = "lua")]
 pub mod lua;

@@ -125,6 +125,8 @@ pub struct FrameFacts {
     pub errors: Vec<String>,
     /// What the rules saw happen on this frame.
     pub events: Vec<RuleEvent>,
+    /// What this frame would send to the hub, as JSON.
+    pub emitted: Vec<Value>,
 }
 
 fn name(class_id: u32, class_name: &Option<String>) -> String {
@@ -198,6 +200,9 @@ fn result_text(r: &Results) -> String {
 fn object_facts(node: &str, index: usize, o: &Object, layouts: &Layouts) -> ObjectFacts {
     let (mut lines, mut children) = (vec![], vec![]);
     for (child, result) in &o.children {
+        if child == crate::results::HAND_POSE {
+            continue;
+        }
         match result {
             Results::Objects(list) => {
                 if list.is_empty() {
@@ -300,6 +305,13 @@ pub fn text_lines(f: &FrameFacts) -> Vec<String> {
             .iter()
             .map(|e| format!("  event: {}", event_line(e))),
     );
+    out.extend(f.emitted.iter().map(|e| {
+        let objects = e["objects"].as_array().map_or(0, Vec::len);
+        format!(
+            "  emit: {} ({objects} objects)",
+            e["event"].as_str().unwrap_or("?")
+        )
+    }));
     out
 }
 
@@ -347,6 +359,7 @@ pub fn to_json(f: &FrameFacts) -> Value {
         "notes": f.notes,
         "errors": f.errors,
         "events": f.events,
+        "emitted": f.emitted,
     })
 }
 

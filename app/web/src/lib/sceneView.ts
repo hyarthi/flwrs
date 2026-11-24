@@ -3,6 +3,7 @@
 // scene's draft (started on the first edit); submit commits it to live.
 
 import { api } from './api';
+import type { NodeDevice, NodeThreads, SceneGroup } from './groups';
 import type { SceneState } from './scenes';
 
 export type NodeType = 'SOURCE' | 'TRANSFORM' | 'SINK';
@@ -26,6 +27,8 @@ export interface Scene {
   enabled: boolean;
   max_hops: number | null;
   defaults: SceneDefaults;
+  /** Left out by servers without groups. */
+  groups?: SceneGroup[];
   revision: number;
   create_time: number;
   update_time: number;
@@ -43,6 +46,8 @@ export interface GraphNode {
   has_token: boolean;
   launch_args_secrets: Record<string, boolean>;
   position: Position | null;
+  /** Where the inner nodes of its graph settings sit: setting → inner node → position. */
+  inner_layout?: Record<string, Record<string, Position>>;
   create_time: number;
   update_time: number;
 }
@@ -138,6 +143,7 @@ export interface Draft {
     name: string;
     max_hops: number | null;
     defaults: SceneDefaults;
+    groups?: SceneGroup[];
     change: Change;
     conflict: Conflict | null;
   };
@@ -147,14 +153,28 @@ export interface Draft {
   /** What undo would take back / redo make again; `null` = nothing. */
   undo: string | null;
   redo: string | null;
+  /** A submit its pre-flight check held back; live is unchanged. */
+  submit: DraftSubmit | null;
   create_time: number;
   update_time: number;
+}
+
+export interface DraftSubmit {
+  state: 'WAITING' | 'FAILED';
+  message: string | null;
+  problems: PreflightIssue[];
+  submit_time: number | null;
+  retry: { attempt: number; max_attempts: number; next_attempt_time: number | null } | null;
 }
 
 export interface Check {
   launchable: boolean;
   problems: string[];
   warnings: string[];
+  /** By node id: the core count each local node that takes one gets, and from where. */
+  threads?: Record<string, NodeThreads>;
+  /** By node id: the devices each local node claims. */
+  devices?: Record<string, NodeDevice[]>;
 }
 
 /** The `scene` event. */
@@ -233,6 +253,38 @@ export interface SceneStatusEvent {
   errors: string[];
   max_hops: number | null;
   nodes: NodeReport[];
+  /** The last pre-flight check's problems (`WAITING`, `FAILED`). */
+  preflight: PreflightIssue[];
+  /** Where the retries stand (`WAITING`). */
+  preflight_retry: { attempt: number; max_attempts: number; next_attempt_time: number | null } | null;
+  /** An update the running scene couldn't take: it keeps its previous graph. */
+  failed_update: { errors: string[]; problems: PreflightIssue[]; fail_time: number } | null;
+}
+
+export interface PreflightIssue {
+  node_id: string;
+  message: string;
+  retryable: boolean;
+}
+
+/** `POST …/preflight`: what the nodes' checks found on this machine. */
+export interface PreflightRun {
+  ok: boolean;
+  permanent: boolean;
+  nodes: {
+    node_id: string;
+    plugin_id: string;
+    checked: boolean;
+    skipped: string | null;
+    problems: { message: string; retryable: boolean }[];
+    warnings: string[];
+  }[];
+}
+
+/** Runs the scene's pre-flight checks (of its draft, if asked); starts nothing. */
+export function runPreflight(sceneId: string, draft: boolean): Promise<PreflightRun> {
+  const query = draft ? '?draft=true' : '';
+  return api<PreflightRun>(`/scenes/by-id/${encodeURIComponent(sceneId)}/preflight${query}`, { method: 'POST' });
 }
 
 /** A registered plugin (`PluginInfo`). */
@@ -251,7 +303,7 @@ export interface Plugin {
    * What a node gets for each run-time setting it leaves out, shaped like a
    * node's `runtime` (manifest, else built-in, else the server's). Absent:
    * `queue.when_full` (block; drop newest on a cycle), `queue.durable` (the
-   * scene's default, else off), `max_restarts` (no limit), `threads` (the
+   * scene's default, else off), `max_restarts` (5 until a critical or just-updated node first runs, otherwise no limit; -1 = try forever), `threads` (the
    * plugin decides).
    */
   node_defaults: Record<string, unknown>;
@@ -277,7 +329,7 @@ export const pluginIconUrl = (id: string) => `/api/plugins/by-id/${part(id)}/ui/
 
 /** A package file the launch-args schema names (text), cached per plugin version; `null` if it can't be had. */
 const schemaFileCache = new Map<string, Promise<string | null>>();
-function getSchemaFile(kind: 'definitions' | 'templates', pluginId: string, version: string, path: string): Promise<string | null> {
+function getSchemaFile(kind: 'definitions' | 'templates' | 'graph-catalogs', pluginId: string, version: string, path: string): Promise<string | null> {
   const key = `${kind}:${pluginId}@${version}:${path}`;
   if (!schemaFileCache.has(key)) {
     const url = `/api/plugins/by-id/${part(pluginId)}/${kind}/${path.split('/').map(part).join('/')}`;
@@ -297,6 +349,9 @@ export const getDefinitions = (pluginId: string, version: string, path: string) 
 /** A field's template (`x-flwrs-template`): what an empty field is filled with. */
 export const getTemplate = (pluginId: string, version: string, path: string) => getSchemaFile('templates', pluginId, version, path);
 
+/** A graph setting's catalog (`x-flwrs-graph`), as text. */
+export const getGraphCatalog = (pluginId: string, version: string, path: string) => getSchemaFile('graph-catalogs', pluginId, version, path);
+
 /** The payload schemas a node of the plugin has with these launch args. */
 export const getNodeSchemas = (pluginId: string, launchArgs: unknown) =>
   api<{ in: SchemaField[] | null; out: SchemaField[] | null }>(`/plugins/by-id/${part(pluginId)}/node-schemas`, {
@@ -312,7 +367,8 @@ export const updateDraftNode = (
   id: string,
   nodeId: string,
   body: { name: string | null; plugin_id: string; config: Record<string, unknown> },
-) => api<GraphNode>(`${draft(id)}/nodes/by-id/${part(nodeId)}`, { method: 'PUT', json: body });
+  group?: UndoGroup,
+) => api<GraphNode>(`${draft(id)}/nodes/by-id/${part(nodeId)}`, { method: 'PUT', json: body, headers: undoHeaders(group) });
 
 /** A node's uploads: the draft's (if the scene has one) or live's. */
 export const listUploads = (id: string, nodeId: string, inDraft: boolean) =>
@@ -370,8 +426,12 @@ export const removeDraftEdge = (id: string, edgeId: string) =>
 export const restoreDraftEdge = (id: string, edgeId: string) =>
   api<unknown>(`${draft(id)}/edges/by-id/${part(edgeId)}/restore`, { method: 'POST' });
 
-export const updateDraftSettings = (id: string, body: { name: string; max_hops: number | null; defaults: SceneDefaults }) =>
-  api<Draft>(`${draft(id)}/settings`, { method: 'PUT', json: body });
+/** The scene's settings in the draft; `groups` left out = kept. */
+export const updateDraftSettings = (
+  id: string,
+  body: { name: string; max_hops: number | null; defaults: SceneDefaults; groups?: SceneGroup[] },
+  group?: UndoGroup,
+) => api<Draft>(`${draft(id)}/settings`, { method: 'PUT', json: body, headers: undoHeaders(group) });
 export const discardDraft = (id: string) => api<null>(draft(id), { method: 'DELETE' });
 export const rebaseDraft = (id: string) =>
   api<{ taken_live: string[]; conflicts: string[]; dropped_edges: string[] }>(`${draft(id)}/rebase`, { method: 'POST' });
@@ -383,6 +443,17 @@ export const submitDraft = (id: string, baseRevision: number, disable: boolean) 
 /** Places nodes and edge boxes (live and draft alike; layout isn't a change). */
 export const setLayout = (id: string, nodes: Record<string, Position | null>, edges: Record<string, Position | null> = {}) =>
   api<null>(`${scene(id)}/layout`, { method: 'PATCH', json: { nodes, edges } });
+
+/** Places a graph setting's inner nodes (`null` forgets one). Layout: nothing else changes. */
+export const setInnerLayout = (id: string, nodeId: string, field: string, places: Record<string, Position | null>) =>
+  api<null>(`${scene(id)}/layout`, { method: 'PATCH', json: { inner: { [nodeId]: { [field]: places } } } });
+
+/** What a node's configurator says about the uploads these launch args name; nothing is stored. */
+export const describeNode = (id: string, nodeId: string, draft: boolean, launchArgs: Record<string, unknown>) =>
+  api<{ values: Record<string, unknown> | null }>(`${scene(id)}/nodes/by-id/${part(nodeId)}/describe?draft=${draft}`, {
+    method: 'POST',
+    json: { launch_args: launchArgs },
+  });
 
 /** Replaces an edge in the draft. */
 export const updateDraftEdge = (

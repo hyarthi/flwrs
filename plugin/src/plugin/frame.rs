@@ -11,8 +11,8 @@
 //! [`FrameHeader`]; its `code` says which message type the body holds.
 
 use crate::schema::protocol::{
-    Ack, Credit, ErrorEvent, Event, Exit, FrameHeader, Initialize, InitializeResponse, LogEvent,
-    Nack, Ping, Pong, Shutdown, msg_code::Enum as MsgCode,
+    Ack, Credit, ErrorEvent, Event, Exit, FrameHeader, Initialize, InitializeResponse, LiveFeed,
+    LiveFeedControl, LogEvent, Nack, Ping, Pong, Shutdown, msg_code::Enum as MsgCode,
 };
 use bytes::Bytes;
 use prost::Message;
@@ -152,6 +152,8 @@ wire_message! {
     Credit => Credit,
     Ping => Ping,
     Pong => Pong,
+    LiveFeed => LiveFeed,
+    LiveFeedControl => LiveFeedControl,
 }
 
 /// A header with only a code (every frame except data events).

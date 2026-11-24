@@ -151,6 +151,63 @@ pub fn constant_outputs(
     model(graph, metadata)
 }
 
+/// The mean colour of an image: `y` of shape `[batch, 3]` from `x` of shape
+/// `[batch, 3, height, width]`. With `batch` `None` the batch is a dynamic
+/// dimension, so one run can take several images.
+pub fn mean_colour(batch: Option<usize>, height: usize, width: usize) -> Vec<u8> {
+    let dim = |d: Option<usize>| match d {
+        Some(d) => Message::default().int(1, d as i64),
+        None => Message::default().str(2, "batch"),
+    };
+    let info = |name: &str, dims: &[Option<usize>]| {
+        let mut shape = Message::default();
+        for d in dims {
+            shape = shape.msg(1, dim(*d));
+        }
+        let tensor_type = Message::default().int(1, FLOAT).msg(2, shape);
+        Message::default()
+            .str(1, name)
+            .msg(2, Message::default().msg(1, tensor_type))
+    };
+    let axis = Message::default().str(1, "axis").int(3, 1).int(20, 2);
+    let graph = Message::default()
+        .str(2, "mean_colour")
+        .msg(1, node("GlobalAveragePool", &["x"], "pooled", vec![]))
+        .msg(1, node("Flatten", &["pooled"], "y", vec![axis]))
+        .msg(11, info("x", &[batch, Some(3), Some(height), Some(width)]))
+        .msg(12, info("y", &[batch, Some(3)]));
+    model(graph, &[])
+}
+
+/// A gesture embedder's shape: inputs `hand`, `handedness`, `world_hand`,
+/// and a fixed output `embedding` of `len` values (all inputs used).
+#[cfg(feature = "ort")]
+pub fn hand_embedder(len: usize) -> Vec<u8> {
+    let keepdims = || Message::default().str(1, "keepdims").int(3, 0).int(20, 2);
+    let graph = Message::default()
+        .str(2, "embedder")
+        .msg(1, node("ReduceMean", &["hand"], "m1", vec![keepdims()]))
+        .msg(
+            1,
+            node("ReduceMean", &["handedness"], "m2", vec![keepdims()]),
+        )
+        .msg(
+            1,
+            node("ReduceMean", &["world_hand"], "m3", vec![keepdims()]),
+        )
+        .msg(1, node("Add", &["m1", "m2"], "m12", vec![]))
+        .msg(1, node("Add", &["m12", "m3"], "sum", vec![]))
+        .msg(1, node("Mul", &["sum", "zero"], "nothing", vec![]))
+        .msg(1, node("Add", &["fixed", "nothing"], "embedding", vec![]))
+        .msg(5, tensor("zero", &[], &[0.0]))
+        .msg(5, tensor("fixed", &[1, len], &vec![0.5; len]))
+        .msg(11, value_info("hand", FLOAT, &[1, 21, 3]))
+        .msg(11, value_info("handedness", FLOAT, &[1, 1]))
+        .msg(11, value_info("world_hand", FLOAT, &[1, 21, 3]))
+        .msg(12, value_info("embedding", FLOAT, &[1, len]));
+    model(graph, &[])
+}
+
 /// A deterministic pseudo-random generator (xorshift), for fuzz tests.
 pub struct Rng(u64);
 

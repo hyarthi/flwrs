@@ -4,8 +4,9 @@
 
 use crate::modules::node_config::SceneDefaults;
 use crate::modules::scene::service::query_sqlite::Store;
-use crate::modules::scene::service::{EdgeRow, NodeRow, NodeUpload};
+use crate::modules::scene::service::{EdgeRow, NodeRow, NodeUpload, Scene};
 use chrono::Local;
+use flwrs_types::groups::Group;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{AssertSqlSafe, FromRow, Sqlite, SqliteConnection};
 
@@ -18,10 +19,110 @@ pub(crate) struct DraftRow {
     pub max_hops: Option<u32>,
     #[sqlx(json)]
     pub defaults: SceneDefaults,
+    #[sqlx(json)]
+    pub groups: Vec<Group>,
     pub base_hash: String,
     pub conflict: Option<String>,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
+    /// A submit held back by its pre-flight check: `WAITING` or `FAILED`.
+    pub submit_state: Option<String>,
+    /// Its problems (`PreflightIssue`s, JSON).
+    pub submit_problems: Option<String>,
+    pub submit_message: Option<String>,
+    pub submit_time: Option<chrono::DateTime<Local>>,
+    /// The wait in progress.
+    pub submit_id: Option<String>,
+}
+
+/// Resets a submit's mark (in an `UPDATE scene_drafts SET …`).
+const CLEAR_SUBMIT: &str = "submit_state = NULL, submit_problems = NULL, submit_message = NULL, submit_time = NULL, submit_id = NULL";
+
+/// Clears the mark. Returns whether there was one.
+pub(crate) async fn clear_submit(
+    conn: &mut SqliteConnection,
+    scene_id: &str,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(AssertSqlSafe(format!(
+        "UPDATE scene_drafts SET {CLEAR_SUBMIT} WHERE scene_id = $1 AND submit_state IS NOT NULL"
+    )))
+    .bind(scene_id)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
+pub(crate) async fn mark_waiting(
+    conn: &mut SqliteConnection,
+    scene_id: &str,
+    id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE scene_drafts SET submit_state = 'WAITING', submit_problems = '[]', \
+             submit_message = NULL, submit_time = $1, submit_id = $2 WHERE scene_id = $3",
+    )
+    .bind(Local::now())
+    .bind(id)
+    .bind(scene_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// The problems of the wait `id`, if it's still the draft's.
+pub(crate) async fn set_wait_problems(
+    conn: &mut SqliteConnection,
+    scene_id: &str,
+    id: &str,
+    problems: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE scene_drafts SET submit_problems = $1 WHERE scene_id = $2 AND submit_id = $3",
+    )
+    .bind(problems)
+    .bind(scene_id)
+    .bind(id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Ends the wait `id` as `FAILED`, if it's still the draft's.
+pub(crate) async fn mark_failed(
+    conn: &mut SqliteConnection,
+    scene_id: &str,
+    id: &str,
+    problems: &str,
+    message: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE scene_drafts SET submit_state = 'FAILED', submit_problems = $1, submit_message = $2, \
+             submit_time = $3, submit_id = NULL WHERE scene_id = $4 AND submit_id = $5",
+    )
+    .bind(problems)
+    .bind(message)
+    .bind(Local::now())
+    .bind(scene_id)
+    .bind(id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Every `WAITING` mark becomes `FAILED` (at start-up).
+pub(crate) async fn fail_all_waiting(
+    conn: &mut SqliteConnection,
+    message: &str,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE scene_drafts SET submit_state = 'FAILED', submit_message = $1, submit_time = $2, \
+             submit_id = NULL WHERE submit_state = 'WAITING'",
+    )
+    .bind(message)
+    .bind(Local::now())
+    .execute(conn)
+    .await?
+    .rows_affected())
 }
 
 /// A draft node's or edge's own columns.
@@ -45,36 +146,37 @@ pub(crate) async fn get(
         .await
 }
 
+/// A draft of `scene`'s settings as they are now.
 pub(crate) async fn insert(
     conn: &mut SqliteConnection,
-    scene_id: &str,
-    base_revision: i64,
-    name: &str,
-    max_hops: Option<u32>,
-    defaults: &SceneDefaults,
+    scene: &Scene,
     base_hash: &str,
 ) -> Result<DraftRow, sqlx::Error> {
     sqlx::query_as::<Sqlite, DraftRow>(
-        "INSERT INTO scene_drafts (scene_id, base_revision, \"name\", max_hops, defaults, base_hash) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
+        "INSERT INTO scene_drafts (scene_id, base_revision, \"name\", max_hops, defaults, \"groups\", base_hash) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
     )
-    .bind(scene_id)
-    .bind(base_revision)
-    .bind(name)
-    .bind(max_hops)
-    .bind(sqlx::types::Json(defaults))
+    .bind(&scene.id)
+    .bind(scene.revision)
+    .bind(&scene.name)
+    .bind(scene.max_hops)
+    .bind(sqlx::types::Json(&scene.defaults))
+    .bind(sqlx::types::Json(&scene.groups))
     .bind(base_hash)
     .fetch_one(conn)
     .await
 }
 
-/// Marks the draft as changed now, and records its state for undo.
+/// Marks the draft as changed now (a submit's mark no longer applies), and
+/// records its state for undo.
 pub(crate) async fn touch(conn: &mut SqliteConnection, scene_id: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE scene_drafts SET update_time = $1 WHERE scene_id = $2")
-        .bind(Local::now())
-        .bind(scene_id)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE scene_drafts SET update_time = $1, {CLEAR_SUBMIT} WHERE scene_id = $2"
+    )))
+    .bind(Local::now())
+    .bind(scene_id)
+    .execute(&mut *conn)
+    .await?;
     super::history::record(conn, scene_id).await
 }
 
@@ -84,14 +186,16 @@ pub(crate) async fn set_settings(
     name: &str,
     max_hops: Option<u32>,
     defaults: &SceneDefaults,
+    groups: &[Group],
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE scene_drafts SET \"name\" = $1, max_hops = $2, defaults = $3, update_time = $4 \
-         WHERE scene_id = $5",
-    )
+    sqlx::query(AssertSqlSafe(format!(
+        "UPDATE scene_drafts SET \"name\" = $1, max_hops = $2, defaults = $3, \"groups\" = $4, update_time = $5, \
+             {CLEAR_SUBMIT} WHERE scene_id = $6"
+    )))
     .bind(name)
     .bind(max_hops)
     .bind(sqlx::types::Json(defaults))
+    .bind(sqlx::types::Json(groups))
     .bind(Local::now())
     .bind(scene_id)
     .execute(conn)

@@ -71,7 +71,7 @@ The executable is made executable when the package is unpacked; other permission
 | `launch_args_schema` | no | A JSON Schema (draft 2020-12) of a node's settings. External `$ref`s aren't resolved. |
 | `launch_args_style` | no | `flags` (default; a node's settings are a JSON object) or `positional` (a list of strings, passed as they are; no annotations). |
 | `payload_schemas` | by type | `in` for a SINK, `out` for a SOURCE, both for a TRANSFORM. Each is either a path to a `SchemaDefinition` in proto3 JSON (`{"fields": [{"key": "url", "type": "STRING"}]}`), or `{"from_launch_args": "<JSON pointer>", "default": "<path>"?}`: the node's own schema, from its settings ([section 3.5](#35-per-node-payload-schemas)). The plugin MUST declare exactly the schemas in effect in `Initialize`. |
-| `runtime_defaults` | no | Defaults for the node's runtime settings (timeouts, restarts, queue, delivery); same keys as a node's `config.runtime`. |
+| `runtime_defaults` | no | Defaults for the node's runtime settings (timeouts, restarts, queue, delivery, `is_critical_path`); same keys as a node's `config.runtime`. `is_critical_path` says whether a node of this plugin is critical unless the user changes it (default `false`). When a critical node fails for good, the scene goes to `FAILED`. Any other failed node is marked `FAILED` and taken offline: producers stop routing to it, what's queued for it is kept, the scene runs on, and the next reload relaunches it. |
 | `threads` | no | How the plugin takes a **core count**: `{"via": "arg" \| "env", "name", "value"?}`, e.g. `{"via": "arg", "name": "threads"}` (the Rust SDK's `--threads`), `{"via": "env", "name": "GOMAXPROCS"}`, or `{"via": "env", "name": "JAVA_TOOL_OPTIONS", "value": "-XX:ActiveProcessorCount={n}"}` (`value` is a template, default `{n}`). See [section 5.5](#55-the-core-count). A name a launch arg also uses, a bootstrap argument, or an `FLWRS_*` variable is refused. |
 | `configurator` | no | `{"executable", "fields"}`: a program in the package that sets some of a node's settings from its others, e.g. an out schema derived from an OpenAPI document ([section 3.6](#36-configured-settings-the-configurator)). A remote plugin definition gives only `fields` (its nodes' endpoints run it, [section 4.1](#41-configuring-a-remote-node)). Version 2 only. |
 | `ui` | no | How a UI presents the plugin: `icon` (an `.svg` or `.png` in the package), `categories` (free tags, 1 to 64 characters, no duplicates), `color` (`#RRGGBB`), `docs` (a Markdown file in the package). |
@@ -129,13 +129,66 @@ On a string property: `{"language": "lua", "params": [names], "definitions"?: "<
 
 ### 3.4 Presentation hints
 
-On any property, all optional: `x-flwrs-group` (a section name), `x-flwrs-order` (an integer), `x-flwrs-advanced` (collapsed by default), `x-flwrs-widget` (`duration`, `cron`, `file-path` or `code`), `x-flwrs-platforms` and `x-flwrs-template` (both below). Standard keywords (`title`, `description`, `default`, `enum`, `minimum`, `format`, …) are used as they are. An unknown `x-flwrs-*` keyword is a warning at upload, and ignored.
+On any property, all optional: `x-flwrs-group` (a section name), `x-flwrs-order` (an integer), `x-flwrs-advanced` (collapsed by default), `x-flwrs-widget` (`duration`, `cron`, `file-path` or `code`), `x-flwrs-platforms`, `x-flwrs-template` and `x-flwrs-graph` (below). Standard keywords (`title`, `description`, `default`, `enum`, `minimum`, `format`, …) are used as they are. An unknown `x-flwrs-*` keyword is a warning at upload, and ignored.
 
 **Platforms:** `x-flwrs-platforms: ["macos", "linux-aarch64"]` on any property, nested ones included, lists the platforms the setting applies to: an OS, or `<os>-<arch>`, in the manifest's notation. An editor hides the setting on other platforms for local nodes (a value already set stays visible, so it can be cleared), and never for remote nodes, which run elsewhere. The server doesn't refuse a value set on another platform, since scenes move between servers: its scene check warns about it, and the plugin decides what it means. A server that doesn't know the keyword warns about it at upload, and ignores it.
 
 **Templates:** `x-flwrs-template: "<file in the package>"` on a property names a file that an editor puts in the field while it's empty: a starting point the user edits, such as a sample API document, a script, or the payload schemas a script expects. For a property whose value may be a string the file is that text (UTF-8); for any other (an object, a list, a number) it's the value as JSON, and a package whose JSON template doesn't parse is refused. Give the fields that work together templates that fit each other (a script and the schemas it reads and writes). It's only a suggestion: the server never applies it (a node that leaves the field out gets the schema's `default`, or nothing), and the plugin never sees it unless the user saves it as the field's value. Write it so it works as it is, if it's saved unchanged. The server serves only the files the schema names this way (`GET /api/plugins/by-id/{id}/templates/{path}`), as text. A server that doesn't know the keyword warns about it at upload, and ignores it.
 
+**Graphs:** `x-flwrs-graph: {"catalog": "<file in the package>"}` on a top-level object property says its value is a graph of typed nodes, and an editor shows it on a canvas instead of as a form. The value keeps one shape, `{"nodes": {"<id>": {"type": "<node type>", …}}, "links": [{"from": "<node>.<port>", "to": "<node>.<port>"}], "groups": […]}`, and stays a normal launch arg (delivered, exported, diffed and checked as any other). The catalog is JSON, checked at upload against the launch-args schema; unknown keys and broken references refuse the package:
+
+```json
+{
+  "format": 1,
+  "port_types": { "frame": { "title": "Frame" }, "regions": { "title": "Regions" }, "boxes": { "title": "Boxes" } },
+  "files_field": "files",
+  "connects": [{ "from": "regions", "to": "frame", "badge": "for each" }],
+  "node_types": {
+    "model": {
+      "title": "Model",
+      "category": "Models",
+      "settings": "#/$defs/model",
+      "max": 8,
+      "defaults": {},
+      "inputs": [{ "name": "frame", "type": "frame", "when": { "pointer": "/embedding", "present": false } }],
+      "outputs": [{ "type_from": { "pointer": "/decode/type", "map": { "yolo": "boxes" } } }],
+      "file_settings": ["model"],
+      "proposal": { "field": "model_info", "file_setting": "model", "at": "/proposal" },
+      "link_badges": [{ "label": "every {value} frames", "when": { "pointer": "/sampling/every_n", "present": true } }]
+    }
+  },
+  "groups": { "node_types": ["model"], "families": ["execution"], "settings": "#/$defs/group" }
+}
+```
+
+- `settings` is a reference `#/$defs/<name>` into the launch-args schema (there's no second copy), whose `type` property is the constant node type id.
+- A port has a fixed `type`, or `type_from` (a value in the node's settings, by JSON pointer, mapped to a port type). `name` defaults to the type's id. `when` shows a port only under a condition: `pointer` with exactly one of `present`, `equals`, `not_equals`, and optionally the `default` meant when the setting is left out.
+- A port always connects to its own type; `connects` adds links between different types, with an optional `badge` for such a link. An input takes one link, and graphs have no cycles.
+- `file_settings` are the node's settings naming one of the node's uploaded files. `files_field` is the top-level list upload setting they must be in; an editor adds a picked file to it.
+- `proposal` says where settings for a picked file come from: the configured `field` holds an object by file name, each entry its proposal at the pointer `at`. An editor asks with the configurator's describe mode (§3.6) and fills only settings that are empty.
+- `max` limits a type per graph; `defaults` start a new node; `link_badges` label the links into a node while their condition holds.
+- `live_setting` (optional) names the top-level setting that turns the plugin's live channels (`LIVE_FEED`, `docs/protocol.md`) on. While a running node announces none and no boolean in that setting is `true`, an editor says to turn it on there.
+- **Live stats on the canvas:** an editor shows a running node's first JSON live channel on its graph when the items have this shape: `{"interval_s": <seconds>, "nodes": {"<graph node id>": {"fps": …, "latency_ms": {"mean": …, "p95": …}, "errors": …, "runs": …, …}}, "<section>": {…}}`. Every number in a node's entry is listed for it (one level of `{mean, p95}`-style nesting flattened; `null` = no value); `fps`, `latency_ms` and `errors` make its short line, and `runs` or `fps` above 0 marks the links into it active (or out of it, into a node without an entry). A node without an entry is shown as not measured, never as zero. Every other top-level object is a summary section. Its first image channel is the preview.
+
+The server serves only the catalogs the schema names (`GET /api/plugins/by-id/{id}/graph-catalogs/{path}`), as text. Where the nodes sit on the canvas is layout, stored beside the node and not in its settings. A server that doesn't know the keyword warns about it at upload, and ignores it.
+
 **Listen addresses:** `x-flwrs-listen: true` on a top-level string property says its value is an address the plugin listens on, as `host:port` (its `default` is what the plugin binds when a node leaves it out). The server's scene check then warns when two local nodes would bind the same address (the same port, on the same address or a wildcard one: `0.0.0.0`, `::`; port 0 never clashes), within a scene or with the server's other enabled scenes. Only one of them could start listening. A server that doesn't know the keyword warns about it at upload, and ignores it.
+
+**Device claims:** `x-flwrs-device` on a top-level property says the setting names a device its node opens exclusively, such as a camera. The server's scene check then reports a **problem** (enabling is refused) when two local nodes claim the same device, within a scene or against the server's other enabled scenes.
+
+```json
+"input": {
+  "$ref": "#/$defs/input",
+  "x-flwrs-device": { "kind": "camera", "field": "device", "when": { "type": "camera" }, "default": "default" }
+}
+```
+
+- `kind` (required): the sort of device. Claims are only compared within a kind.
+- `field`: for an object setting, the key holding the device's name. Left out, the property's own string value is the name.
+- `when` (needs `field`): values the object's other keys must have for it to claim anything. Here, an `input` of another `type` (a folder of images) claims no device.
+- `default`: what a node claims when it names no device (here, "the default camera"). Without one, it claims nothing. An object setting that's left out entirely claims nothing either way.
+
+Devices are **compared by the string each node names**, exactly. The server doesn't know that `0`, `/dev/video0` and a camera's name may be one device, so two nodes naming it differently aren't reported: name a shared device the same way everywhere. Remote nodes claim nothing here, since their devices are on another machine. A server that doesn't know the keyword warns about it at upload, and ignores it.
 
 ### 3.5 Per-node payload schemas
 
@@ -177,6 +230,51 @@ Some settings follow from others: an HTTP source's out schema from the OpenAPI d
 5. The server checks the result: only the requested fields, files inside the folder, regular, and within `[scenes] max_upload_bytes`, and the node's settings with the configured values in place against the launch-args schema and the delivery rules. A configurator that takes longer than `[plugins] configure_timeout_ms` (30 s) is stopped, and `response.json` may hold at most `[plugins] configure_max_response_bytes` (1 MiB).
 
 A configurator must be deterministic for the same input and must not depend on the network: it runs whenever the server needs the result, possibly on another day. It's code from the package, like the plugin, run by the server with the same trust. `flwrs-trellis configure` runs one the way the server does, and `*.configure.toml` test files check it ([trellis](../trellis/README.md)).
+
+#### Pre-flight checks
+
+A configurator can also answer a narrower question, read-only: **can this node run on this machine right now?** (the camera exists, the GPU is there, the binary's libraries load). A plugin opts in:
+
+```json
+"configurator": { "executable": "bin/my-plugin-config", "fields": ["out_schema"], "preflight": true }
+```
+
+Only plugins declaring `preflight` are ever run in this mode, so an existing configurator never sees its arguments. A remote plugin definition can't declare it, and remote nodes are skipped: they run elsewhere, so this machine says nothing about them.
+
+**When it runs.** For every local node before a scene is **enabled** (in parallel, without holding up other changes to the server's scenes); for a draft's added and changed nodes **before it's committed** to an enabled scene; by the director before a scene **starts**, and on a **reload** for the nodes added or changed; and on request, starting nothing (`POST /api/scenes/by-id/{id}/preflight`, `…/nodes/by-id/{node_id}/preflight`, `?draft=true` for the scene's draft).
+
+**How it runs** is the contract above, with these differences (contract version 2):
+
+- The arguments are `--mode preflight --request request.json --response response.json`.
+- `request.json` has `"contract": 2` and `"mode": "preflight"`, and `launch_args` are the node's whole settings, **with** the configured fields (still without secrets, which arrive as they do for the plugin). `config/` holds their files.
+- `request.json` also has `releasing`: a list of `{"node_id", "launch_args"}` for the nodes of the **same plugin** in the **same scene** that are running now and that this change will stop (changed or removed nodes), secrets left out. It's empty for a scene that isn't running. Nodes that keep running aren't listed, and neither are other scenes' nodes, so a real clash with one of them still shows.
+- `response.json` is:
+  ```json
+  { "problems": [ { "message": "no camera at /dev/video0", "retryable": true } ],
+    "warnings": ["the GPU driver is older than recommended"] }
+  ```
+  No problems means the node can run. `retryable` (default `false`) says the problem may go away by itself, like a device still starting up. A check that finds problems may exit non-zero, as long as it writes them.
+- The run is read-only: a response with `values` or `files` in it is refused, as is any other unknown key. It must not change anything outside its temporary folder.
+
+**Resources held by `releasing` nodes.** The old version of a node may hold what the new one needs, such as a camera opened exclusively. Whatever a node in `releasing` holds **will be free when the new version starts** (the old process has fully stopped first), so the configurator MUST NOT report it as busy. It should check what it can without taking it (the device still exists, it supports the settings), and it MUST NEVER try to open it exclusively: that could disturb the running version. A configurator that ignores `releasing` still works, but may report its own running version as busy.
+
+A program that can't start, crashes, or writes no valid answer is a **permanent** problem carrying the end of its stderr (e.g. `GLIBC_2.38 not found`). One that exceeds `[plugins] configure_timeout_ms` is stopped, and that's a **retryable** problem.
+
+**What the server does with the answer.**
+
+- **Enabling a scene:** a permanent problem refuses it (`409`, the problems in `details`, as for the scene's check). Retryable problems don't: the scene goes to `WAITING`, with the problems in its status, and the nodes still failing are checked again with exponential backoff until they pass (the scene starts) or a limit is reached (`FAILED`).
+- **Submitting a draft to an enabled scene:** the checks run first, and live and the running scene aren't touched until they pass. If they pass, the draft is committed and the scene reloads. A permanent problem commits nothing: the submit answers `409`, and the draft is kept, marked `FAILED` with the problems. Retryable problems only: the submit answers `202`, the draft is marked `WAITING`, and the server retries; on a pass it commits, if the draft is unchanged and live hasn't moved on (otherwise the draft is marked `FAILED`, saying why). At the limit the draft is marked `FAILED`. Editing, rebasing, undoing or discarding the draft, submitting it again, or disabling or deleting the scene ends the wait and kills a check in progress. A wait doesn't survive a server restart: the draft is then `FAILED`, and live never changed. A submit that disables the scene, or a submit to a disabled scene, commits without a check (it runs at enable).
+- **Changes that bypass drafts** (direct node and edge edits, `graph/batch`, plugin upgrades) are committed first and reach the director afterwards. While a **running** scene waits for such a reload it keeps its previous graph: unchanged nodes aren't touched, and a changed node keeps its old settings until the check passes. If the check fails or reaches the limit, the scene **keeps running its previous graph** and stays `RUNNING`, with the failed update and its problems in its status (`failed_update`), until a later reload succeeds. A scene that isn't running goes to `FAILED`.
+
+The limits are `[director] preflight_retry` (`max_attempts` 10, `max_wait` `5m`, `initial_delay` `1s`, `max_delay` `30s`; whichever comes first), and a scene can override each in its `defaults.preflight_retry`.
+
+**What pre-flight can't prove.** For an exclusive resource held by the running version, a check can only say that the device exists and fits the settings: it can't take the lock while the old process has it. So a change can pass and the new version still fail after the switch-over, for example because the old process didn't fully exit or didn't release the device. The server stops the old process completely before launching the new one, and then doesn't try to recover: there's **no rollback**, and it doesn't kill or chase whatever holds the device beyond the normal shutdown. A node started by a reload that never reaches `Running` gets up to its `max_restarts`, or 5 restarts if it sets none (as does a critical node at any start), and then fails; `max_restarts: 0` fails it on the first failed launch and `-1` means try forever. If it's critical (`is_critical_path`), the **scene** goes to `FAILED`, naming the node and its last error, and the change stays committed. A person takes over: fix the cause, then disable and enable the scene, or submit a fix. If it isn't critical, only the node goes offline.
+
+**In a draft.** A local node's settings that its configurator refuses are still saved to a scene's draft, so unfinished work isn't lost. The configured fields are then left out (values from earlier settings would look valid), and the scene's check lists the configurator's errors as problems, which block enabling and submitting to an enabled scene. A save to the live graph is refused as before, and so is a value of the node's own for a configured field. A disabled scene may take such a node from its draft; a plugin upgrade then skips it (its configurator already refused these settings, none of its configured fields are set): it isn't run or checked again, takes the new version with its settings unchanged, and the check keeps reporting it. A node that was configured and that the new version's configurator refuses still refuses the upgrade.
+
+**Describe.** A configurator may declare `"describe": true` next to `fields`: a read-only mode for editors, asking what its configured fields would say about the node's uploaded files while the other settings may still be incomplete (a model picked for a node that has no decoder yet). It runs as above with `--mode describe`, `"contract": 3`, `"mode": "describe"`, and only the node's upload settings in `launch_args`. It answers `{"values": {"<configured field>": …}}`, or `{"errors": […]}`; other fields and returned files are refused, and nothing is stored. Only plugins declaring it are run this way (`POST /api/scenes/by-id/{id}/nodes/by-id/{node_id}/describe`), and a remote plugin definition can't declare it.
+
+**Saying where a problem is.** A configurator's error, warning or pre-flight message may start with `[at <JSON pointer>] `, the place in the launch args it's about (`[at /graph/nodes/det] the input isn't linked`). An editor marks that place and leaves the tag out; to everything else it's part of the text. For a graph setting, the pointers it understands are `/<setting>/nodes/<id>` and `/<setting>/links/<index>`.
 
 ## 4. Remote plugins
 
@@ -269,7 +367,7 @@ To stop a local plugin the hub sends `Shutdown` and waits for the process to exi
 
 ### 5.5 The thread count
 
-A node can say how many threads its plugin may use: `runtime.threads` in its config, else the manifest's `runtime_defaults.threads`, else the server's `[director] plugin_threads`. The number `n` means threads: `1` single-threaded, `2` two, and so on; `0` or nothing means the plugin decides (typically one thread per core). It lets a device or server keep cores reserved for other work.
+A node can say how many threads its plugin may use: `runtime.threads` in its config, else its share of a scene **core budget** (a `resources` group's `limits.cpu`, split among the members that set no value of their own), else the manifest's `runtime_defaults.threads`, else the server's `[director] plugin_threads`. The number `n` means threads: `1` single-threaded, `2` two, and so on; `0` or nothing means the plugin decides (typically one thread per core). It lets a device or server keep cores reserved for other work.
 
 The server delivers it only to a plugin whose manifest declares `threads`, the way it declares: as `--<name> <value>` after the bootstrap arguments (`arg`), or as the environment variable `<name>=<value>` (`env`), with `{n}` in `value` replaced by the number. Without the declaration, or for `0`, nothing is passed (the server's check warns about a node that sets a count its plugin wouldn't get). A plugin SHOULD honour it, but MAY treat it as a hint: what a "thread" is depends on the runtime (e.g., the Rust SDK maps `n` to tokio's main thread plus `n - 1` workers, and `1` to a single-threaded runtime; Go's `GOMAXPROCS` caps the threads running Go code; the JVM's `-XX:ActiveProcessorCount` sizes its pools).
 

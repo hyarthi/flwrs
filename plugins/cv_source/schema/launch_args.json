@@ -39,8 +39,18 @@
               },
               {
                 "$ref": "#/$defs/lua"
+              },
+              {
+                "$ref": "#/$defs/emit"
               }
             ]
+          }
+        },
+        "groups": {
+          "description": "Execution and resource groups of the model nodes; a model names its own in groups.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/group"
           }
         },
         "links": {
@@ -69,10 +79,13 @@
         "nodes"
       ],
       "title": "Model graph",
-      "description": "The models and how they link: nodes (source, model, crop, filter, tracker, rule, lua) with typed ports, and links from an output to an input (<node>.<port>). A crop node's regions linked to a model's frame run the model once per region.",
+      "description": "The models and how they link: nodes (source, model, crop, filter, tracker, rule, lua, emit) with typed ports, and links from an output to an input (<node>.<port>). A crop node's regions linked to a model's frame run the model once per region.",
       "x-flwrs-launch": {
         "via": "file",
         "file_name": "graph.json"
+      },
+      "x-flwrs-graph": {
+        "catalog": "schema/graph_catalog.json"
       },
       "x-flwrs-order": 1
     },
@@ -80,6 +93,14 @@
       "title": "Input",
       "description": "Where frames come from: a camera (built-in, USB, CSI, virtual), a folder of images, or an MJPEG file. Left out: the plugin loads its graph and reads no frames.",
       "$ref": "#/$defs/input",
+      "x-flwrs-device": {
+        "kind": "camera",
+        "field": "device",
+        "when": {
+          "type": "camera"
+        },
+        "default": "default"
+      },
       "x-flwrs-launch": {
         "via": "file",
         "file_name": "input.json"
@@ -114,13 +135,73 @@
     },
     "out_schema": {
       "title": "Event schema",
-      "description": "The payload schema of the events (default: the plugin's detections schema).",
+      "description": "The payload schema of the events. Set by the plugin's configurator from the graph's emit settings and rules.",
       "type": "object",
       "x-flwrs-launch": {
         "via": "file",
         "file_name": "out_schema.json"
       },
       "x-flwrs-order": 5,
+      "x-flwrs-advanced": true
+    },
+    "model_info": {
+      "title": "Model files",
+      "description": "What each model file says about itself: inputs, outputs, classes and proposed settings. Set by the plugin's configurator.",
+      "type": "object",
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "model_info.json"
+      },
+      "x-flwrs-order": 6,
+      "x-flwrs-advanced": true
+    },
+    "live": {
+      "title": "Live view",
+      "description": "What the node shows while someone watches it: per-node stats and an annotated video preview. Each is off by default, and does no work while nobody is watching. Preview frames stay in memory.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "stats": {
+          "title": "Stats",
+          "description": "Frame rate, latency, errors and skipped runs per graph node, about once a second.",
+          "type": "boolean",
+          "default": false
+        },
+        "preview": {
+          "title": "Video preview",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "title": "Enabled",
+              "description": "An annotated JPEG preview with boxes, labels and skeletons.",
+              "type": "boolean",
+              "default": false
+            },
+            "fps": {
+              "title": "Frames per second",
+              "description": "At most this many preview frames per second.",
+              "type": "number",
+              "minimum": 0.5,
+              "maximum": 30,
+              "default": 5
+            },
+            "width": {
+              "title": "Width",
+              "description": "Preview width in pixels. A smaller camera frame isn't enlarged.",
+              "type": "integer",
+              "minimum": 160,
+              "maximum": 1920,
+              "default": 640
+            }
+          }
+        }
+      },
+      "x-flwrs-launch": {
+        "via": "file",
+        "file_name": "live.json"
+      },
+      "x-flwrs-order": 7,
       "x-flwrs-advanced": true
     }
   },
@@ -536,6 +617,14 @@
             },
             "presence_sigmoid": {
               "type": "boolean"
+            },
+            "world": {
+              "description": "World landmarks output (3 values per point), kept for a gesture embedder",
+              "type": "string"
+            },
+            "handedness": {
+              "description": "The output giving the probability of a right hand",
+              "type": "string"
             }
           },
           "required": [
@@ -673,6 +762,114 @@
         "type"
       ]
     },
+    "group": {
+      "description": "A group of model nodes with a policy. Execution policies change how models run, never what they compute; resources set a core budget. Placement isn't available inside a graph.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "family": {
+          "enum": [
+            "execution",
+            "placement",
+            "resources"
+          ]
+        },
+        "policy": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "family",
+        "policy"
+      ],
+      "oneOf": [
+        {
+          "description": "Accepted here so the plugin's check can say why it refuses placement inside a graph.",
+          "properties": {
+            "family": {
+              "const": "placement"
+            }
+          }
+        },
+        {
+          "properties": {
+            "family": {
+              "const": "execution"
+            },
+            "policy": {
+              "additionalProperties": false,
+              "properties": {
+                "device": {
+                  "description": "Where its models run.",
+                  "enum": [
+                    "cpu",
+                    "gpu",
+                    "npu"
+                  ]
+                },
+                "provider": {
+                  "description": "The execution provider for the device (ONNX Runtime).",
+                  "type": "string"
+                },
+                "allow_fallback": {
+                  "description": "A model that won't run on its device runs on the CPU, with a warning.",
+                  "type": "boolean"
+                },
+                "mode": {
+                  "description": "How its for-each items run: one by one, side by side, or as one batch (for a model with a dynamic batch dimension).",
+                  "enum": [
+                    "sequential",
+                    "parallel",
+                    "batched"
+                  ],
+                  "default": "sequential"
+                },
+                "threads": {
+                  "description": "Cores for the group; the groups' sum must fit the node's. Left out: measured at start.",
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "priority": {
+                  "description": "Higher goes first: when a live frame runs late, a model in a lower group with a sampling policy may reuse its last results once more.",
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "family": {
+              "const": "resources"
+            },
+            "policy": {
+              "additionalProperties": false,
+              "properties": {
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "description": "Cores its models may use together.",
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  }
+                }
+              },
+              "required": [
+                "limits"
+              ]
+            }
+          }
+        }
+      ]
+    },
     "model": {
       "type": "object",
       "additionalProperties": false,
@@ -713,11 +910,12 @@
                 "type": "integer",
                 "minimum": 0
               }
+            },
+            "embedder": {
+              "description": "MediaPipe's gesture embedder (a file of the node): the input is its embedding of a hand from a landmarks decoder with world and handedness. Takes no dims, normalize or keypoints.",
+              "type": "string"
             }
-          },
-          "required": [
-            "dims"
-          ]
+          }
         },
         "decode": {
           "$ref": "#/$defs/decoder"
@@ -729,8 +927,16 @@
           "maximum": 1
         },
         "execution": {
-          "description": "Where this model runs; each field set here overrides the plugin's execution setting.",
+          "description": "Where this model runs; each field set here overrides its execution group's and the plugin's execution setting.",
           "$ref": "#/$defs/execution"
+        },
+        "groups": {
+          "description": "The groups this model is in, by id (the graph's groups).",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
         },
         "labels": {
           "oneOf": [
@@ -1571,6 +1777,41 @@
       "required": [
         "type",
         "script"
+      ]
+    },
+    "emit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "emit"
+        },
+        "mode": {
+          "enum": [
+            "rules",
+            "changes",
+            "frames"
+          ],
+          "default": "rules",
+          "description": "rules: only rule events. changes: also the objects when who's there or a label changes. frames: also the objects, rate-limited"
+        },
+        "min_interval_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 200
+        },
+        "max_objects": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 32
+        },
+        "keypoints": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "type"
       ]
     }
   }

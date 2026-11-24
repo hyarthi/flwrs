@@ -1,0 +1,6 @@
+name = "a camera that isn't there may still appear"
+mode = "preflight"
+launch_args = "no_camera.json"
+expect = "error"
+problems_contain = ["camera"]
+retryable = true

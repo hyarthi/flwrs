@@ -12,6 +12,7 @@
   "payload_schemas": {
     "out": "schema/out.json"
   },
+  "runtime_defaults": { "is_critical_path": false },
   "ui": {
     "icon": "ui/mqtt-source.svg",
     "categories": [

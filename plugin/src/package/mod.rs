@@ -1,7 +1,7 @@
 //! Plugin packages (feature `package`): the manifest model, its validation,
 //! the rules for a node's `launch_args` and how they reach the plugin
 //! (`launch`), the checks on a package ZIP, and the configurator contract
-//! (`configure`).
+//! (`configure`), and graph catalogs for editors (`graph`).
 //!
 //! This is the format the server installs (`POST /api/plugins`) and
 //! `flwrs-trellis package` produces; both use this module, so they agree on
@@ -9,6 +9,7 @@
 
 pub mod archive;
 pub mod configure;
+pub mod graph;
 pub mod launch;
 pub mod manifest;
 

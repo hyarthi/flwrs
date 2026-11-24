@@ -39,6 +39,7 @@ export interface Schema {
   'x-flwrs-platforms'?: string[];
   /** A package file an editor fills the empty field with. */
   'x-flwrs-template'?: string;
+  'x-flwrs-graph'?: { catalog: string };
   [key: string]: unknown;
 }
 

@@ -290,6 +290,7 @@ impl Supervisor {
     async fn run_local(&mut self, launch: &LocalLaunch) {
         let timings = self.spec.timings.clone();
         let mut delay = timings.restart_delay;
+        let mut has_run = false;
         loop {
             let token = new_token();
             self.link.renew_token(token.clone());
@@ -329,6 +330,7 @@ impl Supervisor {
             match startup {
                 Startup::Up => {
                     let up_since = Instant::now();
+                    has_run = true;
                     self.update(|s| {
                         s.state = NodeState::Running;
                         s.failed_launches = 0;
@@ -388,7 +390,12 @@ impl Supervisor {
                         s.last_error = Some(reason.clone());
                     });
                     let failed = self.status.borrow().failed_launches;
-                    if let Some(max) = timings.max_restarts
+                    let limit = match timings.max_restarts {
+                        // Negative (-1): try forever.
+                        Some(max) => u64::try_from(max).ok(),
+                        None => timings.first_run_max_restarts.filter(|_| !has_run),
+                    };
+                    if let Some(max) = limit
                         && failed > max
                     {
                         let reason = format!(

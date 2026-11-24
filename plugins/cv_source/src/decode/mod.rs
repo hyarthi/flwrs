@@ -134,6 +134,13 @@ pub enum Decoder {
         presence: Option<String>,
         #[serde(default)]
         presence_sigmoid: bool,
+        /// World landmarks, 3 values per point (MediaPipe hands): kept with
+        /// the depth and `handedness` for a gesture embedder.
+        #[serde(default)]
+        world: Option<String>,
+        /// The probability that it's a right hand.
+        #[serde(default)]
+        handedness: Option<String>,
     },
     /// Semantic segmentation logits `[1, C, H, W]` → class ids.
     Semantic { output: String },
@@ -276,6 +283,17 @@ impl Decoder {
             }
             Decoder::Landmarks { points: 0, .. } | Decoder::Landmarks { dims: 0, .. } => {
                 problems.push("decode.points and decode.dims must be at least 1".into())
+            }
+            Decoder::Landmarks {
+                dims,
+                world,
+                handedness,
+                ..
+            } if world.is_some() != handedness.is_some() || (world.is_some() && *dims < 3) => {
+                problems.push(
+                    "decode.world and decode.handedness go together, with dims of at least 3"
+                        .into(),
+                )
             }
             Decoder::Landmarks {
                 dims,

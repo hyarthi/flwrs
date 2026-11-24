@@ -186,6 +186,23 @@ fn telemetry_extra(value: Option<&toml::Value>) -> Vec<String> {
         .collect()
 }
 
+/// `[director]`: the pre-flight retry limits.
+fn director_extra(value: Option<&toml::Value>) -> Vec<String> {
+    let Some(Ok(config)) = value.map(|v| {
+        v.clone()
+            .try_into::<crate::modules::director::config::DirectorConfig>()
+    }) else {
+        return vec![];
+    };
+    match config.preflight_retry.resolve() {
+        Ok(_) => vec![],
+        Err(problems) => problems
+            .into_iter()
+            .map(|p| format!("preflight_retry.{p}"))
+            .collect(),
+    }
+}
+
 /// `[server]`: how the server restarts itself (from the server page), and
 /// how long a restart with a changed config waits for the page to confirm it.
 #[derive(serde::Deserialize, Serialize, Clone, Debug, ToSchema)]
@@ -306,7 +323,7 @@ pub(crate) fn sections() -> &'static [Section] {
                 summary: "Running scenes: hop limit, folders, spilling to disk, plugin cores.",
                 schema: schema::<director::config::DirectorConfig>,
                 parse: parse::<director::config::DirectorConfig>,
-                extra: none,
+                extra: director_extra,
                 secrets: &[],
                 locked: &[],
             },

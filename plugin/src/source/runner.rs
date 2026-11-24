@@ -56,11 +56,14 @@ impl<T: Source> SourceRunner<T> {
     /// `Shutdown` (unknown instance id or wrong token).
     pub async fn run(&mut self) -> Result<(), Error> {
         let sink = LocalSink::new(self.client.clone());
-        let mut init = self
+        let request = self
             .plugin
             .initialize(self.plugin_id.clone(), self.log_level, sink)
-            .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?
-            .into_initialize(PluginType::Source);
+            .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?;
+        if let Some(publisher) = request.live_feed() {
+            self.client.attach_live_feed(publisher);
+        }
+        let mut init = request.into_initialize(PluginType::Source);
         init.token = self.connection.resolved_token();
 
         let mut backoff = Backoff::new(self.connection.reconnect);

@@ -65,11 +65,14 @@ impl<T: Transform> TransformRunner<T> {
     /// `Shutdown` (unknown instance id, wrong token, a mismatch).
     pub async fn run(&mut self) -> Result<(), Error> {
         let sink = LocalSink::new(self.client.clone());
-        let mut init = self
+        let request = self
             .plugin
             .initialize(self.plugin_id.clone(), self.log_level, sink)
-            .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?
-            .into_initialize(PluginType::Transform);
+            .inspect_err(|err| log::error!("Error initializing plugin: {err}"))?;
+        if let Some(publisher) = request.live_feed() {
+            self.client.attach_live_feed(publisher);
+        }
+        let mut init = request.into_initialize(PluginType::Transform);
         init.token = self.connection.resolved_token();
         init.max_unacked = self.max_unacked;
 

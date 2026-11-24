@@ -36,6 +36,10 @@ pub struct GraphConfig {
     pub nodes: BTreeMap<String, NodeConfig>,
     #[serde(default)]
     pub links: Vec<Link>,
+    /// Execution and resource groups; a model names its own in `groups`.
+    /// They decide how models run, never what they compute.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<flwrs_types::groups::Group>,
 }
 
 /// A link from an output port to an input port, both `<node>.<port>`.
@@ -46,7 +50,7 @@ pub struct Link {
     pub to: String,
 }
 
-/// A node, by `type`. (`emit` comes with event delivery.)
+/// A node, by `type`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NodeConfig {
@@ -66,6 +70,9 @@ pub enum NodeConfig {
     Rule(Box<RuleConfig>),
     /// A rule in Lua. In: `objects`; out: `events`.
     Lua(Box<LuaRuleConfig>),
+    /// What leaves the plugin (at most one; without it, rule events). In:
+    /// `objects`, for `changes` and `frames`.
+    Emit(EmitConfig),
 }
 
 impl NodeConfig {
@@ -78,6 +85,7 @@ impl NodeConfig {
             NodeConfig::Tracker(_) => "tracker",
             NodeConfig::Rule(_) => "rule",
             NodeConfig::Lua(_) => "lua",
+            NodeConfig::Emit(_) => "emit",
         }
     }
 }
@@ -111,10 +119,13 @@ pub struct ModelConfig {
     /// How often it runs (default: every frame).
     #[serde(default)]
     pub sampling: Option<Sampling>,
-    /// Where it runs; each field set here overrides the plugin's
-    /// `execution` setting.
+    /// Where it runs; each field set here overrides its execution group's
+    /// and the plugin's `execution` setting.
     #[serde(default)]
     pub execution: Option<Execution>,
+    /// The groups it's in (`groups` of the graph), by id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
     /// What the keypoints are (names and skeleton): `coco17`,
     /// `blazepose33`, `hand21`, `wholebody133`, `face5`, `face6`.
     #[serde(default)]
@@ -180,7 +191,8 @@ impl Execution {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TensorInput {
-    /// Values per keypoint: 2 (x, y) or 3 (x, y, score).
+    /// Values per keypoint: 2 (x, y) or 3 (x, y, score). Not with `embedder`.
+    #[serde(default)]
     pub dims: usize,
     /// How coordinates are made relative.
     #[serde(default)]
@@ -188,6 +200,11 @@ pub struct TensorInput {
     /// The keypoints used (default: all), by index.
     #[serde(default)]
     pub keypoints: Option<Vec<usize>>,
+    /// MediaPipe's gesture embedder (a file of the node): the input is its
+    /// embedding of a hand's landmarks, world landmarks and handedness, from
+    /// a `landmarks` decoder with `world` and `handedness`.
+    #[serde(default)]
+    pub embedder: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -582,4 +599,52 @@ pub struct LuaLimits {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub max_memory_bytes: Option<u64>,
+}
+
+/// What leaves the plugin.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EmitMode {
+    /// Only rule events.
+    #[default]
+    Rules,
+    /// Rule events, and the objects when who's there (or a label) changes.
+    Changes,
+    /// Rule events, and the objects at most every `min_interval_ms`.
+    Frames,
+}
+
+/// An `emit` node.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmitConfig {
+    #[serde(default)]
+    pub mode: EmitMode,
+    /// The least time between two frames' objects (`changes`, `frames`).
+    #[serde(default = "default_emit_interval")]
+    pub min_interval_ms: u32,
+    /// The most objects in one frame's event (the most confident).
+    #[serde(default = "default_emit_objects")]
+    pub max_objects: usize,
+    /// Include keypoints.
+    #[serde(default = "default_true")]
+    pub keypoints: bool,
+}
+
+impl Default for EmitConfig {
+    fn default() -> Self {
+        Self {
+            mode: EmitMode::Rules,
+            min_interval_ms: default_emit_interval(),
+            max_objects: default_emit_objects(),
+            keypoints: true,
+        }
+    }
+}
+
+fn default_emit_interval() -> u32 {
+    200
+}
+fn default_emit_objects() -> usize {
+    32
 }

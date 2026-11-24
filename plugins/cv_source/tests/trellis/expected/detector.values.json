@@ -1,0 +1,153 @@
+{
+  "model_info": {
+    "fixed_det.onnx": {
+      "candidates": [
+        "detections_e2e"
+      ],
+      "dynamic_batch": false,
+      "file_bytes": 306,
+      "inputs": [
+        {
+          "dtype": "f32",
+          "name": "x",
+          "shape": [
+            1,
+            3,
+            32,
+            64
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "dtype": "f32",
+          "name": "rows",
+          "shape": [
+            1,
+            2,
+            6
+          ]
+        }
+      ],
+      "parameters": 13,
+      "recommendation": {
+        "mode": "parallel",
+        "reason": "a small model: a few threads, its crops side by side",
+        "threads": 2
+      }
+    }
+  },
+  "out_schema": {
+    "fields": [
+      {
+        "description": "What happened: detections (the objects seen in a frame), or a rule's type (line_crossing, zone, loitering, counting)",
+        "key": "event",
+        "type": "STRING"
+      },
+      {
+        "description": "When the frame was captured",
+        "key": "frame_time",
+        "type": "DATETIME"
+      },
+      {
+        "description": "Frame number since the plugin started, from 1",
+        "key": "frame_seq",
+        "type": "U64"
+      },
+      {
+        "description": "Frame width, pixels",
+        "key": "width",
+        "type": "U32"
+      },
+      {
+        "description": "Frame height, pixels",
+        "key": "height",
+        "type": "U32"
+      },
+      {
+        "description": "The objects, boxes and keypoints normalised to the frame (0..1)",
+        "key": "objects",
+        "nested_type_definition": {
+          "object_fields": [
+            {
+              "description": "Class index in the model's labels",
+              "key": "class_id",
+              "type": "U32"
+            },
+            {
+              "description": "Class label (empty without labels)",
+              "key": "class_name",
+              "type": "STRING"
+            },
+            {
+              "description": "Score, 0..1",
+              "key": "confidence",
+              "type": "F32"
+            },
+            {
+              "description": "Track id (0 without a tracker)",
+              "key": "tracker_id",
+              "type": "U64"
+            },
+            {
+              "description": "The graph node that found it",
+              "key": "source",
+              "type": "STRING"
+            },
+            {
+              "description": "x1, y1 (top left), x2, y2 (bottom right), 0..1",
+              "key": "box",
+              "object_fields": [
+                {
+                  "key": "x1",
+                  "type": "F32"
+                },
+                {
+                  "key": "y1",
+                  "type": "F32"
+                },
+                {
+                  "key": "x2",
+                  "type": "F32"
+                },
+                {
+                  "key": "y2",
+                  "type": "F32"
+                }
+              ],
+              "type": "OBJECT"
+            },
+            {
+              "description": "Classifier results on this object (e.g. a gesture): top-k",
+              "key": "classes",
+              "nested_type_definition": {
+                "object_fields": [
+                  {
+                    "key": "source",
+                    "type": "STRING"
+                  },
+                  {
+                    "key": "class_id",
+                    "type": "U32"
+                  },
+                  {
+                    "key": "class_name",
+                    "type": "STRING"
+                  },
+                  {
+                    "key": "confidence",
+                    "type": "F32"
+                  }
+                ],
+                "type": "OBJECT"
+              },
+              "type": "ARRAY"
+            }
+          ],
+          "type": "OBJECT"
+        },
+        "type": "ARRAY"
+      }
+    ]
+  }
+}

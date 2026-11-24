@@ -111,6 +111,9 @@ impl Service {
             }
             nodes.push(pb::Node {
                 position: node.position.map(|p| pb::Position { x: p.x, y: p.y }),
+                inner_layout_json: (!node.inner_layout.is_empty()).then(|| {
+                    serde_json::to_string(&node.inner_layout).expect("a layout serializes")
+                }),
                 omitted_secrets,
                 files: uploads
                     .into_iter()
@@ -149,6 +152,8 @@ impl Service {
             exporter_version: env!("CARGO_PKG_VERSION").into(),
             defaults_json: (scene.defaults != SceneDefaults::default())
                 .then(|| serde_json::to_string(&scene.defaults).expect("defaults serialize")),
+            groups_json: (!scene.groups.is_empty())
+                .then(|| serde_json::to_string(&scene.groups).expect("groups serialize")),
         };
         log::info!(
             "Scene service: exported scene [{id}]{}",
@@ -268,6 +273,7 @@ impl Service {
             &plan.name,
             plan.max_hops,
             &plan.defaults,
+            &plan.groups,
         )
         .await?;
         // Ascending ids keep the file's node order in listings (all imported
@@ -420,6 +426,21 @@ fn layout_of(position: Option<pb::Position>) -> Option<String> {
         .map(Position::to_json)
 }
 
+/// A file's node layout: its position and its inner nodes'. Bad entries are
+/// layout, not content: dropped, not refused.
+fn node_layout_of(position: Option<pb::Position>, inner: Option<&str>) -> Option<String> {
+    let mut layout = NodeLayout::default();
+    layout.set_position(
+        position
+            .map(|p| Position { x: p.x, y: p.y })
+            .filter(|p| p.check().is_ok()),
+    );
+    if let Some(inner) = inner.and_then(|t| serde_json::from_str(t).ok()) {
+        layout.set_inner(inner);
+    }
+    layout.to_json()
+}
+
 fn scopeguard_dir(path: &Path) -> RemoveDir {
     RemoveDir(path.to_path_buf())
 }
@@ -450,6 +471,7 @@ struct Plan {
     name: String,
     max_hops: Option<u32>,
     defaults: SceneDefaults,
+    groups: Vec<Group>,
     nodes: Vec<PlannedNode>,
     edges: Vec<PlannedEdge>,
 }
@@ -466,10 +488,22 @@ fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
             SceneDefaults::default()
         }
     };
+    // A policy this server doesn't honour isn't a broken file: the import
+    // goes through, and the scene's check keeps it from being enabled.
+    let groups: Vec<Group> = match file.groups_json.as_deref().map(serde_json::from_str) {
+        None => vec![],
+        Some(Ok(groups)) => groups,
+        Some(Err(e)) => {
+            errors.push(format!("groups: {e}"));
+            vec![]
+        }
+    };
+    errors.extend(crate::modules::scene::groups::import_problems(&groups));
     let (name, max_hops) = match check_scene(&SceneInput {
         name: file.name,
         max_hops: file.max_hops,
         defaults: defaults.clone(),
+        groups: None,
     }) {
         Ok(settings) => settings,
         Err(ServiceError::Invalid(problems)) => {
@@ -553,7 +587,7 @@ fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
             config_json,
             omitted_secrets: node.omitted_secrets,
             files: node.files,
-            ui: layout_of(node.position),
+            ui: node_layout_of(node.position, node.inner_layout_json.as_deref()),
         });
     }
 
@@ -603,6 +637,7 @@ fn plan_import(file: pb::SceneFile) -> Result<Plan, ServiceError> {
             name,
             max_hops,
             defaults,
+            groups,
             nodes,
             edges,
         })
@@ -660,6 +695,7 @@ mod tests {
                     durable: Some(true),
                     ..Default::default()
                 },
+                groups: None,
             })
             .await
             .unwrap();

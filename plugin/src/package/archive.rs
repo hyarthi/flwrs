@@ -297,6 +297,22 @@ fn read_package(
             }
         }
     }
+    // A graph's catalog, against the schema it refers to.
+    if let Some(schema) = &launch_args_schema {
+        for g in spec.graph_fields() {
+            if let Some(entry) = find(&g.catalog).filter(|e| !e.is_dir) {
+                let text = read_text(archive, entry, &g.catalog)?;
+                if let Err(problems) = super::graph::Catalog::parse(&text, schema) {
+                    errors.extend(problems.into_iter().map(|p| {
+                        format!(
+                            "launch_args_schema {}: x-flwrs-graph {:?}: {p}",
+                            g.pointer, g.catalog
+                        )
+                    }));
+                }
+            }
+        }
+    }
     let launch_args_schema = launch_args_schema.map(|v| v.to_string());
     let mut payload_schema = |field: &str,
                               source: &Option<super::manifest::SchemaSource>|
@@ -749,6 +765,41 @@ mod tests {
         "script": {"type": "string", "contentMediaType": "text/x-lua",
                    "x-flwrs-code": {"language": "lua", "params": ["payload"], "definitions": "types/script.d.lua"},
                    "x-flwrs-hint": 1}}}"#;
+
+    #[test]
+    fn graph_catalogs_are_checked_against_the_schema() {
+        let launch = r##"{"type": "object", "properties": {
+            "schemas": {"type": "object", "properties": {"in": {"type": "object"}}},
+            "graph": {"type": "object", "x-flwrs-graph": {"catalog": "schema/catalog.json"}}},
+            "$defs": {"a": {"properties": {"type": {"const": "a"}}}}}"##;
+        let good: &[u8] = br##"{"format": 1, "port_types": {"x": {"title": "X"}},
+            "node_types": {"a": {"title": "A", "settings": "#/$defs/a"}}}"##;
+        let bad: &[u8] = br##"{"format": 1, "port_types": {"x": {"title": "X"}},
+            "node_types": {"a": {"title": "A", "settings": "#/$defs/nope"}}}"##;
+        let items = |catalog: Option<&'static [u8]>| {
+            let mut items = vec![
+                Item::File("manifest.json", V2_MANIFEST.as_bytes()),
+                Item::File("bin/run", b"#!/bin/sh\n"),
+                Item::File("schema/launch.json", launch.as_bytes()),
+                Item::File("schema/in.json", IN_SCHEMA.as_bytes()),
+                Item::File("ui/icon.svg", b"<svg/>"),
+            ];
+            if let Some(c) = catalog {
+                items.push(Item::File("schema/catalog.json", c));
+            }
+            items
+        };
+        let (_d, r) = run(&items(Some(good)));
+        r.unwrap();
+        for (catalog, expected) in [
+            (Some(bad), "isn't in the launch-args"),
+            (None, "is missing"),
+        ] {
+            let (_d, r) = run(&items(catalog));
+            let errors = errors_of(r);
+            assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
+        }
+    }
 
     #[test]
     fn templates_must_be_there_and_json_for_values() {

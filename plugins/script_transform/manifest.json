@@ -13,6 +13,7 @@
     "in": { "from_launch_args": "/schemas/in" },
     "out": { "from_launch_args": "/schemas/out" }
   },
+  "runtime_defaults": { "is_critical_path": false },
   "ui": {
     "icon": "ui/script.svg",
     "categories": ["Transform", "Scripting"],

@@ -4,7 +4,10 @@ mod configure_tests;
 pub(crate) mod draft;
 #[cfg(test)]
 mod draft_tests;
+#[cfg(test)]
+mod groups_tests;
 pub(crate) mod mapping_test;
+pub(crate) mod preflight;
 mod query_sqlite;
 mod transfer;
 mod uploads;
@@ -22,16 +25,18 @@ use crate::modules::plugin::service::{
     Plugin, Service as PluginService, ServiceError as PluginError,
 };
 use crate::modules::scene::graph;
+use crate::modules::scene::groups::{self as scene_groups, Member, NodeDevice, NodeThreads, Split};
 use chrono::Local;
 use flwrs_core::db::{Database, DbError};
 use flwrs_plugin::package::configure::{self, Configured};
 use flwrs_plugin::schema::payload::SchemaDefinition;
+use flwrs_types::groups::Group;
 pub(crate) use query_sqlite::Store;
 use query_sqlite::{EdgeValues, NodeValues};
 use serde_json::Value;
 use sqlx::Connection;
 use sqlx::error::ErrorKind;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -47,6 +52,9 @@ pub(crate) struct Scene {
     /// Defaults for the scene's nodes (durable queues, remote auth).
     #[sqlx(json)]
     pub defaults: SceneDefaults,
+    /// Groups of the scene's nodes (membership is on the nodes).
+    #[sqlx(json)]
+    pub groups: Vec<Group>,
     /// Counts committed changes to the live graph (settings, nodes, edges,
     /// uploads); a draft remembers the one it's based on.
     pub revision: i64,
@@ -109,6 +117,93 @@ impl Position {
     }
 }
 
+/// Where a graph setting's inner nodes sit, by setting and inner node id.
+pub(crate) type InnerLayout = BTreeMap<String, BTreeMap<String, Position>>;
+
+/// Inner nodes one setting of a node may place.
+const MAX_INNER_POSITIONS: usize = 4096;
+/// The longest setting or inner node id in a layout.
+const MAX_INNER_KEY: usize = 128;
+
+/// A node's `ui` column: its place on the canvas and, beside it, those of
+/// the inner nodes of its graph settings.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NodeLayout {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    y: Option<f64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    inner: InnerLayout,
+}
+
+impl NodeLayout {
+    /// From the `ui` column; what's unreadable counts as not placed.
+    pub(crate) fn from_json(text: Option<&str>) -> Self {
+        let mut layout: Self = text
+            .and_then(|t| serde_json::from_str(t).ok())
+            .unwrap_or_default();
+        layout.keep_valid();
+        layout
+    }
+
+    fn keep_valid(&mut self) {
+        if self.position().is_none() {
+            (self.x, self.y) = (None, None);
+        }
+        self.inner.retain(|setting, places| {
+            places.retain(|id, p| id.len() <= MAX_INNER_KEY && p.check().is_ok());
+            setting.len() <= MAX_INNER_KEY && !places.is_empty()
+        });
+    }
+
+    pub(crate) fn position(&self) -> Option<Position> {
+        let p = Position {
+            x: self.x?,
+            y: self.y?,
+        };
+        p.check().is_ok().then_some(p)
+    }
+
+    pub(crate) fn set_position(&mut self, position: Option<Position>) {
+        (self.x, self.y) = (position.map(|p| p.x), position.map(|p| p.y));
+    }
+
+    /// Takes a file's inner layout; bad entries are dropped.
+    pub(crate) fn set_inner(&mut self, inner: InnerLayout) {
+        self.inner = inner;
+        self.keep_valid();
+    }
+
+    /// Places (or, with `None`, forgets) inner nodes of one setting.
+    fn place_inner(&mut self, setting: &str, places: &BTreeMap<String, Option<Position>>) {
+        let entry = self.inner.entry(setting.to_string()).or_default();
+        for (id, position) in places {
+            match position {
+                Some(p) => {
+                    entry.insert(id.clone(), *p);
+                }
+                None => {
+                    entry.remove(id);
+                }
+            }
+        }
+        if entry.is_empty() {
+            self.inner.remove(setting);
+        }
+    }
+
+    /// As the `ui` column holds it; `None` when there's nothing to hold.
+    pub(crate) fn to_json(&self) -> Option<String> {
+        (self.x.is_some() || !self.inner.is_empty())
+            .then(|| serde_json::to_string(self).expect("a layout serializes"))
+    }
+}
+
+/// What a layout request places inside nodes: node → setting → inner node.
+pub(crate) type InnerPlaces =
+    BTreeMap<String, BTreeMap<String, BTreeMap<String, Option<Position>>>>;
+
 /// A node using a plugin.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize, utoipa::ToSchema)]
 pub(crate) struct PluginUse {
@@ -160,6 +255,8 @@ pub(crate) struct Node {
     pub config: NodeConfig,
     /// Where the node sits on the editor's canvas, if placed.
     pub position: Option<Position>,
+    /// Where the inner nodes of its graph settings sit (layout, like `position`).
+    pub inner_layout: InnerLayout,
     pub create_time: chrono::DateTime<Local>,
     pub update_time: chrono::DateTime<Local>,
     /// The launch-args secrets the plugin declares (JSON pointers) and
@@ -181,6 +278,7 @@ impl TryFrom<NodeRow> for Node {
         let config = NodeConfig::parse(&value).map_err(|e| {
             ServiceError::Unknown(format!("node {} has an outdated config: {e}", row.id))
         })?;
+        let layout = NodeLayout::from_json(row.ui.as_deref());
         Ok(Self {
             id: row.id,
             name: row.name,
@@ -189,7 +287,8 @@ impl TryFrom<NodeRow> for Node {
             plugin_id: row.plugin_id,
             plugin_version: row.plugin_version,
             config,
-            position: Position::from_json(row.ui.as_deref()),
+            position: layout.position(),
+            inner_layout: layout.inner,
             create_time: row.create_time,
             update_time: row.update_time,
             secrets: BTreeMap::new(),
@@ -346,6 +445,12 @@ pub(crate) struct Service {
     /// Also held while uploaded files are stored or removed. Its release
     /// counts as a change for the live views (`changes()`).
     lock: ChangeLock,
+    /// `[director] preflight_retry`: how a held-back draft submit retries.
+    preflight_retry: crate::modules::node_config::PreflightRetryConfig,
+    /// The draft submits waiting on their pre-flight checks, by scene.
+    submit_waits: std::sync::Mutex<HashMap<String, draft::submit::SubmitWait>>,
+    /// What the director runs (for pre-flight checks' `releasing`).
+    running: std::sync::Mutex<preflight::RunningScenes>,
 }
 
 type Conn = sqlx::pool::PoolConnection<sqlx::Sqlite>;
@@ -368,7 +473,21 @@ impl Service {
             director,
             files,
             lock: ChangeLock::new(),
+            preflight_retry: Default::default(),
+            submit_waits: Default::default(),
+            running: Default::default(),
         }
+    }
+
+    /// With the server's `[director] preflight_retry`.
+    pub(crate) fn with_preflight_retry(
+        mut self,
+        retry: crate::modules::node_config::PreflightRetryConfig,
+    ) -> Self {
+        if retry.resolve().is_ok() {
+            self.preflight_retry = retry;
+        }
+        self
     }
 
     /// Bumped after every change to scenes, nodes, edges or uploads (for the
@@ -406,14 +525,17 @@ impl Service {
         let (name, max_hops) = check_scene(input)?;
         let mut conn = self.conn().await?;
         let id = Ulid::generate().to_string();
+        let groups = input.groups.clone().unwrap_or_default();
         let scene =
-            query_sqlite::create_scene(&mut conn, &id, &name, max_hops, &input.defaults).await?;
+            query_sqlite::create_scene(&mut conn, &id, &name, max_hops, &input.defaults, &groups)
+                .await?;
         log::debug!("Scene service: created scene [{}]", scene.id);
         self.lock.bump();
         Ok(scene)
     }
 
-    /// Replaces the scene's settings (name, hop limit, defaults).
+    /// Replaces the scene's settings (name, hop limit, defaults, and its
+    /// groups unless the input leaves them out).
     pub(crate) async fn update_scene(
         &self,
         id: &str,
@@ -425,17 +547,27 @@ impl Service {
         let before = query_sqlite::get_scene(&mut conn, id)
             .await
             .map_err(not_found("scene"))?;
-        let scene = query_sqlite::update_scene(&mut conn, id, &name, max_hops, &input.defaults)
-            .await
-            .map_err(not_found("scene"))?;
+        let groups = input.groups.as_ref().unwrap_or(&before.groups);
+        if *groups != before.groups {
+            let entries = group_entries(&mut conn, Store::Live, id).await?;
+            self.refuse_group_problems(before.enabled, groups, &entries)
+                .await?;
+        }
+        let scene =
+            query_sqlite::update_scene(&mut conn, id, &name, max_hops, &input.defaults, groups)
+                .await
+                .map_err(not_found("scene"))?;
         query_sqlite::bump_revision(&mut conn, id).await?;
         let scene = Scene {
             revision: scene.revision + 1,
             ..scene
         };
-        // A rename doesn't change the workflow; a new hop limit or new
-        // defaults do.
-        if scene.enabled && (scene.max_hops != before.max_hops || scene.defaults != before.defaults)
+        // A rename doesn't change the workflow; a new hop limit, new defaults
+        // or new groups (the threads they give) do.
+        if scene.enabled
+            && (scene.max_hops != before.max_hops
+                || scene.defaults != before.defaults
+                || scene.groups != before.groups)
         {
             self.director.request_reload(id);
         }
@@ -476,6 +608,10 @@ impl Service {
     /// Enables (runs) or disables (stops) a scene's workflow. Enabling checks
     /// that every node's plugin is installed.
     pub(crate) async fn set_enabled(&self, id: &str, enabled: bool) -> Result<Scene, ServiceError> {
+        if enabled {
+            // Before the lock: these are processes, and may take a while.
+            self.preflight_before_enable(id).await?;
+        }
         let _guard = self.lock.lock().await;
         let mut conn = self.conn().await?;
         let scene = query_sqlite::get_scene(&mut conn, id)
@@ -497,6 +633,8 @@ impl Service {
         if enabled {
             self.director.request_reload(id);
         } else {
+            // A disabled scene takes its draft as it is: no check to wait for.
+            draft::query::clear_submit(&mut conn, id).await?;
             self.director.request_stop(id);
         }
         log::info!(
@@ -524,7 +662,7 @@ impl Service {
                 Ok(check) => check,
                 Err(e) => SceneCheck {
                     problems: vec![format!("couldn't check the scene: {e}")],
-                    warnings: vec![],
+                    ..Default::default()
                 },
             };
             rows.push(SceneRow {
@@ -585,12 +723,182 @@ impl Service {
         conn: &mut sqlx::SqliteConnection,
         scene_id: &str,
     ) -> Result<SceneCheck, ServiceError> {
-        let defaults = query_sqlite::get_scene(conn, scene_id)
+        let scene = query_sqlite::get_scene(conn, scene_id)
             .await
-            .map_err(not_found("scene"))?
-            .defaults;
-        self.check_store(conn, Store::Live, scene_id, &defaults)
+            .map_err(not_found("scene"))?;
+        self.check_store(conn, Store::Live, scene_id, &scene.defaults, &scene.groups)
             .await
+    }
+
+    /// The devices a scene's local nodes claim: (label, node id, claim), from
+    /// their plugins' `x-flwrs-device` settings.
+    async fn device_claims(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        store: Store,
+        scene_id: &str,
+    ) -> Result<Vec<(String, String, NodeDevice)>, ServiceError> {
+        let mut out = vec![];
+        for row in query_sqlite::list_nodes(conn, store, scene_id).await? {
+            let node = Node::try_from(row)?;
+            if node.config.launch != crate::modules::node_config::LaunchMode::Local {
+                continue;
+            }
+            let Ok(plugin) = self.plugins.get(&node.plugin_id).await else {
+                continue;
+            };
+            let Ok(rules) = NodeRules::of(&plugin) else {
+                continue;
+            };
+            let label = match &node.name {
+                Some(name) => format!("node {} ({name})", node.id),
+                None => format!("node {}", node.id),
+            };
+            for claim in rules.spec.device_claims(&node.config.launch_args) {
+                out.push((
+                    label.clone(),
+                    node.id.clone(),
+                    NodeDevice {
+                        kind: claim.kind,
+                        device: claim.device,
+                        field: claim.field,
+                    },
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The registry entries of the plugins named (those that exist).
+    async fn plugins_named<'a>(
+        &self,
+        ids: impl Iterator<Item = &'a str>,
+    ) -> Result<HashMap<String, Plugin>, ServiceError> {
+        let mut plugins = HashMap::new();
+        for id in ids {
+            if plugins.contains_key(id) {
+                continue;
+            }
+            match self.plugins.get(id).await {
+                Ok(plugin) => {
+                    plugins.insert(id.to_string(), plugin);
+                }
+                Err(PluginError::NotFound) => {}
+                Err(e) => return Err(ServiceError::Unknown(e.to_string())),
+            }
+        }
+        Ok(plugins)
+    }
+
+    /// Refuses what a live save mustn't leave behind: groups or memberships
+    /// that are wrong, and on an enabled scene budgets that don't add up
+    /// (its next load would fail). `entries`: (node id, config, plugin id).
+    pub(super) async fn refuse_group_problems(
+        &self,
+        enabled: bool,
+        groups: &[Group],
+        entries: &[(String, NodeConfig, String)],
+    ) -> Result<(), ServiceError> {
+        if groups.is_empty() && entries.iter().all(|(_, c, _)| c.groups.is_empty()) {
+            return Ok(());
+        }
+        let plugins = self
+            .plugins_named(entries.iter().map(|(_, _, p)| p.as_str()))
+            .await?;
+        let members: Vec<Member> = entries
+            .iter()
+            .map(|(id, config, plugin)| Member::from_config(id, config, plugins.get(plugin)))
+            .collect();
+        let split = Split::of(groups, &members);
+        let errors = if enabled {
+            split.problems()
+        } else {
+            split.structure
+        };
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ServiceError::Invalid(errors))
+        }
+    }
+
+    /// What the scene's groups come to (problems, warnings, each node's
+    /// effective threads) and the devices its nodes claim, with any clash.
+    async fn check_groups_and_devices(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        store: Store,
+        scene_id: &str,
+        groups: &[Group],
+        check: &mut SceneCheck,
+    ) -> Result<(), ServiceError> {
+        let nodes: Vec<Node> = query_sqlite::list_nodes(conn, store, scene_id)
+            .await?
+            .into_iter()
+            .map(Node::try_from)
+            .collect::<Result<_, _>>()?;
+        let plugins = self
+            .plugins_named(nodes.iter().map(|n| n.plugin_id.as_str()))
+            .await?;
+        let members: Vec<Member> = nodes
+            .iter()
+            .map(|n| Member::of(n, plugins.get(&n.plugin_id)))
+            .collect();
+        let split = Split::of(groups, &members);
+        check.problems.extend(split.problems());
+        check.warnings.extend(split.warnings.iter().cloned());
+        let server = self.plugins.server_plugin_threads();
+        for (node, member) in nodes.iter().zip(&members) {
+            if !member.takes_threads {
+                continue;
+            }
+            let manifest = plugins
+                .get(&node.plugin_id)
+                .and_then(Plugin::parsed_manifest)
+                .and_then(|m| crate::modules::supervisor::runtime_defaults(&m).ok())
+                .unwrap_or_default();
+            check.threads.insert(
+                node.id.clone(),
+                scene_groups::effective_threads(
+                    &node.config.runtime,
+                    split.shares.get(&node.id),
+                    &manifest,
+                    server,
+                ),
+            );
+        }
+
+        // Two local nodes claiming one device: only one can open it.
+        let same = |a: &NodeDevice, b: &NodeDevice| a.kind == b.kind && a.device == b.device;
+        let mine = self.device_claims(conn, store, scene_id).await?;
+        for (i, (a_label, _, a)) in mine.iter().enumerate() {
+            for (b_label, b_id, b) in &mine[i + 1..] {
+                if same(a, b) && mine[i].1 != *b_id {
+                    check.problems.push(format!(
+                        "{a_label} and {b_label} both claim {} {:?}: only one of them can open it",
+                        a.kind, a.device
+                    ));
+                }
+            }
+        }
+        for other in query_sqlite::enabled_scene_ids(conn).await? {
+            if other == scene_id {
+                continue;
+            }
+            let theirs = self.device_claims(conn, Store::Live, &other).await?;
+            for (a_label, _, a) in &mine {
+                for (b_label, _, _) in theirs.iter().filter(|(_, _, b)| same(a, b)) {
+                    check.problems.push(format!(
+                        "{a_label} claims {} {:?}, as does {b_label} of enabled scene {other}: only one of them can open it",
+                        a.kind, a.device
+                    ));
+                }
+            }
+        }
+        for (_, node_id, claim) in mine {
+            check.devices.entry(node_id).or_default().push(claim);
+        }
+        Ok(())
     }
 
     /// The scene's check, on its live graph or its draft (with the draft's
@@ -601,6 +909,7 @@ impl Service {
         store: Store,
         scene_id: &str,
         defaults: &SceneDefaults,
+        groups: &[Group],
     ) -> Result<SceneCheck, ServiceError> {
         let mut check = SceneCheck::default();
         for row in query_sqlite::list_nodes(conn, store, scene_id).await? {
@@ -677,16 +986,24 @@ impl Service {
             let configured_here = node.config.launch
                 == crate::modules::node_config::LaunchMode::Local
                 || node.config.configurator.is_some();
+            // What the configurator run behind these settings said.
+            let notes = if configured_here {
+                configurator::warnings(conn, &node.id, &node.config.launch_args).await?
+            } else {
+                None
+            };
+            let refused = notes.as_ref().is_some_and(|n| !n.errors.is_empty());
             if configured_here && !rules.spec.configured_fields().is_empty() {
                 // A configurator may leave some of its fields unset; none set
-                // means it hasn't run (e.g. waiting for an upload, or imported).
+                // means it hasn't run (e.g. waiting for an upload, or imported)
+                // or refused these settings (said below).
                 let never_ran = !rules
                     .spec
                     .configured_fields()
                     .iter()
                     .any(|f| node.config.launch_args.get(f.as_str()).is_some());
                 let stale = node.plugin_version.as_deref() != Some(plugin.version.as_str());
-                if never_ran || stale {
+                if (never_ran && !refused) || stale {
                     let why = if never_ran {
                         "its plugin's configurator hasn't set its configured settings yet"
                             .to_string()
@@ -702,14 +1019,14 @@ impl Service {
                     ));
                 }
             }
-            // The warnings of the configurator run that produced these settings.
-            if configured_here
-                && let Some((warnings, time)) =
-                    configurator::warnings(conn, &node.id, &node.config.launch_args).await?
-            {
-                let time = time.format("%Y-%m-%d %H:%M:%S");
+            if let Some(notes) = notes {
+                let time = notes.time.format("%Y-%m-%d %H:%M:%S");
+                check.problems.extend(notes.errors.into_iter().map(|e| {
+                    format!("{label}: its configured settings aren't set (run {time}): {e}")
+                }));
                 check.warnings.extend(
-                    warnings
+                    notes
+                        .warnings
                         .into_iter()
                         .map(|w| format!("{label}: configurator (run {time}): {w}")),
                 );
@@ -777,6 +1094,8 @@ impl Service {
                 }
             }
         }
+        self.check_groups_and_devices(conn, store, scene_id, groups, &mut check)
+            .await?;
         // Mappings, against this server's plugin schemas.
         for edge in query_sqlite::list_edges(conn, store, scene_id).await? {
             let Some(mapping) = edge.mapping.as_deref() else {
@@ -886,6 +1205,9 @@ impl Service {
                 errors: vec![],
                 max_hops: None,
                 nodes: vec![],
+                preflight: vec![],
+                preflight_retry: None,
+                failed_update: None,
             });
         Ok((scene, status))
     }
@@ -921,21 +1243,39 @@ impl Service {
     /// A scene with its whole graph and the registry entries of its plugins,
     /// read under the service lock, so it never reflects a half-applied change.
     pub(crate) async fn snapshot(&self, id: &str) -> Result<SceneSnapshot, ServiceError> {
+        self.snapshot_in(Store::Live, id).await
+    }
+
+    /// [`Service::snapshot`] of the live graph or the scene's draft.
+    pub(crate) async fn snapshot_in(
+        &self,
+        store: Store,
+        id: &str,
+    ) -> Result<SceneSnapshot, ServiceError> {
         let _guard = self.lock.lock_read().await;
         let mut conn = self.conn().await?;
-        let scene = query_sqlite::get_scene(&mut conn, id)
+        let mut scene = query_sqlite::get_scene(&mut conn, id)
             .await
             .map_err(not_found("scene"))?;
-        let mut nodes = query_sqlite::list_nodes(&mut conn, Store::Live, id)
+        if store == Store::Draft {
+            // What the scene would run with once the draft is in.
+            let row = draft::query::get(&mut conn, id)
+                .await?
+                .ok_or(ServiceError::NotFound("draft"))?;
+            scene.max_hops = row.max_hops;
+            scene.defaults = row.defaults;
+            scene.groups = row.groups;
+        }
+        let mut nodes = query_sqlite::list_nodes(&mut conn, store, id)
             .await?
             .into_iter()
             .map(Node::try_from)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut uploads = query_sqlite::list_scene_uploads(&mut conn, Store::Live, id).await?;
+        let mut uploads = query_sqlite::list_scene_uploads(&mut conn, store, id).await?;
         for node in &mut nodes {
             node.uploads = uploads.extract_if(.., |u| u.node_id == node.id).collect();
         }
-        let edges: Vec<Edge> = query_sqlite::list_edges(&mut conn, Store::Live, id)
+        let edges: Vec<Edge> = query_sqlite::list_edges(&mut conn, store, id)
             .await?
             .into_iter()
             .map(Edge::from)
@@ -1027,7 +1367,7 @@ impl Service {
     /// Creates (`id` = `None`) or replaces a node, live or in the scene's
     /// draft (started from live if there's none). A draft takes an incomplete
     /// node (its problems show in the draft's check); live refuses it.
-    pub(super) async fn save_node(
+    pub(crate) async fn save_node(
         &self,
         store: Store,
         scene_id: &str,
@@ -1060,6 +1400,16 @@ impl Service {
         let prepared = self
             .prepare_node(store, &id, input, existing.as_ref(), &defaults)
             .await?;
+        // A draft takes wrong memberships: its check lists them.
+        if store == Store::Live {
+            let config: NodeConfig = serde_json::from_str(&prepared.config_json)
+                .map_err(|e| ServiceError::Unknown(format!("config: {e}")))?;
+            let mut entries = group_entries(&mut conn, Store::Live, scene_id).await?;
+            entries.retain(|(node, _, _)| *node != id);
+            entries.push((id.clone(), config, prepared.plugin_id.clone()));
+            self.refuse_group_problems(scene.enabled, &scene.groups, &entries)
+                .await?;
+        }
         let mut tx = conn.begin_with(WRITE_TX).await?;
         let mut row = match existing {
             None => {
@@ -1076,9 +1426,11 @@ impl Service {
             }
         };
         if let Some(p) = position {
-            let ui = p.to_json();
-            query_sqlite::set_ui(&mut tx, store, scene_id, &id, Some(&ui)).await?;
-            row.ui = Some(ui);
+            let mut layout = NodeLayout::from_json(row.ui.as_deref());
+            layout.set_position(Some(p));
+            let ui = layout.to_json();
+            query_sqlite::set_ui(&mut tx, store, scene_id, &id, ui.as_deref()).await?;
+            row.ui = ui;
         }
         self.store_configured(&mut tx, store, &id, &prepared)
             .await?;
@@ -1095,17 +1447,47 @@ impl Service {
     /// position refuses the whole request. Layout isn't content: no
     /// revision, no reload, no draft change (the change counter still moves,
     /// so live views see it).
+    #[cfg(test)]
     pub(crate) async fn set_layout(
         &self,
         scene_id: &str,
         nodes: &BTreeMap<String, Option<Position>>,
         edges: &BTreeMap<String, Option<Position>>,
     ) -> Result<(), ServiceError> {
-        let errors: Vec<String> = nodes
+        self.set_layout_with(scene_id, nodes, edges, &InnerPlaces::new())
+            .await
+    }
+
+    /// [`Self::set_layout`], also placing the inner nodes of graph settings.
+    pub(crate) async fn set_layout_with(
+        &self,
+        scene_id: &str,
+        nodes: &BTreeMap<String, Option<Position>>,
+        edges: &BTreeMap<String, Option<Position>>,
+        inner: &InnerPlaces,
+    ) -> Result<(), ServiceError> {
+        let mut errors: Vec<String> = nodes
             .iter()
             .chain(edges)
             .filter_map(|(id, p)| p.as_ref()?.check().err().map(|e| format!("{id}: {e}")))
             .collect();
+        for (node, settings) in inner {
+            for (setting, places) in settings {
+                if setting.is_empty() || setting.len() > MAX_INNER_KEY {
+                    errors.push(format!("{node}: a setting's name is empty or too long"));
+                }
+                for (id, p) in places {
+                    if id.is_empty() || id.len() > MAX_INNER_KEY {
+                        errors.push(format!(
+                            "{node}.{setting}: an inner id is empty or too long"
+                        ));
+                    }
+                    if let Some(Err(e)) = p.as_ref().map(Position::check) {
+                        errors.push(format!("{node}.{setting}.{id}: {e}"));
+                    }
+                }
+            }
+        }
         if !errors.is_empty() {
             return Err(ServiceError::Invalid(errors));
         }
@@ -1116,13 +1498,31 @@ impl Service {
             .map_err(not_found("scene"))?;
         let mut tx = conn.begin_with(WRITE_TX).await?;
         let mut unknown = vec![];
-        for (id, position) in nodes {
-            let ui = position.map(Position::to_json);
-            let live =
-                query_sqlite::set_ui(&mut tx, Store::Live, scene_id, id, ui.as_deref()).await?;
-            let draft =
-                query_sqlite::set_ui(&mut tx, Store::Draft, scene_id, id, ui.as_deref()).await?;
-            if !live && !draft {
+        let placed: BTreeSet<&String> = nodes.keys().chain(inner.keys()).collect();
+        for id in placed {
+            let mut found = false;
+            for store in [Store::Live, Store::Draft] {
+                let Some(ui) = query_sqlite::get_ui(&mut tx, store, scene_id, id).await? else {
+                    continue;
+                };
+                found = true;
+                let mut layout = NodeLayout::from_json(ui.as_deref());
+                if let Some(position) = nodes.get(id) {
+                    layout.set_position(*position);
+                }
+                for (setting, places) in inner.get(id).into_iter().flatten() {
+                    layout.place_inner(setting, places);
+                    let held = layout.inner.get(setting).map_or(0, BTreeMap::len);
+                    if held > MAX_INNER_POSITIONS {
+                        return Err(ServiceError::Invalid(vec![format!(
+                            "{id}.{setting}: at most {MAX_INNER_POSITIONS} inner positions"
+                        )]));
+                    }
+                }
+                let ui = layout.to_json();
+                query_sqlite::set_ui(&mut tx, store, scene_id, id, ui.as_deref()).await?;
+            }
+            if !found {
                 unknown.push(format!("{id}: no such node in this scene"));
             }
         }
@@ -1346,6 +1746,8 @@ impl Service {
         {
             errors.push(problem);
         }
+        // What the configurator refused about a draft's unfinished settings.
+        let mut refused = vec![];
         // A draft's incomplete node: stored without running its configurator.
         let mut incomplete = false;
         if lenient
@@ -1377,6 +1779,7 @@ impl Service {
             {
                 // The configurator's own errors are the answer.
                 Err(problems) => return Err(ServiceError::Invalid(problems)),
+                Ok(Configure::Refused(problems)) => refused = problems,
                 Ok(Configure::Ran(c)) => configured = Some(c),
                 Ok(Configure::Pending) => {
                     pending = rules.as_ref().map_or(&[], |r| r.spec.configured_fields());
@@ -1412,6 +1815,7 @@ impl Service {
             plugin_id: plugin.id,
             plugin_version: Some(plugin.version),
             config_json: serde_json::to_string(&config).expect("config serializes"),
+            refusal: (!refused.is_empty()).then(|| (config.launch_args.clone(), refused)),
             configured,
         })
     }
@@ -1491,7 +1895,7 @@ impl Service {
             config.launch_args = user_part(&config.launch_args);
             return Ok(Ok(Configure::Pending));
         }
-        Ok(self
+        match self
             .run_configurator(
                 &package,
                 node_id,
@@ -1500,10 +1904,19 @@ impl Service {
                 remote.as_ref(),
             )
             .await
-            .map(|c| {
+        {
+            Ok(c) => {
                 config.launch_args = c.launch_args.clone();
-                Configure::Ran(c)
-            }))
+                Ok(Ok(Configure::Ran(c)))
+            }
+            // A draft keeps unfinished settings. Values configured from
+            // earlier settings would look valid, so they go.
+            Err(problems) if store == Store::Draft => {
+                config.launch_args = user_part(&config.launch_args);
+                Ok(Ok(Configure::Refused(problems)))
+            }
+            Err(problems) => Ok(Err(problems)),
+        }
     }
 
     async fn run_configurator(
@@ -1567,6 +1980,9 @@ impl Service {
             configurator::store_files(tx, store, &self.files.files_dir, node_id, configured)
                 .await
                 .map_err(ServiceError::Unknown)?;
+        }
+        if let Some((args, errors)) = &prepared.refusal {
+            configurator::store_refusal(tx, node_id, args, errors).await?;
         }
         Ok(())
     }
@@ -1653,6 +2069,7 @@ impl Service {
             plugin_version: Some(plugin.version.clone()),
             config_json: serde_json::to_string(&config).expect("config serializes"),
             configured: Some(configured),
+            refusal: None,
         };
         let mut tx = conn.begin_with(WRITE_TX).await?;
         let row =
@@ -1844,6 +2261,8 @@ enum Configure {
     Kept,
     /// A file the settings name isn't uploaded yet: it runs once it is.
     Pending,
+    /// A draft's settings it refused: kept, without configured values.
+    Refused(Vec<String>),
     /// A remote node, or a plugin without a configurator.
     NotApplicable,
 }
@@ -1856,6 +2275,8 @@ pub(super) struct PreparedNode {
     config_json: String,
     /// The configurator's run, if it ran: its files become the node's uploads.
     configured: Option<flwrs_plugin::package::configure::Configured>,
+    /// A draft's settings its configurator refused, and why.
+    refusal: Option<(Value, Vec<String>)>,
 }
 
 impl PreparedNode {
@@ -1878,6 +2299,22 @@ fn validate_against_plugin(
 ) -> Result<Vec<String>, ServiceError> {
     let rules = NodeRules::of(plugin).map_err(ServiceError::Unknown)?;
     Ok(config.validate(&rules.plugin_rules(), defaults))
+}
+
+/// A scene's nodes as the group rules read them: (id, config, plugin id).
+pub(super) async fn group_entries(
+    conn: &mut sqlx::SqliteConnection,
+    store: Store,
+    scene_id: &str,
+) -> Result<Vec<(String, NodeConfig, String)>, ServiceError> {
+    query_sqlite::list_nodes(conn, store, scene_id)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let node = Node::try_from(row)?;
+            Ok((node.id, node.config, node.plugin_id))
+        })
+        .collect()
 }
 
 /// Whole-scene rules the DB can't express, checked before commit:
@@ -1960,6 +2397,10 @@ pub(crate) struct SceneCheck {
     pub problems: Vec<String>,
     /// Worth knowing, but not blocking (e.g. a different plugin version).
     pub warnings: Vec<String>,
+    /// The core count of each local node whose plugin takes one.
+    pub threads: BTreeMap<String, NodeThreads>,
+    /// The devices each local node claims.
+    pub devices: BTreeMap<String, Vec<NodeDevice>>,
 }
 
 /// Upper bound for a scene's `max_hops` (the DB has the same CHECK). High
@@ -1974,6 +2415,8 @@ pub(crate) struct SceneInput {
     /// `None` = use the server default (`[director] max_hops`).
     pub max_hops: Option<u32>,
     pub defaults: SceneDefaults,
+    /// `None` keeps the groups the scene (or draft) has.
+    pub groups: Option<Vec<Group>>,
 }
 
 impl SceneInput {
@@ -2001,6 +2444,10 @@ fn check_scene(input: &SceneInput) -> Result<(String, Option<u32>), ServiceError
         && !(1..=MAX_HOPS_LIMIT).contains(&hops)
     {
         problems.push(format!("max_hops must be between 1 and {MAX_HOPS_LIMIT}"));
+    }
+    problems.extend(input.defaults.validate());
+    if let Some(groups) = &input.groups {
+        problems.extend(scene_groups::settings_problems(groups));
     }
     if problems.is_empty() {
         Ok((name, input.max_hops))

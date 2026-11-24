@@ -36,13 +36,20 @@
 
   type Attention = { scene: SceneRow; reason: string; level: 'danger' | 'warn' };
   const summary = $derived.by(() => {
-    const counts = { running: 0, failed: 0, notRunning: 0, disabled: 0 };
+    const counts = { running: 0, waiting: 0, failed: 0, notRunning: 0, disabled: 0 };
     const attention: Attention[] = [];
     for (const scene of rows ?? []) {
       const s = byId.get(scene.id);
       if (s?.state === 'FAILED') {
         counts.failed++;
         attention.push({ scene, level: 'danger', reason: `failed to start (${s.errors} error${s.errors === 1 ? '' : 's'})` });
+      } else if (s?.state === 'WAITING') {
+        counts.waiting++;
+        attention.push({
+          scene,
+          level: 'warn',
+          reason: s.errors ? `waiting: ${s.errors} pre-flight problem${s.errors === 1 ? '' : 's'}, retrying` : 'waiting for its pre-flight check',
+        });
       } else if (s?.state === 'RUNNING') {
         counts.running++;
         if (s.running_nodes < s.nodes) {
@@ -134,6 +141,7 @@
       <span class="hero">{rows?.length ?? '–'}</span>
       <span class="parts">
         <span><b>{summary.counts.running}</b> running</span>
+        {#if summary.counts.waiting}<span class="warn"><b>{summary.counts.waiting}</b> waiting</span>{/if}
         {#if summary.counts.failed}<span class="bad"><b>{summary.counts.failed}</b> failed</span>{/if}
         {#if summary.counts.notRunning}<span class="warn"><b>{summary.counts.notRunning}</b> not running</span>{/if}
         <span class="muted"><b>{summary.counts.disabled}</b> disabled</span>

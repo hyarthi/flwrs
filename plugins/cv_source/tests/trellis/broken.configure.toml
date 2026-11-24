@@ -1,0 +1,4 @@
+name = "a graph with two sources is refused"
+launch_args = "broken.json"
+expect = "error"
+errors_contain = ["source"]

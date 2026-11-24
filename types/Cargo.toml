@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 flwrs-plugin.workspace = true # payload and schema types
 pbjson-types.workspace = true # Timestamp
+serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true # RFC 3339 datetimes
 base64.workspace = true # bytes in JSON

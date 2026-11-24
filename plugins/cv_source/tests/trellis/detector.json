@@ -1,0 +1,19 @@
+{
+  "graph": {
+    "nodes": {
+      "camera": { "type": "source" },
+      "det": {
+        "type": "model", "model": "fixed_det.onnx",
+        "pre": { "width": 64, "height": 32, "resize": "stretch", "color": "rgb", "dtype": "f32", "layout": "nchw" },
+        "decode": { "type": "detections_e2e", "output": "rows" },
+        "labels": ["person", "dog"]
+      },
+      "out": { "type": "emit", "mode": "frames", "keypoints": false }
+    },
+    "links": [
+      { "from": "camera.frame", "to": "det.frame" },
+      { "from": "det.objects", "to": "out.objects" }
+    ]
+  },
+  "files": ["fixed_det.onnx"]
+}

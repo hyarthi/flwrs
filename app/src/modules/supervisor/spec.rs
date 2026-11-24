@@ -43,6 +43,8 @@ pub(crate) struct NodeSpec {
     pub out_schema: Option<SchemaDefinition>,
     pub launch: Launch,
     pub timings: Timings,
+    /// The scene fails if this node does.
+    pub critical: bool,
     /// The node's inbound queue (sinks and transforms).
     pub queue: QueueSpec,
     pub delivery: DeliverySpec,
@@ -266,7 +268,8 @@ impl QueueSpec {
 /// `[director] spill_default`, the core count to `[director] plugin_threads`.
 /// Left out where there's no single value: `queue.when_full` (block, or drop
 /// newest on a cycle), `queue.durable` (the scene's default, else off),
-/// `max_restarts` (no limit) and `threads` (the plugin decides).
+/// `max_restarts` (5 until a critical or just-updated node first runs,
+/// otherwise no limit; -1 = try forever) and `threads` (the plugin decides).
 pub(crate) fn node_defaults(
     manifest_defaults: &RuntimeConfig,
     spill_default: bool,
@@ -304,6 +307,8 @@ pub(crate) fn node_defaults(
     if let Some(max) = timings.max_restarts {
         out["max_restarts"] = serde_json::json!(max);
     }
+    out["is_critical_path"] =
+        serde_json::json!(manifest_defaults.is_critical_path.unwrap_or(false));
     if let Some(threads) = manifest_defaults
         .threads
         .or(plugin_threads)
@@ -338,8 +343,13 @@ pub(crate) struct Timings {
     /// `None`: every relaunch waits `restart_delay`.
     pub backoff: Option<Backoff>,
     pub kill_grace: Duration,
-    /// Consecutive failed launches before the node goes `Failed`; `None` = no limit.
-    pub max_restarts: Option<u64>,
+    /// Consecutive failed launches before the node goes `Failed`.
+    /// `Some(0)`: no retry. `Some(-1)`: try forever. `None`: see
+    /// `first_run_max_restarts`.
+    pub max_restarts: Option<i64>,
+    /// The limit while the node has never reached `Running`, when
+    /// `max_restarts` sets none (a critical node, or one a reload started).
+    pub first_run_max_restarts: Option<u64>,
     pub shutdown_grace: Duration,
 }
 
@@ -392,6 +402,7 @@ impl Timings {
                 DEFAULT_KILL_GRACE_MS,
             ),
             max_restarts: node.max_restarts.or(defaults.max_restarts),
+            first_run_max_restarts: None,
             shutdown_grace: ms(
                 node.shutdown_grace_ms,
                 defaults.shutdown_grace_ms,
@@ -436,6 +447,8 @@ pub(crate) struct Surroundings<'a> {
     pub uploads: &'a [NodeUpload],
     /// `[director] plugin_threads`: cores for plugins whose nodes don't say.
     pub plugin_threads: Option<u32>,
+    /// This node's share of its `resources` group's core budget.
+    pub group_threads: Option<u32>,
 }
 
 impl NodeSpec {
@@ -457,6 +470,7 @@ impl NodeSpec {
             files_dir,
             uploads,
             plugin_threads,
+            group_threads,
         } = *at;
         let mut errors = vec![];
         let manifest = plugin
@@ -556,6 +570,7 @@ impl NodeSpec {
                         config
                             .runtime
                             .threads
+                            .or(group_threads)
                             .or(defaults.threads)
                             .or(plugin_threads),
                     ),
@@ -585,6 +600,11 @@ impl NodeSpec {
             in_schema,
             out_schema,
             timings: Timings::resolve(&config.runtime, &defaults),
+            critical: config
+                .runtime
+                .is_critical_path
+                .or(defaults.is_critical_path)
+                .unwrap_or(false),
             queue: QueueSpec::resolve(&config.runtime, &defaults),
             delivery: DeliverySpec::resolve(&config.runtime, &defaults),
             launch,
@@ -640,12 +660,14 @@ mod defaults_tests {
             assert!(builtin["queue"].get(absent).is_none(), "{absent}");
         }
         assert!(builtin.get("max_restarts").is_none());
+        assert_eq!(builtin["is_critical_path"], json!(false));
 
         // The manifest's runtime_defaults win.
         let manifest = RuntimeConfig::parse(&json!({
             "queue": {"capacity": 7, "when_full": "drop_oldest", "durable": true, "spill": {"enabled": false}},
             "delivery": {"retry_delay_ms": 250},
             "max_restarts": 3,
+            "is_critical_path": true,
             "threads": 1
         }))
         .unwrap();
@@ -656,6 +678,7 @@ mod defaults_tests {
         assert_eq!(ours["queue"]["spill"]["enabled"], json!(false));
         assert_eq!(ours["delivery"]["retry_delay_ms"], json!(250));
         assert_eq!(ours["max_restarts"], json!(3));
+        assert_eq!(ours["is_critical_path"], json!(true));
         assert_eq!(ours["threads"], json!(1));
         // `threads: 0` and no server value: the plugin decides.
         assert!(

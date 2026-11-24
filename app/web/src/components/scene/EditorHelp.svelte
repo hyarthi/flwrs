@@ -62,6 +62,18 @@
     </section>
 
     <section>
+      <h3>Groups</h3>
+      <dl>
+        <dt>Create and edit</dt>
+        <dd>In the scene’s Settings. Chips on a node name its groups; hover one, or a legend entry, to pick out the members.</dd>
+        <dt>Join</dt>
+        <dd>Drop a node on a frame, or tick the group in the node’s settings.</dd>
+        <dt>Leave</dt>
+        <dd>Right-click the node, or <kbd>{mac ? '⌥' : 'Alt'}</kbd> + drag it out of the frame, or untick it in its settings. A plain drag only stretches the outline.</dd>
+      </dl>
+    </section>
+
+    <section>
       <h3>The canvas</h3>
       <dl>
         <dt>Pan and zoom</dt>

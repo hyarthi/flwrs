@@ -2,6 +2,7 @@ pub mod core;
 pub(crate) mod credits;
 pub mod error;
 pub mod frame;
+pub mod live;
 pub(crate) mod logger;
 pub(crate) mod msg_client;
 pub(crate) mod runtime;

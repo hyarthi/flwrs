@@ -45,8 +45,9 @@ pub(crate) struct PluginInfo {
     /// `runtime_defaults`, else the built-in defaults, with the server's
     /// `[director] spill_default` and `plugin_threads`. Left out where there's
     /// no single value: `queue.when_full` (block; drop newest on a cycle),
-    /// `queue.durable` (the scene's default, else off), `max_restarts` (no
-    /// limit), `threads` (the plugin decides).
+    /// `queue.durable` (the scene's default, else off), `max_restarts` (5
+    /// until a critical or just-updated node first runs, otherwise no limit;
+    /// -1 = try forever), `threads` (the plugin decides).
     #[schema(value_type = Object)]
     pub node_defaults: serde_json::Value,
     /// The manifest's format version (1 or 2).
@@ -324,6 +325,34 @@ async fn get_definitions(
     Path((id, path)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     schema_file(service, &id, &path, definitions_of).await
+}
+
+/// `x-flwrs-graph` `catalog` (the node types of a graph setting's editor).
+fn graph_catalog_of(map: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    map.get("x-flwrs-graph")?.get("catalog")?.as_str()
+}
+
+#[utoipa::path(
+    get,
+    path = "/by-id/{id}/graph-catalogs/{path}",
+    operation_id = "get-plugin-graph-catalog",
+    summary = "Get a graph setting's catalog",
+    description = "A JSON file the launch-args schema names in an `x-flwrs-graph`: the node types, ports and connection rules of a graph editor. Only such files; served as `text/plain`, sandboxed, `ETag` = the package's hash.",
+    params(
+        ("id" = String, Path, description = "Plugin id"),
+        ("path" = String, Path, description = "The file's path in the package"),
+    ),
+    responses(
+        (status = 200, description = "The catalog", content_type = "text/plain", body = String),
+        (status = 304, description = "Not modified (If-None-Match)"),
+        (status = 404, description = "Plugin not found, or the schema names no such file", body = ErrorBody),
+    )
+)]
+async fn get_graph_catalog(
+    State(service): State<Svc>,
+    Path((id, path)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    schema_file(service, &id, &path, graph_catalog_of).await
 }
 
 #[utoipa::path(
@@ -894,6 +923,7 @@ async fn replace_definition(
         get_ui_file,
         get_definitions,
         get_template,
+        get_graph_catalog,
         node_schemas,
         upload_plugin,
         upgrade_plugin,
@@ -939,6 +969,10 @@ impl Api {
                 get(get_definitions),
             )
             .route("/plugins/by-id/{id}/templates/{*path}", get(get_template))
+            .route(
+                "/plugins/by-id/{id}/graph-catalogs/{*path}",
+                get(get_graph_catalog),
+            )
             .route(
                 "/plugins/by-id/{id}/node-schemas",
                 axum::routing::post(node_schemas),

@@ -12,6 +12,7 @@
   "payload_schemas": {
     "in": "schema/in.json"
   },
+  "runtime_defaults": { "is_critical_path": false },
   "ui": {
     "icon": "ui/ws-sink.svg",
     "categories": [

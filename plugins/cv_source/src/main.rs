@@ -3,8 +3,12 @@ mod settings;
 
 use crate::settings::Args;
 use clap::Parser;
+use flwrs_cv_source::emit::{self, Emitter, Outbox};
+use flwrs_cv_source::live::Live;
+use flwrs_plugin::plugin::live::LiveFeedPublisher;
 use flwrs_plugin::source::runner::{SourceRunner, SourceRunnerConfig};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 fn main() -> ExitCode {
     // The debug mode has no hub, so none of the bootstrap arguments.
@@ -60,11 +64,29 @@ async fn run(args: Args) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let emitter = Arc::new(Mutex::new(Emitter::new(emit::config_of(&settings.graph))));
+    let outbox = Arc::new(Outbox::new(emit::MAX_QUEUED_EVENTS));
+    // No capability offered, and no thread, unless the setting turns it on.
+    let live = if settings.live.any() {
+        let feed = LiveFeedPublisher::new();
+        match Live::new(&settings.live, &settings.graph, feed.clone()) {
+            Ok(live) => Some((feed, Arc::new(Mutex::new(live)))),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     let source = plugin::VisionSource {
         settings,
-        plan: std::sync::Arc::new(std::sync::Mutex::new(plan)),
+        plan: Arc::new(Mutex::new(plan)),
         warnings,
         sink: None,
+        outbox,
+        emitter,
+        live,
     };
     let config = SourceRunnerConfig {
         plugin_id: args.bootstrap.id.clone(),
@@ -150,6 +172,100 @@ mod package_tests {
         );
     }
 
+    /// The editor's catalog says what the plugin does: the same node types
+    /// and settings, and for every example graph the same ports.
+    #[test]
+    fn the_graph_catalog_agrees_with_the_plugin() {
+        use flwrs_cv_source::graph::{self, Ports};
+        use flwrs_plugin::package::graph::{Catalog, Condition, Port};
+        use serde_json::Value;
+
+        let schema = json("schema/launch_args.json");
+        let text = std::fs::read_to_string(path("schema/graph_catalog.json")).unwrap();
+        let catalog = Catalog::parse(&text, &schema).unwrap();
+        // Node types: those the schema's graph accepts.
+        let in_schema: BTreeSet<String> = schema
+            .pointer("/properties/graph/properties/nodes/additionalProperties/oneOf")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                r["$ref"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let listed: BTreeSet<String> = catalog.node_types.keys().cloned().collect();
+        assert_eq!(listed, in_schema);
+        for (id, node) in &catalog.node_types {
+            assert_eq!(node.settings, format!("#/$defs/{id}"));
+        }
+        // Every decoder has an output type.
+        let decoders = schema["$defs"]["decoder"]["oneOf"].as_array().unwrap();
+        let outputs = &catalog.node_types["model"].outputs[0];
+        let map = &outputs.type_from.as_ref().unwrap().map;
+        for decoder in decoders {
+            let name = decoder["properties"]["type"]["const"].as_str().unwrap();
+            assert!(map.contains_key(name), "decoder {name} has no output type");
+        }
+
+        fn holds(c: &Condition, node: &Value) -> bool {
+            let value = node.pointer(&c.pointer).or(c.default.as_ref());
+            if let Some(present) = c.present {
+                return value.is_some() == present;
+            }
+            if let Some(v) = &c.equals {
+                return value == Some(v);
+            }
+            value != c.not_equals.as_ref()
+        }
+        fn ports(list: &[Port], node: &Value) -> BTreeSet<(String, String)> {
+            list.iter()
+                .filter(|p| p.when.as_ref().is_none_or(|c| holds(c, node)))
+                .map(|p| {
+                    let t = p.port_type.clone().unwrap_or_else(|| {
+                        let from = p.type_from.as_ref().unwrap();
+                        from.map[node.pointer(&from.pointer).unwrap().as_str().unwrap()].clone()
+                    });
+                    (p.name.clone().unwrap_or_else(|| t.clone()), t)
+                })
+                .collect()
+        }
+        let actual = |list: &[(&str, graph::PortType)]| -> BTreeSet<(String, String)> {
+            list.iter()
+                .map(|(n, t)| (n.to_string(), t.name().to_string()))
+                .collect()
+        };
+        let mut checked = 0;
+        for entry in std::fs::read_dir(path("examples/graphs")).unwrap() {
+            let file = entry.unwrap().path();
+            let example: Value =
+                serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            let Ok(config) = serde_json::from_value::<graph::GraphConfig>(example["graph"].clone())
+            else {
+                panic!("{}", file.display());
+            };
+            for (id, node) in &config.nodes {
+                let raw = &example["graph"]["nodes"][id];
+                let kind = &catalog.node_types[raw["type"].as_str().unwrap()];
+                let of = Ports::of(node);
+                let at = format!("{} {id}", file.display());
+                assert_eq!(ports(&kind.inputs, raw), actual(&of.inputs), "{at}: inputs");
+                assert_eq!(
+                    ports(&kind.outputs, raw),
+                    actual(&of.outputs),
+                    "{at}: outputs"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 50, "only {checked} nodes checked");
+    }
+
     /// Every example graph is valid by the launch-args schema and by the
     /// plugin's own check.
     #[test]
@@ -162,6 +278,13 @@ mod package_tests {
             let file = entry.unwrap().path();
             let example: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            // A build without Lua rightly refuses a graph with a Lua rule.
+            let uses_lua = example["graph"]["nodes"]
+                .as_object()
+                .is_some_and(|nodes| nodes.values().any(|n| n["type"] == "lua"));
+            if uses_lua && !cfg!(feature = "lua") {
+                continue;
+            }
             let (graph_config, _) = flwrs_cv_source::graph::parse(&example["graph"])
                 .unwrap_or_else(|p| panic!("{}: {p:?}", file.display()));
             let files = flwrs_cv_source::graph::uploads(&graph_config);
@@ -237,6 +360,29 @@ mod package_tests {
             std::path::Path::new("config/yolov10n.onnx")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `live` setting: the schema's defaults and limits are the code's.
+    #[test]
+    fn the_live_setting_matches_the_schema() {
+        use flwrs_cv_source::live::{
+            LiveConfig, MAX_PREVIEW_FPS, MAX_PREVIEW_WIDTH, MIN_PREVIEW_FPS, MIN_PREVIEW_WIDTH,
+        };
+        let schema = json("schema/launch_args.json");
+        let live = &schema["properties"]["live"]["properties"];
+        let preview = &live["preview"]["properties"];
+        let defaults = LiveConfig::default();
+        assert_eq!(live["stats"]["default"], defaults.stats);
+        assert_eq!(preview["enabled"]["default"], defaults.preview.enabled);
+        assert_eq!(
+            preview["fps"]["default"],
+            f64::from(defaults.preview.fps) as u32
+        );
+        assert_eq!(preview["width"]["default"], defaults.preview.width);
+        assert_eq!(preview["fps"]["minimum"], f64::from(MIN_PREVIEW_FPS));
+        assert_eq!(preview["fps"]["maximum"], MAX_PREVIEW_FPS as u32);
+        assert_eq!(preview["width"]["minimum"], MIN_PREVIEW_WIDTH);
+        assert_eq!(preview["width"]["maximum"], MAX_PREVIEW_WIDTH);
     }
 
     /// The `input` setting: what the schema and the plugin take and refuse.

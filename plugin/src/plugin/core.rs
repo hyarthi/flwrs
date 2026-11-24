@@ -1,4 +1,5 @@
 use crate::plugin::frame::PROTOCOL_VERSION;
+use crate::plugin::live::LiveFeedPublisher;
 use crate::plugin::msg_client::{Connector, HubClient};
 use crate::schema::payload::PluginPayload;
 use crate::schema::payload::{
@@ -69,6 +70,7 @@ pub struct InitializeRequest {
     version: String,
     in_schema: SchemaDefinition,
     out_schema: SchemaDefinition,
+    live_feed: Option<LiveFeedPublisher>,
 }
 
 impl InitializeRequest {
@@ -78,6 +80,7 @@ impl InitializeRequest {
             version: String::new(),
             in_schema: SchemaDefinition::new(),
             out_schema: SchemaDefinition::new(),
+            live_feed: None,
         }
     }
 
@@ -110,6 +113,18 @@ impl InitializeRequest {
         self.out_schema = schema;
         self
     }
+
+    /// Offers the `LIVE_FEED` capability, with `publisher` as the plugin's
+    /// handle to it (it's cheap to clone: keep one where the work happens).
+    pub fn with_live_feed(mut self, publisher: LiveFeedPublisher) -> Self {
+        self.live_feed = Some(publisher);
+        self
+    }
+
+    /// The publisher the runner connects to the hub client.
+    pub(crate) fn live_feed(&self) -> Option<LiveFeedPublisher> {
+        self.live_feed.clone()
+    }
 }
 
 impl Default for InitializeRequest {
@@ -128,6 +143,10 @@ impl InitializeRequest {
             PluginType::Source => (None, Some(self.out_schema.into())),
             _ => (Some(self.in_schema.into()), Some(self.out_schema.into())),
         };
+        let mut capabilities = vec![Capability::Acks as i32, Capability::Credits as i32];
+        if self.live_feed.is_some() {
+            capabilities.push(Capability::LiveFeed as i32);
+        }
         Initialize {
             instance_id: self.id,
             plugin_version: self.version,
@@ -137,7 +156,7 @@ impl InitializeRequest {
             out_schema,
             min_protocol_version: PROTOCOL_VERSION,
             max_protocol_version: PROTOCOL_VERSION,
-            capabilities: vec![Capability::Acks as i32, Capability::Credits as i32],
+            capabilities,
             max_unacked: 0,
         }
     }

@@ -217,7 +217,7 @@ impl Service {
         {
             return Ok(None);
         }
-        let configured = self
+        let ran = self
             .run_configurator(
                 &package,
                 &node.id,
@@ -225,14 +225,30 @@ impl Service {
                 uploads,
                 remote.as_ref(),
             )
-            .await
-            .map_err(|mut errors| {
+            .await;
+        let configured = match ran {
+            Ok(configured) => configured,
+            // A draft's unfinished node (nothing configured to lose) takes
+            // the file; its check says what's still wrong.
+            Err(errors) if store == Store::Draft && never_ran => {
+                return Ok(Some(PreparedNode {
+                    name: node.name.clone(),
+                    node_type: plugin.plugin_type.clone(),
+                    plugin_id: plugin.id.clone(),
+                    plugin_version: Some(plugin.version.clone()),
+                    config_json: serde_json::to_string(&node.config).expect("config serializes"),
+                    configured: None,
+                    refusal: Some((node.config.launch_args.clone(), errors)),
+                }));
+            }
+            Err(mut errors) => {
                 errors.insert(
                     0,
                     format!("the node's configurator refused the new {name:?}"),
                 );
-                ServiceError::Invalid(errors)
-            })?;
+                return Err(ServiceError::Invalid(errors));
+            }
+        };
         let mut config = node.config.clone();
         config.launch_args = configured.launch_args.clone();
         Ok(Some(PreparedNode {
@@ -242,6 +258,7 @@ impl Service {
             plugin_version: Some(plugin.version.clone()),
             config_json: serde_json::to_string(&config).expect("config serializes"),
             configured: Some(configured),
+            refusal: None,
         }))
     }
 

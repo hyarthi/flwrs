@@ -116,6 +116,8 @@ pub(crate) struct Negotiated {
     pub credits: bool,
     /// With `acks`, for consumers: the most unacked events in flight.
     pub max_unacked: u32,
+    /// Live observation data (stats, preview frames).
+    pub live_feed: bool,
 }
 
 impl Negotiated {
@@ -127,6 +129,9 @@ impl Negotiated {
         if self.credits {
             caps.push(Capability::Credits as i32);
         }
+        if self.live_feed {
+            caps.push(Capability::LiveFeed as i32);
+        }
         caps
     }
 }
@@ -135,7 +140,12 @@ impl Negotiated {
 /// accepted (`docs/protocol.md`, section 4.2).
 pub(crate) fn plugin_may_send(plugin_type: PluginType, code: MsgCode) -> bool {
     match code {
-        MsgCode::Log | MsgCode::Error | MsgCode::Exit | MsgCode::Ping | MsgCode::Pong => true,
+        MsgCode::Log
+        | MsgCode::Error
+        | MsgCode::Exit
+        | MsgCode::Ping
+        | MsgCode::Pong
+        | MsgCode::LiveFeed => true,
         MsgCode::Event => plugin_type != PluginType::Sink,
         MsgCode::Ack | MsgCode::Nack => plugin_type != PluginType::Source,
         _ => false,
@@ -161,6 +171,7 @@ mod tests {
                 MsgCode::InitializeResponse,
                 MsgCode::Shutdown,
                 MsgCode::Credit,
+                MsgCode::LiveFeedControl,
             ] {
                 assert!(!plugin_may_send(t, code), "{t:?} {code:?}");
             }

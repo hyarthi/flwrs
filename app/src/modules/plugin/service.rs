@@ -191,6 +191,11 @@ impl Service {
             .set((spill_default, plugin_threads));
     }
 
+    /// `[director] plugin_threads`.
+    pub(crate) fn server_plugin_threads(&self) -> Option<u32> {
+        self.node_server_defaults.get().and_then(|d| d.1)
+    }
+
     /// What a node of this plugin gets for each run-time setting it leaves
     /// out (`supervisor::spec::node_defaults`).
     pub(crate) fn node_defaults(
@@ -661,7 +666,9 @@ impl Service {
     /// local nodes' `launch_args` (schema, delivery, code), and every node's
     /// payload schemas when the package takes them from the node. With a
     /// configurator, it runs (from `staged`) for every local node first;
-    /// their new configs are returned, to be stored with the upgrade.
+    /// their new configs are returned, to be stored with the upgrade. Nodes
+    /// whose configurator already refused their settings are skipped
+    /// (`already_refused`): they keep their settings and take the new version.
     async fn check_nodes_against(
         &self,
         package: &Package,
@@ -706,6 +713,23 @@ impl Service {
             let endpoint: Option<crate::modules::node_config::RemoteConfigurator> = config
                 .get("configurator")
                 .and_then(|c| serde_json::from_value(c.clone()).ok());
+            // Skipped: a node whose configurator already refused its settings
+            // (unfinished work a disabled scene took from a draft). None of
+            // its configured fields are set and the refusal is on record for
+            // exactly these settings. It isn't run or checked again: it moves
+            // to the new version as it is, and `check` keeps reporting it.
+            if configurator.is_some()
+                && (!remote || endpoint.is_some())
+                && self
+                    .already_refused(&mut conn, &node_id, &args, &package.manifest)
+                    .await?
+            {
+                log::info!(
+                    "Plugin registry: upgrade of {}: node [{node_id}] skipped, its configurator already refused its settings",
+                    package.manifest.id
+                );
+                continue;
+            }
             if let Some(package_ref) = &configurator
                 && (!remote || endpoint.is_some())
             {
@@ -781,6 +805,29 @@ impl Service {
         } else {
             Err(ServiceError::IncompatibleNodes(problems))
         }
+    }
+
+    /// Whether a node's configurator already refused its current settings:
+    /// a refusal is recorded for them and none of the configured fields
+    /// (the new manifest's) is set.
+    async fn already_refused(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        node_id: &str,
+        args: &serde_json::Value,
+        manifest: &flwrs_plugin::package::Manifest,
+    ) -> Result<bool, ServiceError> {
+        let fields = manifest
+            .configurator
+            .as_ref()
+            .map(|c| c.fields.as_slice())
+            .unwrap_or_default();
+        if fields.iter().any(|f| args.get(f.as_str()).is_some()) {
+            return Ok(false);
+        }
+        Ok(crate::modules::configurator::warnings(conn, node_id, args)
+            .await?
+            .is_some_and(|notes| !notes.errors.is_empty()))
     }
 
     async fn conn(&self) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, ServiceError> {

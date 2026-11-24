@@ -59,6 +59,16 @@ impl registry::Service for Service {
             nodes_dir: config.nodes_dir.clone(),
             files_dir: config.files_dir.clone(),
             plugin_threads: config.plugin_threads,
+            preflight_retry: match config.preflight_retry.resolve() {
+                Ok(_) => config.preflight_retry.clone(),
+                Err(problems) => {
+                    log::error!(
+                        "Director: [director] preflight_retry: {}; using the defaults",
+                        problems.join("; ")
+                    );
+                    Default::default()
+                }
+            },
         };
         Engine::new(ctx, crate::modules::scene::service())
             .run(commands, shutdown_token)

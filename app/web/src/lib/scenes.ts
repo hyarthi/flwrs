@@ -17,7 +17,7 @@ export interface SceneRow {
   warnings: string[];
 }
 
-export type SceneState = 'RUNNING' | 'STOPPED' | 'FAILED';
+export type SceneState = 'RUNNING' | 'STOPPED' | 'WAITING' | 'FAILED';
 
 /** A scene in the `status` event (`SceneSummary`). */
 export interface SceneSummary {

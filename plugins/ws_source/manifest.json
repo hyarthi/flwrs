@@ -16,6 +16,7 @@
     "executable": "bin/flwrs-ws-source-config",
     "fields": ["out_schema"]
   },
+  "runtime_defaults": { "is_critical_path": false },
   "ui": {
     "icon": "ui/ws-source.svg",
     "categories": ["Inputs", "WebSocket", "AsyncAPI"],

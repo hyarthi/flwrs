@@ -23,7 +23,7 @@ pub(crate) struct SceneStatusResponse {
     path = "/by-id/{id}/status",
     operation_id = "scene-status",
     summary = "What the scene is doing: its state, and each node's state, queue and counters",
-    description = "`state` is RUNNING, STOPPED (disabled, or not started since the server started) or FAILED (with `errors`). Per node: the plugin's state (LAUNCHING, WAITING, RUNNING, DISCONNECTED, UNHEALTHY, STOPPING, STOPPED, FAILED), launches and the last error; `counters` (emitted, received, dropped, mapping errors, restarts); and the inbound queue (depth, drops by reason, time blocked, spill).",
+    description = "`state` is RUNNING, STOPPED (disabled, or not started since the server started), WAITING (a pre-flight check is running or waiting out retryable problems: `preflight`, `preflight_retry`; on a reload, the nodes keep running the old graph meanwhile) or FAILED (with `errors`). Per node: the plugin's state (LAUNCHING, WAITING, RUNNING, DISCONNECTED, UNHEALTHY, STOPPING, STOPPED, FAILED), launches and the last error; `counters` (emitted, received, dropped, mapping errors, restarts); and the inbound queue (depth, drops by reason, time blocked, spill).",
     params(("id" = String, Path, description = "Scene ID")),
     responses(
         (status = 200, description = "Status", body = SceneStatusResponse),
@@ -147,6 +147,9 @@ mod tests {
             errors: vec!["edge e: a sink can't send events".into()],
             max_hops: None,
             nodes: vec![],
+            preflight: vec![],
+            preflight_retry: None,
+            failed_update: None,
         };
         let ((code, body), ()) = tokio::join!(get(f.service, &uri), answer(Some(failed)));
         assert_eq!(code, StatusCode::OK);

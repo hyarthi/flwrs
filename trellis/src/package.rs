@@ -230,7 +230,11 @@ pub fn package(opts: &PackageOptions) -> Result<Packaged, String> {
     if let Some(executable) = &executable {
         files.insert(manifest.executable.clone(), (executable.clone(), 0o755));
     }
-    if let Some(c) = manifest.configurator.as_ref().filter(|c| !c.executable.is_empty()) {
+    if let Some(c) = manifest
+        .configurator
+        .as_ref()
+        .filter(|c| !c.executable.is_empty())
+    {
         let source = configurator_built
             .clone()
             .unwrap_or_else(|| dir.join(&c.executable));

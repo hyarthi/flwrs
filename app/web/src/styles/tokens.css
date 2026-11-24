@@ -51,6 +51,16 @@
   --series-3: light-dark(#1baf7a, #199e70);
   --chart-grid: light-dark(#eceef2, #242833);
 
+  /* Scene groups (categorical: chips, legend, frames on the canvas). Never for status. */
+  --group-1: light-dark(#2a78d6, #5b9df0);
+  --group-2: light-dark(#c2410c, #f08a5d);
+  --group-3: light-dark(#0f8a63, #34c796);
+  --group-4: light-dark(#7c3aed, #b08cf7);
+  --group-5: light-dark(#be185d, #f07eb0);
+  --group-6: light-dark(#0e7490, #45c1dc);
+  --group-7: light-dark(#8a6d00, #d9b92e);
+  --group-8: light-dark(#4d7c0f, #9bd14b);
+
   /* Type */
   --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;

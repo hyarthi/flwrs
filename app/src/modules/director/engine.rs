@@ -2,17 +2,19 @@
 //! in order and a slow stop of one scene doesn't hold up the others.
 
 use super::handle::{
-    DirectorCommand, DirectorError, Overview, SceneState, SceneStatus, SceneSummary, StatsSnapshot,
-    Usage,
+    DirectorCommand, DirectorError, FailedUpdate, Overview, PreflightIssue, PreflightRetryStatus,
+    SceneState, SceneStatus, SceneSummary, StatsSnapshot, Usage,
 };
+use super::preflight::{WaitEnd, WaitProgress, gave_up_line, preflight_loop};
 use super::queue::{delete_files, purge_files};
-use super::running::{Context, RunningScene};
-use crate::modules::scene::service::{Service as SceneService, ServiceError};
+use super::running::{Context, NodeFailure, RunningScene, nodes_to_start};
+use crate::modules::configurator::{self, PreflightTarget};
+use crate::modules::scene::service::{SceneSnapshot, Service as SceneService, ServiceError};
 use crate::modules::supervisor::{NodeState, workdir};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct Engine {
@@ -21,6 +23,39 @@ pub(crate) struct Engine {
 }
 
 type Done = oneshot::Sender<Result<(), DirectorError>>;
+
+/// A load held back by its pre-flight check. It runs on a task of its own,
+/// so the scene's worker keeps answering commands.
+struct Waiting {
+    cancel: CancellationToken,
+    task: JoinHandle<WaitEnd>,
+    progress: watch::Receiver<WaitProgress>,
+    snapshot: SceneSnapshot,
+    dones: Vec<Done>,
+}
+
+impl Waiting {
+    /// Stops the checks (their programs are killed); returns who's waiting.
+    fn cancel(self) -> Vec<Done> {
+        self.cancel.cancel();
+        self.dones
+    }
+}
+
+/// Resolves when the wait (if any) ends. Cancel-safe.
+async fn wait_end(waiting: &mut Option<Waiting>) -> WaitEnd {
+    match waiting {
+        Some(w) => (&mut w.task).await.unwrap_or_else(|e| WaitEnd::Problems {
+            issues: vec![PreflightIssue {
+                node_id: String::new(),
+                message: format!("the pre-flight check failed: {e}"),
+                retryable: false,
+            }],
+            gave_up: None,
+        }),
+        None => std::future::pending().await,
+    }
+}
 
 impl Engine {
     pub(crate) fn new(ctx: Context, scenes: &'static SceneService) -> Self {
@@ -36,6 +71,7 @@ impl Engine {
         shutdown: CancellationToken,
     ) {
         let engine = Arc::new(self);
+        engine.scenes.set_director_context(engine.ctx.clone());
         clean_spool_dir(&engine).await;
         clean_nodes_dir(&engine).await;
         let mut workers: HashMap<String, mpsc::UnboundedSender<DirectorCommand>> = HashMap::new();
@@ -237,12 +273,48 @@ async fn scene_worker(
     let mut running: Option<RunningScene> = None;
     let mut errors: Vec<String> = vec![];
     let mut backlog: VecDeque<DirectorCommand> = VecDeque::new();
+    let mut waiting: Option<Waiting> = None;
+    // The problems behind a `FAILED` from a pre-flight check.
+    let mut issues: Vec<PreflightIssue> = vec![];
+    // An update the running scene couldn't take: it keeps its old graph.
+    let mut failed_update: Option<FailedUpdate> = None;
+    // Nodes that reached `Failed`.
+    let (node_failed, mut node_failures) = mpsc::unbounded_channel();
     loop {
+        engine
+            .scenes
+            .publish_running(&scene_id, running.as_ref().map(|r| r.view()));
+        if let Some(scene) = running.as_mut() {
+            scene.watch_started(&node_failed);
+        }
         let command = match backlog.pop_front() {
             Some(command) => command,
-            None => match commands.recv().await {
-                Some(command) => command,
-                None => break,
+            None => tokio::select! {
+                biased;
+                command = commands.recv() => match command {
+                    Some(command) => command,
+                    None => break,
+                },
+                Some(failure) = node_failures.recv() => {
+                    on_node_failed(&scene_id, failure, &mut running, &mut errors).await;
+                    if running.is_none() {
+                        failed_update = None;
+                        issues.clear();
+                    }
+                    continue;
+                }
+                end = wait_end(&mut waiting) => {
+                    let wait = waiting.take().expect("a wait just ended");
+                    let result = finish_wait(
+                        &engine, &scene_id, end, &wait.snapshot,
+                        &mut running, &mut errors, &mut issues, &mut failed_update,
+                    )
+                    .await;
+                    for done in wait.dones {
+                        let _ = done.send(result.clone());
+                    }
+                    continue;
+                }
             },
         };
         match command {
@@ -259,16 +331,53 @@ async fn scene_worker(
                         }
                     }
                 }
-                let result = reload(&engine, &scene_id, &mut running, &mut errors).await;
+                // A newer graph replaces what was being waited for.
+                if let Some(wait) = waiting.take() {
+                    dones.extend(wait.cancel());
+                }
+                issues.clear();
+                let result = match load(&engine, &scene_id, &mut running, &mut errors).await {
+                    Err(result) => result,
+                    Ok(snapshot) => {
+                        let targets = preflight_targets(&engine, running.as_ref(), &snapshot);
+                        if targets.is_empty() {
+                            let applied =
+                                apply(&engine, &scene_id, &snapshot, &mut running, &mut errors)
+                                    .await;
+                            if applied.is_ok() {
+                                failed_update = None;
+                            }
+                            applied
+                        } else {
+                            waiting = Some(start_wait(
+                                &engine,
+                                targets,
+                                snapshot,
+                                std::mem::take(&mut dones),
+                            ));
+                            Ok(())
+                        }
+                    }
+                };
+                if running.is_none() {
+                    failed_update = None;
+                }
                 for done in dones {
                     let _ = done.send(result.clone());
                 }
             }
             DirectorCommand::Stop { done, .. } => {
+                if let Some(wait) = waiting.take() {
+                    for done in wait.cancel() {
+                        let _ = done.send(Ok(()));
+                    }
+                }
                 if let Some(scene) = running.take() {
                     scene.stop().await;
                 }
                 errors.clear();
+                issues.clear();
+                failed_update = None;
                 if let Some(done) = done {
                     let _ = done.send(Ok(()));
                 }
@@ -291,22 +400,197 @@ async fn scene_worker(
                 let _ = reply.send(purged);
             }
             DirectorCommand::Status { reply, .. } => {
+                let progress = waiting.as_ref().map(|w| w.progress.borrow().clone());
                 let status = SceneStatus {
-                    state: match (&running, errors.is_empty()) {
-                        (Some(_), _) => SceneState::Running,
-                        (None, true) => SceneState::Stopped,
-                        (None, false) => SceneState::Failed,
+                    state: match (&progress, &running, errors.is_empty()) {
+                        (Some(_), ..) => SceneState::Waiting,
+                        (None, Some(_), _) => SceneState::Running,
+                        (None, None, true) => SceneState::Stopped,
+                        (None, None, false) => SceneState::Failed,
                     },
-                    errors: errors.clone(),
+                    errors: match &progress {
+                        Some(p) => p.issues.iter().map(PreflightIssue::line).collect(),
+                        None => errors.clone(),
+                    },
                     max_hops: running.as_ref().map(|r| r.max_hops()),
                     nodes: running.as_ref().map(|r| r.reports()).unwrap_or_default(),
+                    preflight: match &progress {
+                        Some(p) => p.issues.clone(),
+                        None => issues.clone(),
+                    },
+                    preflight_retry: progress.map(|p| p.retry),
+                    failed_update: failed_update.clone(),
                 };
                 let _ = reply.send(Some(status));
             }
         }
     }
+    engine.scenes.publish_running(&scene_id, None);
+    if let Some(wait) = waiting.take() {
+        wait.cancel();
+    }
     if let Some(scene) = running {
         scene.stop().await;
+    }
+}
+
+/// A node has failed for good. A critical one stops the scene (`FAILED`,
+/// saying what a person needs to know; after a reload the change stays
+/// committed, nothing is rolled back). Any other is taken offline and the
+/// scene runs on.
+async fn on_node_failed(
+    scene_id: &str,
+    failure: NodeFailure,
+    running: &mut Option<RunningScene>,
+    errors: &mut Vec<String>,
+) {
+    let node_id = failure.node_id.as_str();
+    let Some(scene) = running.as_mut() else {
+        return;
+    };
+    // Reported for a node since replaced by another reload: not this one.
+    let Some(critical) = scene.failed_critical(node_id) else {
+        return;
+    };
+    if !critical {
+        log::warn!(
+            "Director: scene [{scene_id}]: node {node_id} failed and is offline; the scene runs on"
+        );
+        scene.take_offline(node_id).await;
+        return;
+    }
+    let Some(report) = scene.reports().into_iter().find(|n| n.node_id == node_id) else {
+        return;
+    };
+    let last = report
+        .status
+        .last_error
+        .unwrap_or_else(|| "no error reported".into());
+    let stderr = crate::modules::node_logs::snapshot(node_id)
+        .into_iter()
+        .rev()
+        .find(|r| r.source == crate::modules::node_logs::Source::Stderr)
+        .map(|r| format!("; last stderr: {}", r.message))
+        .unwrap_or_default();
+    let message = if failure.after_swap {
+        format!(
+            "critical node {node_id} failed after the switch-over to the new version and never started: {last}{stderr}. \
+             The previous process may not have released a device it held. The change is committed and wasn't rolled back: \
+             check the device, then disable and enable the scene, or submit a fix"
+        )
+    } else {
+        format!(
+            "critical node {node_id} failed: {last}{stderr}. Fix the cause, then disable and enable the scene, or submit a fix"
+        )
+    };
+    log::error!("Director: scene [{scene_id}]: {message}");
+    if let Some(scene) = running.take() {
+        scene.stop().await;
+    }
+    *errors = vec![message];
+}
+
+/// The pre-flight checks a load of `snapshot` needs: its local nodes that
+/// would start and whose plugin declares one.
+fn preflight_targets(
+    engine: &Engine,
+    running: Option<&RunningScene>,
+    snapshot: &SceneSnapshot,
+) -> Vec<PreflightTarget> {
+    let files_dir = &engine.ctx.files_dir;
+    // Most scenes have none: no need to plan the graph for them.
+    if configurator::preflight_targets(snapshot, files_dir, None).is_empty() {
+        return vec![];
+    }
+    match nodes_to_start(running, snapshot, &engine.ctx) {
+        Some(ids) => configurator::preflight_targets(snapshot, files_dir, Some(&ids)),
+        None => vec![],
+    }
+}
+
+fn start_wait(
+    engine: &Engine,
+    targets: Vec<PreflightTarget>,
+    snapshot: SceneSnapshot,
+    dones: Vec<Done>,
+) -> Waiting {
+    let retry = engine
+        .ctx
+        .preflight_retry
+        .for_scene(&snapshot.scene.defaults);
+    let cancel = CancellationToken::new();
+    let (progress_tx, progress) = watch::channel(WaitProgress {
+        issues: vec![],
+        retry: PreflightRetryStatus {
+            attempt: 1,
+            max_attempts: retry.max_attempts,
+            next_attempt_time: None,
+        },
+    });
+    let task = tokio::spawn(preflight_loop(
+        targets,
+        engine.scenes.configure_limits(),
+        retry,
+        cancel.clone(),
+        progress_tx,
+        engine.scenes,
+        snapshot.clone(),
+    ));
+    Waiting {
+        cancel,
+        task,
+        progress,
+        snapshot,
+        dones,
+    }
+}
+
+/// Acts on a finished wait: applies the load, or reports the failure. A
+/// scene that's running keeps its old graph and stays `RUNNING`, with the
+/// failed update in its status; one that isn't goes to `FAILED`.
+#[allow(clippy::too_many_arguments)]
+async fn finish_wait(
+    engine: &Engine,
+    scene_id: &str,
+    end: WaitEnd,
+    snapshot: &SceneSnapshot,
+    running: &mut Option<RunningScene>,
+    errors: &mut Vec<String>,
+    issues: &mut Vec<PreflightIssue>,
+    failed_update: &mut Option<FailedUpdate>,
+) -> Result<(), DirectorError> {
+    match end {
+        WaitEnd::Passed => {
+            let applied = apply(engine, scene_id, snapshot, running, errors).await;
+            if applied.is_ok() {
+                *failed_update = None;
+            }
+            applied
+        }
+        WaitEnd::Cancelled => Ok(()),
+        WaitEnd::Problems {
+            issues: found,
+            gave_up,
+        } => {
+            let mut lines: Vec<String> = found.iter().map(PreflightIssue::line).collect();
+            lines.extend(gave_up.map(gave_up_line));
+            let shown = lines.join("; ");
+            if running.is_some() {
+                log::error!(
+                    "Director: scene [{scene_id}] keeps its previous graph: the update failed its pre-flight check: {shown}"
+                );
+                *failed_update = Some(FailedUpdate {
+                    errors: lines,
+                    problems: found,
+                    fail_time: chrono::Utc::now().timestamp_millis(),
+                });
+            } else {
+                log::error!("Director: scene [{scene_id}] failed its pre-flight check: {shown}");
+                *errors = lines;
+                *issues = found;
+            }
+            Err(DirectorError::Failed(shown))
+        }
     }
 }
 
@@ -373,24 +657,23 @@ async fn gather(
     }
 }
 
-/// Loads the scene and brings it to its stored state: a diff against the
-/// running graph (see `running.rs`), a fresh start, or a stop if it's disabled or
-/// gone.
-async fn reload(
+/// Reads the scene to run. A scene that's disabled, gone or unreadable is
+/// stopped here, and `Err` holds the load's result.
+async fn load(
     engine: &Engine,
     scene_id: &str,
     running: &mut Option<RunningScene>,
     errors: &mut Vec<String>,
-) -> Result<(), DirectorError> {
+) -> Result<SceneSnapshot, Result<(), DirectorError>> {
     errors.clear();
-    let snapshot = match engine.scenes.snapshot(scene_id).await {
-        Ok(snapshot) if snapshot.scene.enabled => snapshot,
+    match engine.scenes.snapshot(scene_id).await {
+        Ok(snapshot) if snapshot.scene.enabled => Ok(snapshot),
         Ok(_) => {
             log::debug!("Director: scene [{scene_id}] is disabled; not running it");
             if let Some(scene) = running.take() {
                 scene.stop().await;
             }
-            return Ok(());
+            Err(Ok(()))
         }
         Err(ServiceError::NotFound(_)) => {
             log::debug!("Director: scene [{scene_id}] is gone; not running it");
@@ -415,7 +698,7 @@ async fn reload(
             {
                 log::warn!("Director: couldn't remove {}: {err}", spool.display());
             }
-            return Ok(());
+            Err(Ok(()))
         }
         Err(err) => {
             let message = format!("couldn't load the scene: {err}");
@@ -424,11 +707,22 @@ async fn reload(
                 scene.stop().await;
             }
             *errors = vec![message.clone()];
-            return Err(DirectorError::Failed(message));
+            Err(Err(DirectorError::Failed(message)))
         }
-    };
+    }
+}
+
+/// Brings the scene to `snapshot`: a diff against the running graph (see
+/// `running.rs`) or a fresh start.
+async fn apply(
+    engine: &Engine,
+    scene_id: &str,
+    snapshot: &SceneSnapshot,
+    running: &mut Option<RunningScene>,
+    errors: &mut Vec<String>,
+) -> Result<(), DirectorError> {
     let result = match running.as_mut() {
-        Some(scene) => match scene.reload(&snapshot, &engine.ctx).await {
+        Some(scene) => match scene.reload(snapshot, &engine.ctx).await {
             Ok(_) => Ok(()),
             // The stored graph can't run: stop rather than keep an old one.
             Err(problems) => {
@@ -441,7 +735,7 @@ async fn reload(
         None => {
             // A fresh start: durable queues adopt their files; other
             // leftovers go (RunningScene::start).
-            RunningScene::start(&snapshot, &engine.ctx)
+            RunningScene::start(snapshot, &engine.ctx)
                 .await
                 .map(|scene| *running = Some(scene))
         }

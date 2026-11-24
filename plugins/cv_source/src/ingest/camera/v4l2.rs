@@ -45,7 +45,9 @@ fn retry(what: &str, e: std::io::Error) -> IngestError {
     IngestError::retryable(format!("{what}: {e}"))
 }
 
-pub(super) fn open(config: &CameraConfig) -> Result<V4l2Camera, IngestError> {
+/// The capture nodes, in device order. Asking a node what it is doesn't
+/// start it, so this is safe while another process streams from it.
+fn capture_nodes() -> Vec<(Listed, std::path::PathBuf)> {
     // Video nodes include metadata and output ones: only real capture nodes.
     let mut nodes: Vec<(Listed, std::path::PathBuf)> = v4l::context::enum_devices()
         .into_iter()
@@ -75,6 +77,15 @@ pub(super) fn open(config: &CameraConfig) -> Result<V4l2Camera, IngestError> {
             .collect();
         digits.parse::<u32>().unwrap_or(u32::MAX)
     });
+    nodes
+}
+
+pub(super) fn list() -> Vec<Listed> {
+    capture_nodes().into_iter().map(|(l, _)| l).collect()
+}
+
+pub(super) fn open(config: &CameraConfig) -> Result<V4l2Camera, IngestError> {
+    let nodes = capture_nodes();
     let listed: Vec<Listed> = nodes.iter().map(|(l, _)| l.clone()).collect();
     let i = pick(config.device.as_deref(), &listed)?;
     let dev = Device::with_path(&nodes[i].1).map_err(|e| retry(&listed[i].id, e))?;

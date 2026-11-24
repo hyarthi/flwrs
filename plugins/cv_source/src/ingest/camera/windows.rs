@@ -212,11 +212,11 @@ fn split(pair: u64) -> (u32, u32) {
     ((pair >> 32) as u32, pair as u32)
 }
 
-pub(super) fn open(config: &CameraConfig) -> Result<MfCamera, IngestError> {
-    let runtime = Runtime::start()?;
+/// The video capture devices, not activated. Needs a started [`Runtime`].
+fn enumerate() -> Result<(Vec<IMFActivate>, Vec<Listed>), IngestError> {
     // SAFETY: every interface is a live COM reference from the call before;
     // the activation array is released and freed before leaving the block.
-    let (source, name) = unsafe {
+    unsafe {
         let mut attributes = None;
         MFCreateAttributes(&mut attributes, 1).map_err(|e| retry("attributes", e))?;
         let attributes = attributes.ok_or_else(|| IngestError::fatal("no attributes"))?;
@@ -246,6 +246,21 @@ pub(super) fn open(config: &CameraConfig) -> Result<MfCamera, IngestError> {
                 name: string_of(d, &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME).unwrap_or_default(),
             })
             .collect();
+        Ok((devices, listed))
+    }
+}
+
+/// The cameras the OS lists; none is activated.
+pub(super) fn list() -> Result<Vec<Listed>, IngestError> {
+    let _runtime = Runtime::start()?;
+    enumerate().map(|(_, listed)| listed)
+}
+
+pub(super) fn open(config: &CameraConfig) -> Result<MfCamera, IngestError> {
+    let runtime = Runtime::start()?;
+    let (devices, listed) = enumerate()?;
+    // SAFETY: the devices are live COM references.
+    let (source, name) = unsafe {
         let i = pick(config.device.as_deref(), &listed)?;
         let source: IMFMediaSource = devices[i]
             .ActivateObject()

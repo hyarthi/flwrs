@@ -5,6 +5,7 @@ mod check;
 pub mod config;
 pub mod crop;
 pub mod exec;
+pub mod groups;
 
 pub use check::{Checked, check};
 pub use config::{GraphConfig, NodeConfig};
@@ -87,6 +88,14 @@ impl Ports {
                 },
                 outputs: out(PortType::Events),
             },
+            NodeConfig::Emit(e) => Ports {
+                inputs: if e.mode == config::EmitMode::Rules {
+                    vec![]
+                } else {
+                    vec![("objects", PortType::Objects)]
+                },
+                outputs: vec![],
+            },
             NodeConfig::Lua(_) => Ports {
                 inputs: vec![("objects", PortType::Objects)],
                 outputs: out(PortType::Events),
@@ -144,6 +153,9 @@ pub fn uploads(graph: &GraphConfig) -> Vec<String> {
                 names.insert(f.clone());
             }
             if let Some(TextSource::File(f)) = &m.charset {
+                names.insert(f.clone());
+            }
+            if let Some(f) = m.tensor_input.as_ref().and_then(|t| t.embedder.as_ref()) {
                 names.insert(f.clone());
             }
         }

@@ -120,7 +120,11 @@ pub(crate) fn from_snapshot(snapshot: &StatsSnapshot, time: SystemTime) -> Sampl
         push(
             SCENE_UP,
             scene.clone(),
-            u64::from(status.state == SceneState::Running),
+            // Waiting on a reload: the running nodes keep working.
+            u64::from(
+                status.state == SceneState::Running
+                    || (status.state == SceneState::Waiting && !status.nodes.is_empty()),
+            ),
         );
         for node in &status.nodes {
             let labels = vec![
@@ -269,6 +273,9 @@ mod tests {
                     errors: vec![],
                     max_hops: Some(32),
                     nodes: vec![node],
+                    preflight: vec![],
+                    preflight_retry: None,
+                    failed_update: None,
                 },
             )],
         };

@@ -17,6 +17,7 @@
       "from_launch_args": "/schemas/out"
     }
   },
+  "runtime_defaults": { "is_critical_path": false },
   "ui": {
     "icon": "ui/accumulator.svg",
     "categories": [

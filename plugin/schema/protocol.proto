@@ -33,6 +33,8 @@ message MsgCode {
     CREDIT = 10;              // Credit                hub -> plugin (capability CREDITS)
     PING = 11;                // Ping                  both
     PONG = 12;                // Pong                  both
+    LIVE_FEED = 13;           // LiveFeed              plugin -> hub (capability LIVE_FEED)
+    LIVE_FEED_CONTROL = 14;   // LiveFeedControl       hub -> plugin (capability LIVE_FEED)
   }
 }
 
@@ -96,6 +98,9 @@ message Capability {
     ACKS = 1;
     // Credit-based flow control for the events this plugin produces.
     CREDITS = 2;
+    // Live observation data (stats, preview frames) outside the data flow:
+    // LIVE_FEED and LIVE_FEED_CONTROL.
+    LIVE_FEED = 3;
   }
 }
 
@@ -189,6 +194,30 @@ message Ping {
 
 message Pong {
   uint64 nonce = 1;
+}
+
+// Plugin -> hub (capability LIVE_FEED): the newest item of a live channel,
+// for someone observing the node. Not a data event: it has no header seq,
+// credit or ack, never enters the scene's flow, and may be dropped anywhere.
+// With empty `data` it only announces the channel and its media type.
+message LiveFeed {
+  // The channel's name: 1 to 64 characters of A-Z a-z 0-9 . _ -
+  string channel = 1;
+  // What `data` is: an IANA media type without parameters, such as
+  // application/json or image/jpeg. It tells the hub how to show the channel.
+  string media_type = 2;
+  bytes data = 3;
+  // Counts up per channel, so a viewer can see what was skipped.
+  uint64 seq = 4;
+  // When what `data` shows was captured, if known.
+  google.protobuf.Timestamp capture_time = 5;
+}
+
+// Hub -> plugin (capability LIVE_FEED): the channels being watched now, as a
+// full list; empty = nobody. Sent after the handshake if any are watched, and
+// on each change. A plugin does the work for a channel only while it's listed.
+message LiveFeedControl {
+  repeated string channels = 1;
 }
 
 message LogLevel {

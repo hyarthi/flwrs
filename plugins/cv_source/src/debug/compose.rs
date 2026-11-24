@@ -395,8 +395,9 @@ fn draw_recording(c: &mut Canvas, seconds: f32, scale: i32) {
     c.text(left + 2 * scale, top + scale, &lines[0], INK, scale);
 }
 
-/// Draws a scene on a `w` x `h` buffer; `scale`: pixels per font pixel.
-pub fn compose(scene: &Scene, view: &View, pixels: &mut [u32], w: usize, h: usize, scale: i32) {
+/// The frame and what's known about it, without the debug window's own marks
+/// (the keyboard hint, the recording light). `scale`: pixels per font pixel.
+pub fn annotate(scene: &Scene, view: &View, pixels: &mut [u32], w: usize, h: usize, scale: i32) {
     if w == 0 || h == 0 {
         return;
     }
@@ -417,6 +418,16 @@ pub fn compose(scene: &Scene, view: &View, pixels: &mut [u32], w: usize, h: usiz
     if view.panel {
         draw_panel(&mut c, scene, scale);
     }
+}
+
+/// Draws a scene on a `w` x `h` buffer, as the debug window shows it;
+/// `scale`: pixels per font pixel.
+pub fn compose(scene: &Scene, view: &View, pixels: &mut [u32], w: usize, h: usize, scale: i32) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    annotate(scene, view, pixels, w, h, scale);
+    let mut c = Canvas::new(pixels, w, h);
     draw_guide(
         &mut c,
         view,
