@@ -86,6 +86,26 @@ Recording saves every frame the camera delivers, without the overlay, as an MJPE
 
 `--compare-cpu` also runs every model on the CPU and reports where the chosen device's results differ. Use it to check a `gpu` or `npu` setting.
 
+## Testing a Lua rule
+
+`flwrs-cv-source rule-test` runs one Lua rule node of a graph on frames written as JSON lines, with no camera, no models and no hub, and prints the events it returns as JSON lines. The rule runs as it does in a node: the same sandbox and helpers, `state` across frames, and `held` / `once` on the frames' own clock, so a test of timing is exact.
+
+```sh
+flwrs-cv-source rule-test --graph graph.json --node my_rule --frames frames.jsonl
+```
+
+`--graph` takes the graph itself, a node's launch args (`{"graph": …}`) or an example file; `--node` can be left out when the graph has one Lua node; without `--frames` the frames come from standard input. A frame:
+
+```json
+{"time": 1.5, "width": 1280, "height": 720,
+ "objects": [{"tracker_id": 1, "class_name": "person", "box": [400, 100, 700, 700],
+              "kp": {"left_wrist": [520, 300, 0.9]},
+              "children": {"hand": [{"box": [480, 220, 560, 300], "kp": {"index_finger_tip": [530, 230]}}],
+                           "gesture": [{"class_name": "thumb_up", "confidence": 0.9}]}}]}
+```
+
+Only `time` (seconds) is required; `width` and `height` default to 1280 x 720. Keypoints are `keypoints` (a list) or `kp` (by name, using the `keypoint_layout` of the model that feeds the rule, or for a child, of that child's model node); a point is `[x, y]`, `[x, y, confidence]` or `{x, y, confidence}`, with confidence 1 when left out. A child is a list of objects (items with a `box`), a list of classes, or a string. `tracks` and `ended` (track ids) may be given; without them every object with a `tracker_id` is a track, and a track missing from a frame ends on it. The command exits with 1 if the rule failed on any frame (each failure on standard error), 2 on a problem with its input.
+
 ## Settings
 
 | Setting | | |

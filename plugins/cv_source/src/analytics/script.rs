@@ -353,6 +353,16 @@ impl LuaRule {
         })
     }
 
+    /// The keypoint names of the rule's own objects (`None`), or of what a
+    /// model node found on them (`Some(node)`), if their model names them.
+    pub fn keypoint_names(&self, node: Option<&str>) -> Option<&[String]> {
+        match node {
+            None => self.layout.as_ref(),
+            Some(node) => self.layouts.get(node),
+        }
+        .map(|l| l.points.as_slice())
+    }
+
     /// Runs the rule on a frame.
     pub fn update(&mut self, i: &ScriptInput) -> Result<Vec<RuleEvent>, String> {
         {

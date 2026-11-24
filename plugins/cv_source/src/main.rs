@@ -15,6 +15,11 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("debug") {
         return flwrs_cv_source::debug::main(std::env::args().skip(1));
     }
+    // Running a Lua rule on frames written as JSON: no hub, no models.
+    #[cfg(feature = "lua")]
+    if std::env::args().nth(1).as_deref() == Some("rule-test") {
+        return flwrs_cv_source::rule_test::main(std::env::args().skip(1));
+    }
     let args = Args::parse();
     // `--threads` (optional, from the server) sizes the runtime.
     match flwrs_plugin::rt::runtime(args.bootstrap.threads) {

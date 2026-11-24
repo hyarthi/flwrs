@@ -285,6 +285,49 @@ fn origin<'a>(
     (tracker, None)
 }
 
+/// Every model node's keypoint layout, by node: names the keypoints of what
+/// a model found, for Lua rules.
+#[cfg(feature = "lua")]
+fn keypoint_layouts(graph: &GraphConfig) -> BTreeMap<String, crate::keypoints::KeypointLayout> {
+    graph
+        .nodes
+        .iter()
+        .filter_map(|(id, n)| match n {
+            NodeConfig::Model(m) => Some((
+                id.clone(),
+                crate::keypoints::layout(m.keypoint_layout.as_deref()?)?,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A graph's Lua rule node on its own, set up as [`compile`] sets it up
+/// (keypoint names from the models feeding it), with the tracker it reads,
+/// if any. Loads no model: for running a rule on recorded or made-up
+/// inputs (`flwrs-cv-source rule-test`).
+#[cfg(feature = "lua")]
+pub fn lua_rule(
+    graph: &GraphConfig,
+    node: &str,
+) -> Result<(crate::analytics::script::LuaRule, Option<String>), String> {
+    let Some(NodeConfig::Lua(config)) = graph.nodes.get(node) else {
+        return Err(format!("the graph has no lua node {node:?}"));
+    };
+    let links: BTreeMap<String, String> = graph
+        .links
+        .iter()
+        .map(|l| (l.to.clone(), l.from.clone()))
+        .collect();
+    let (tracker, model) = origin(graph, &links, node);
+    let layout = model
+        .and_then(|m| m.keypoint_layout.as_deref())
+        .and_then(crate::keypoints::layout);
+    let rule =
+        crate::analytics::script::LuaRule::new(node, config, layout, keypoint_layouts(graph))?;
+    Ok((rule, tracker))
+}
+
 /// The model feeding `node`'s objects, through filters.
 fn origin_model<'a>(
     graph: &'a GraphConfig,
@@ -527,17 +570,7 @@ fn compile_with(
     let mut measured: BTreeMap<&str, Option<usize>> = BTreeMap::new();
     let mut measuring = Duration::ZERO;
     #[cfg(feature = "lua")]
-    let layouts: BTreeMap<String, crate::keypoints::KeypointLayout> = graph
-        .nodes
-        .iter()
-        .filter_map(|(id, n)| match n {
-            NodeConfig::Model(m) => Some((
-                id.clone(),
-                crate::keypoints::layout(m.keypoint_layout.as_deref()?)?,
-            )),
-            _ => None,
-        })
-        .collect();
+    let layouts = keypoint_layouts(graph);
     for id in &checked.order {
         let config = &graph.nodes[id];
         let ports = Ports::of(config);

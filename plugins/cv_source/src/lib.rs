@@ -22,6 +22,8 @@ pub mod live;
 pub mod model;
 pub mod pre;
 pub mod results;
+#[cfg(feature = "lua")]
+pub mod rule_test;
 pub mod tensor;
 #[cfg(test)]
 pub(crate) mod testing;
