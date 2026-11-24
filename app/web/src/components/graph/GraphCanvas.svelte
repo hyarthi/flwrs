@@ -64,6 +64,7 @@
     type Point,
   } from '../../lib/graphModel';
   import { PLATFORM_CONTEXT, labelOf, resolve, type Schema } from '../../lib/schemaForm';
+  import type { Scope } from '../../lib/lua/types';
   import { describeNode, putUpload, setInnerLayout, updateDraftNode, type GraphNode, type SceneView, type Upload } from '../../lib/sceneView';
   import { getPluginSettings } from '../../lib/plugins';
   import { theme } from '../../lib/theme.svelte';
@@ -80,6 +81,7 @@
     active,
     running,
     liveArgs,
+    codeScope,
     onopensettings,
     onsaved,
   }: {
@@ -97,6 +99,8 @@
     running: boolean;
     /** The running node's launch args (what its live setting is). */
     liveArgs: Record<string, unknown> | null;
+    /** The scope a code setting sees (Lua completion). */
+    codeScope?: (schema: Schema) => Scope | null;
     onopensettings: () => void;
     onsaved: (saved: GraphNode) => void;
   } = $props();
@@ -897,6 +901,7 @@
               name={key}
               value={current[key]}
               required={settings.required?.includes(key) ?? false}
+              {codeScope}
               onchange={(v) => setSetting(key, v)}
             />
           {/each}

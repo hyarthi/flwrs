@@ -39,7 +39,13 @@ export function codeFieldScope(
   for (const name of code.params ?? []) {
     const text = types.get(name) ?? 'any';
     const bare = text.replace(/\?$/, '').split('|')[0].trim();
-    const type: LuaType = scope.classes.has(bare) ? { kind: 'named', name: bare } : plain(text);
+    // `Name[]`: a list of a class (iterated with ipairs, indexed).
+    const list = /^(\w+)\[\]$/.exec(bare);
+    const type: LuaType = scope.classes.has(bare)
+      ? { kind: 'named', name: bare }
+      : list && scope.classes.has(list[1])
+        ? { kind: 'list', element: { kind: 'named', name: list[1] } }
+        : plain(text);
     scope.globals.set(name, { name, type, doc: `Parameter of the code: ${name}: ${text}` });
   }
   return scope;

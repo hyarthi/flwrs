@@ -369,7 +369,7 @@
 
             {#if editor.useScript}
               <div class="block">
-                <CodeEditor scope={luaScope} params={['payload', 'meta']} language="lua" value={editor.script} onchange={(v) => { editor.script = v; change(); }} />
+                <CodeEditor grow expandable title="Mapping script" scope={luaScope} params={['payload', 'meta']} language="lua" value={editor.script} onchange={(v) => { editor.script = v; change(); }} />
                 <span class="hint mono">function(payload, meta) → the whole output table (nil: dropped)</span>
               </div>
             {:else}
@@ -541,15 +541,19 @@
 
   .editor {
     display: grid;
+    /* As tall as its tallest column: never squeezed by the scrolling box. */
+    flex: none;
     grid-template-columns: minmax(180px, 1fr) minmax(0, 2.4fr) minmax(180px, 1fr);
     gap: var(--space-3);
     min-height: 260px;
   }
 
+  /* No column scrolls on its own: the row is as tall as the tallest column,
+     and the dialog's scroll moves past it to the samples. */
   .schema {
-    max-height: 420px;
+    /* Long names are cut with an ellipsis by the tree itself. */
+    min-width: 0;
     padding: var(--space-2);
-    overflow: auto;
     border: 1px solid var(--border);
     border-radius: var(--radius);
   }
@@ -567,8 +571,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
-    max-height: 420px;
-    overflow: auto;
+    min-width: 0;
   }
 
   .row {

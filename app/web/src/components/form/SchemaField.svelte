@@ -349,6 +349,8 @@
         language={schema['x-flwrs-code']?.language ?? 'lua'}
         scope={codeScope?.(schema) ?? null}
         params={schema['x-flwrs-code']?.params ?? null}
+        expandable
+        title={label}
         {disabled}
         onchange={(v) => text(v)}
       />

@@ -1753,7 +1753,18 @@
         "script": {
           "type": "string",
           "minLength": 1,
-          "description": "Body of function(frame, objects, tracks, state): returns nothing, an event, or a list of events"
+          "description": "Body of function(frame, objects, tracks, state): returns nothing, an event, or a list of events",
+          "x-flwrs-code": {
+            "language": "lua",
+            "params": [
+              "frame",
+              "objects",
+              "tracks",
+              "state"
+            ],
+            "definitions": "types/rule.d.lua",
+            "signature": "fun(frame: Frame, objects: Object[], tracks: Track[], state: table): RuleEvent|RuleEvent[]|nil"
+          }
         },
         "limits": {
           "type": "object",

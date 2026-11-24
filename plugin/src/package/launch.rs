@@ -185,6 +185,8 @@ pub struct LaunchSpec {
     style: LaunchArgsStyle,
     fields: BTreeMap<String, LaunchField>,
     code: Vec<CodeField>,
+    /// Code fields inside `$defs` entries (pointers into the schema).
+    definition_code: Vec<CodeField>,
     templates: Vec<TemplateField>,
     graphs: Vec<GraphField>,
     listen: Vec<ListenField>,
@@ -277,6 +279,7 @@ impl LaunchSpec {
             style: manifest.launch_args_style,
             fields: BTreeMap::new(),
             code: vec![],
+            definition_code: vec![],
             templates: vec![],
             graphs: vec![],
             listen: Vec::new(),
@@ -298,6 +301,7 @@ impl LaunchSpec {
             Place::Root,
             &mut Found {
                 code: &mut spec.code,
+                definition_code: &mut spec.definition_code,
                 templates: &mut spec.templates,
                 graphs: &mut spec.graphs,
             },
@@ -396,6 +400,7 @@ impl LaunchSpec {
             style: LaunchArgsStyle::Flags,
             fields: BTreeMap::new(),
             code: vec![],
+            definition_code: vec![],
             templates: vec![],
             graphs: vec![],
             listen: Vec::new(),
@@ -437,6 +442,14 @@ impl LaunchSpec {
 
     pub fn code_fields(&self) -> &[CodeField] {
         &self.code
+    }
+
+    /// Code fields inside `$defs` entries: values a definition describes
+    /// wherever it's used (a graph's node settings, say). Their `pointer` is
+    /// into the schema (`/$defs/<name>/properties/<key>`), not into
+    /// `launch_args`, so they're for editors, not for checking a node.
+    pub fn definition_code_fields(&self) -> &[CodeField] {
+        &self.definition_code
     }
 
     /// The properties holding addresses the plugin listens on.
@@ -520,13 +533,17 @@ impl LaunchSpec {
     /// Package files the schema refers to (`x-flwrs-code.definitions`,
     /// `x-flwrs-template`, `x-flwrs-graph`).
     pub fn file_references(&self) -> Vec<(String, &str)> {
-        let definitions = self.code.iter().filter_map(|c| {
-            let path = c.definitions.as_deref()?;
-            Some((
-                format!("launch_args_schema {}: definitions", c.pointer),
-                path,
-            ))
-        });
+        let definitions = self
+            .code
+            .iter()
+            .chain(&self.definition_code)
+            .filter_map(|c| {
+                let path = c.definitions.as_deref()?;
+                Some((
+                    format!("launch_args_schema {}: definitions", c.pointer),
+                    path,
+                ))
+            });
         let templates = self.templates.iter().map(|t| {
             (
                 format!("launch_args_schema {}: x-flwrs-template", t.pointer),
@@ -692,6 +709,10 @@ fn quoted_length(arg: &str) -> usize {
 enum Place {
     Root,
     Property(usize),
+    /// Inside a `$defs` entry: the entry itself (0), or a property at that
+    /// depth below it. Code there describes values the launch args hold
+    /// wherever the definition is used (e.g. a graph's node settings).
+    Definition(usize),
     Other,
 }
 
@@ -700,6 +721,7 @@ enum Place {
 /// What `walk` collects.
 struct Found<'a> {
     code: &'a mut Vec<CodeField>,
+    definition_code: &'a mut Vec<CodeField>,
     templates: &'a mut Vec<TemplateField>,
     graphs: &'a mut Vec<GraphField>,
 }
@@ -719,7 +741,8 @@ fn walk(node: &Value, pointer: &str, place: Place, found: &mut Found, report: &m
                     format!("launch_args{p}")
                 }
             };
-            let property = matches!(place, Place::Property(_));
+            let in_definition = matches!(place, Place::Definition(d) if d > 0);
+            let property = matches!(place, Place::Property(_)) || in_definition;
             for (key, value) in map {
                 if key == "writeOnly" && value == &Value::Bool(true) && place != Place::Property(1)
                 {
@@ -766,6 +789,7 @@ fn walk(node: &Value, pointer: &str, place: Place, found: &mut Found, report: &m
                         at(pointer)
                     )),
                     "x-flwrs-code" => match code_field(pointer, map, value) {
+                        Ok(c) if in_definition => found.definition_code.push(c),
                         Ok(c) => found.code.push(c),
                         Err(e) => report
                             .errors
@@ -821,6 +845,22 @@ fn walk(node: &Value, pointer: &str, place: Place, found: &mut Found, report: &m
                     for (name, prop) in props {
                         let p = format!("{pointer}/{}", escape(name));
                         walk(prop, &p, Place::Property(depth), found, report);
+                    }
+                } else if key == "properties"
+                    && let Place::Definition(d) = place
+                    && let Value::Object(props) = value
+                {
+                    for (name, prop) in props {
+                        let p = format!("{pointer}/properties/{}", escape(name));
+                        walk(prop, &p, Place::Definition(d + 1), found, report);
+                    }
+                } else if key == "$defs"
+                    && place == Place::Root
+                    && let Value::Object(defs) = value
+                {
+                    for (name, def) in defs {
+                        let p = format!("/$defs/{}", escape(name));
+                        walk(def, &p, Place::Definition(0), found, report);
                     }
                 } else {
                     walk(value, pointer, Place::Other, found, report);
@@ -2098,7 +2138,51 @@ mod tests {
             "x-flwrs-widget: must be one of",
             "x-flwrs-order: must be an integer",
             "unknown key \"how\"",
-            "the schema root: x-flwrs-code is only allowed on properties",
+            "launch_args/$defs/x: x-flwrs-code is only allowed on properties",
+        ] {
+            assert!(
+                report.errors.iter().any(|e| e.contains(fragment)),
+                "missing {fragment:?} in {:#?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn code_fields_inside_definitions_are_for_editors() {
+        let s = json!({
+            "type": "object",
+            "properties": {"graph": {"$ref": "#/$defs/node"}},
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "script": {"type": "string", "x-flwrs-code": {
+                            "language": "lua", "params": ["frame"], "definitions": "types/rule.d.lua"
+                        }},
+                        "bad": {"type": "integer", "x-flwrs-code": {"language": "lua"}},
+                        "launch": {"type": "string", "x-flwrs-launch": {"via": "env"}}
+                    }
+                }
+            }
+        });
+        let mut m = manifest(2);
+        m.payload_schemas.input = None;
+        let (spec, report) = LaunchSpec::new(&m, Some(&s));
+        // Checked like any code field, but not one of the node's own.
+        assert!(spec.code_fields().is_empty());
+        let defs = spec.definition_code_fields();
+        assert_eq!(defs.len(), 1, "{:?}", report.errors);
+        assert_eq!(defs[0].pointer, "/$defs/node/properties/script");
+        assert_eq!(defs[0].params, ["frame"]);
+        assert!(
+            spec.file_references()
+                .iter()
+                .any(|(_, p)| *p == "types/rule.d.lua")
+        );
+        for fragment in [
+            "launch_args/$defs/node/properties/bad: x-flwrs-code: the property must be a string",
+            "launch_args/$defs/node/properties/launch: x-flwrs-launch is only allowed on top-level",
         ] {
             assert!(
                 report.errors.iter().any(|e| e.contains(fragment)),

@@ -281,6 +281,16 @@ A graph that's invalid is refused. Everything else is a warning, because a scene
 
 The check **never opens a camera**, so it can't disturb a running node. It also means it can't tell that a camera is busy: that shows up when the node starts, and the node's restart limit decides what happens next.
 
+**Describe** (`--mode describe`) answers an editor's question about the node's uploaded files while the graph may still be unfinished: their `model_info` entries, nothing stored. The web UI uses it to prefill a model node's empty settings from a picked file.
+
+Problems and warnings about a part of the graph start with where it is, a JSON pointer into the launch args (for example `[at /graph/nodes/det] nodes.det: input frame isn't linked`), so editors can mark the node or link.
+
+## In the web UI
+
+The `graph` setting is edited on a canvas in the node's Graph tab: the plugin's catalog (`schema/graph_catalog.json`, named by the setting's `x-flwrs-graph` annotation) lists the node types, their settings and ports, and which ports connect. The tab type-checks links, shows for-each, per-track and sampling badges on links, marks problems on nodes, edits execution groups with frames, and keeps a JSON tab. Node positions are layout, stored beside the graph: moving one is never a change to the scene. A graph the configurator refuses can still be saved to a draft, but not to a running scene.
+
+A node of this plugin is **critical by default** (`runtime.is_critical_path`): if it fails, its scene stops. Turn it off in the node's run-time settings to keep the rest of the scene running without the camera.
+
 ## Events
 
 What leaves the plugin is set by an optional `emit` node (at most one per graph):

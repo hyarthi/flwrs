@@ -9,14 +9,75 @@ With flwrs you build workflows (data flows) of any complexity from **pre-compile
 > **Status:** early development; expect breaking changes. What works today:
 >
 > - the server core, the [plugin protocol](docs/protocol.md) (version 2) with its Rust SDK ([`flwrs-plugin`](https://crates.io/crates/flwrs-plugin)) and a plugin developer toolkit ([`flwrs-trellis`](https://crates.io/crates/flwrs-trellis): package, audit, test, bench), and the plugin registry (package upload);
-> - a **web UI** served by the server: a visual scene editor (drafts with undo, review and submit; node settings generated from each plugin's schema; an edge mapping editor with a live test), the live scenes list, plugin pages, an overview with live charts, and the server's own configuration; everything it does is also in the REST API;
-> - running scenes: the director launches and supervises plugins (local, or remote over TLS with tokens or client certificates), routes events through bounded queues (credit-based flow control, at-least-once delivery with acks, optionally durable on disk), applies edge mappings (dot notation and Lua), and applies edits to a running scene as a diff, restarting only what changed;
+> - a **web UI** served by the server: a visual scene editor (drafts with undo, review and submit; node settings generated from each plugin's schema; an edge mapping editor with a live test; groups with shared core budgets; a canvas for plugins whose settings are a graph, with live per-node stats and video), the live scenes list, plugin pages, an overview with live charts, and the server's own configuration; everything it does is also in the REST API;
+> - running scenes: the director launches and supervises plugins (local, or remote over TLS with tokens or client certificates), checks each node before it starts (pre-flight), routes events through bounded queues (credit-based flow control, at-least-once delivery with acks, optionally durable on disk), applies edge mappings (dot notation and Lua), and applies edits to a running scene as a diff, restarting only what changed;
 > - scene export / import between servers, status endpoints, and telemetry export (OpenTelemetry, or local files);
-> - eleven base plugins in Rust (HTTP, WebSocket and MQTT in and out, push to browsers, a ticker, Lua scripting, windowed aggregation), plus minimal demo plugins in Python, Go, TypeScript and Java.
+> - eleven base plugins in Rust (HTTP, WebSocket and MQTT in and out, push to browsers, a ticker, Lua scripting, windowed aggregation) and an early **vision source** (ML models on a camera or video: detection, pose, hands and gestures, tracking, rules), plus minimal demo plugins in Python, Go, TypeScript and Java.
+>
+> Ready-made demos live in [flwrs-demos](https://github.com/hyarthi/flwrs-demos) (below).
 >
 > See the [roadmap](#roadmap) for what's missing.
 > 
 > I'm using this project as a learning/test bed to experiment with Rust, edge and heavy-load event systems and various ML/AI models.
+
+## Quickstart (5 minutes)
+
+There are no release binaries yet, so this builds from source. You need Rust 1.94+, a C compiler, and Node.js 20.19+ with npm (for the web UI); see *Building* for details. The first builds take a few minutes (on an Apple M2, about 2 for the server and 3 for the two plugins, plus downloading the crates); everything after them takes seconds.
+
+A tiny scene: a ticker sends an event every second, and an HTTP push sink serves them to anyone subscribed over Server-Sent Events.
+
+```mermaid
+flowchart LR
+  tick["ticker<br/>(source, every 1 s)"] -- "mapping: event → JSON in data,<br/>channel 'ticks'" --> push["http-push-sink<br/>(127.0.0.1:8090)"]
+  push -- "SSE: GET /subscribe/ticks" --> you(("curl"))
+```
+
+**1. Start the server** with the development config (everything it writes goes under `./.data/`):
+
+```sh
+git clone https://github.com/hyarthi/flwrs.git && cd flwrs
+cargo dev                       # builds and serves the web UI and API on http://127.0.0.1:8080
+```
+
+**2. Package and install two plugins**, in a second terminal (uploads are allowed from loopback in the dev config):
+
+```sh
+cargo trellis package plugins/ticker
+cargo trellis package plugins/http_push_sink
+for p in target/plugins/ticker-*.zip target/plugins/http-push-sink-*.zip; do
+  curl -F file=@$p http://127.0.0.1:8080/api/plugins
+done
+```
+
+**3. Build the scene.** In the web UI (<http://127.0.0.1:8080/>, *Scenes* → *New scene*): drag a *Ticker* and an *HTTP push sink* from the palette, set the push sink's *Listen on* to `127.0.0.1:8090` (the server itself uses 8080), connect the ticker to it, and in the edge's mapping set `channel` to the value `ticks` and `data` from the whole event (`.`) encoded as JSON. Submit the draft and switch the scene on. Or do the same in one request:
+
+```sh
+SID=$(curl -s -H 'content-type: application/json' -d '{"name":"hello ticks"}' \
+  http://127.0.0.1:8080/api/scenes | sed 's/.*"id":"\([^"]*\)".*/\1/')
+curl -s -H 'content-type: application/json' http://127.0.0.1:8080/api/scenes/by-id/$SID/graph/batch -d '{"ops": [
+  {"op": "create_node", "key": "tick", "name": "tick", "plugin_id": "ticker", "config": {"launch_args": {"interval": "1s"}}},
+  {"op": "create_node", "key": "push", "name": "push", "plugin_id": "http-push-sink",
+   "config": {"launch_args": {"listen": "127.0.0.1:8090", "ack_mode": "buffered"}}},
+  {"op": "create_edge", "source_node_id": "$tick", "target_node_id": "$push", "mapping": {"mode": "replace", "rules": [
+    {"target": "channel", "value": "ticks"},
+    {"target": "data", "source": ".", "encode": "json"},
+    {"target": "content_type", "value": "application/json"}]}}]}'
+curl -s -X POST http://127.0.0.1:8080/api/scenes/by-id/$SID/enable
+```
+
+**4. Watch the events:**
+
+```sh
+curl -N http://127.0.0.1:8090/subscribe/ticks
+# id: mwv7wz3k-6
+# data: {"emit_time":"2026-11-24T21:39:58.099669Z","label":"","missed":0,"seq":6,"tick_time":"2026-11-24T21:39:58.096812Z"}
+```
+
+The scene's page in the web UI shows the flow live, and its *Stats* tab the counters. Stop the server with Ctrl+C; `chmod -R u+w .data && rm -rf .data` starts over.
+
+## Demos
+
+[**flwrs-demos**](https://github.com/hyarthi/flwrs-demos) holds self-contained demos: each one's installer checks out flwrs, builds the server and the plugins it needs, downloads its models and sets up its scene, and a runner starts it. The first is **cv-dog**: a cartoon dog on a web page that obeys hand gestures and poses seen by a webcam (the vision source with MediaPipe hands and a pose model, a Lua rule, and the HTTP push sink to the page).
 
 ## Concepts
 
@@ -171,7 +232,7 @@ The protocol is the contract between the server and a plugin, so plugins can be 
 - The server starts a local plugin with `--id <instance id> --host <hub host> --port <hub port> --log-level <level>` (plus the node's launch arguments) and a per-launch token in `FLWRS_TOKEN`. A remote plugin is started by an operator, and authenticates with the node's pre-shared token or a client certificate. Every plugin opens one TCP connection to the hub, or a TLS connection to its TLS listener. Until its handshake is done, a connection counts against `[hub] max_pending_connections` (256) and `max_pending_per_ip` (8; loopback isn't counted); over either, the hub closes new connections at once, so a flood of connections that never authenticate can't use up the server's file descriptors or memory. A flood from many addresses still needs a firewall or proxy in front of the hub.
 - Every message is a frame: `u32 LE length | u8 framing version (2) | u32 LE header length | FrameHeader | body`. The protobuf `FrameHeader` names the body's message (`MsgCode`), and carries the routing metadata of data events, so the hub forwards bodies without decoding them.
 - The first frame is the plugin's `Initialize` (instance id, token, type, version, payload schemas, protocol versions, capabilities). The hub answers `InitializeResponse` or, to reject it, `Shutdown`. Then data events flow, `PING` is answered with `PONG`, and `Shutdown` is answered with `Exit`. A plugin that loses its connection reconnects with backoff (at most 30 s).
-- Optional capabilities: **`ACKS`** (acknowledgements and redelivery: at-least-once delivery) and **`CREDITS`** (credit-based flow control for what a plugin produces). A plugin without them still works, with TCP backpressure and at-most-once delivery on its hops.
+- Optional capabilities: **`ACKS`** (acknowledgements and redelivery: at-least-once delivery), **`CREDITS`** (credit-based flow control for what a plugin produces) and **`LIVE_FEED`** (named channels, such as stats or a preview image, that the web UI shows while someone watches a node; the hub tells the plugin which are watched, so an unwatched channel costs nothing). A plugin without them still works, with TCP backpressure and at-most-once delivery on its hops.
 
 **Check a plugin** in any language with trellis, which runs it against a fake hub ([trellis/README.md](trellis/README.md)):
 
@@ -188,7 +249,8 @@ A **scene** is a workflow: a directed graph whose **nodes** are plugin instances
 | Request | Purpose |
 |---|---|
 | `GET/POST /api/scenes`, `GET/PUT/DELETE /api/scenes/by-id/{id}` | List, create, get, update (`name`, `max_hops`, `defaults`, `groups`), delete scenes (deleting removes nodes, edges and queued events). |
-| `POST /api/scenes/by-id/{id}/enable`, `…/disable` | Run or stop the workflow. Enabling requires every node's plugin to be installed. |
+| `POST /api/scenes/by-id/{id}/enable`, `…/disable` | Run or stop the workflow. Enabling requires every node's plugin to be installed, and a clean pre-flight (below). |
+| `POST /api/scenes/by-id/{id}/preflight`, `…/nodes/by-id/{node_id}/preflight` | Run the nodes' **pre-flight checks** without starting anything (`?draft=true` for the draft): plugins with a configurator can check this machine (files, devices, models) before a node starts. Per node: checked or skipped, `problems` (each `retryable` or not) and `warnings`. |
 | `GET/POST /api/scenes/by-id/{id}/nodes`, `GET/PUT/DELETE …/nodes/by-id/{node_id}` | Manage nodes. A node runs a registered plugin; its `type` is the plugin's type. |
 | `GET/POST /api/scenes/by-id/{id}/edges`, `GET/PUT/DELETE …/edges/by-id/{edge_id}` | Manage edges. A SINK can't send and a SOURCE can't receive; at most one edge per direction between two nodes. |
 | `GET /api/scenes/by-id/{id}/export`, `POST /api/scenes/import` | Move a scene to another server as a `.flwr` file or a `.far` archive with its nodes' files (see below). |
@@ -200,6 +262,8 @@ A **scene** is a workflow: a directed graph whose **nodes** are plugin instances
 | `…/scenes/by-id/{id}/draft…` | The scene's **draft**: edit the graph apart from the live one, then submit it at once (see *Drafts*, below). |
 | `POST /api/scenes/by-id/{id}/graph/batch` | Several changes to the live graph in one step, all or nothing (see *Drafts*, below). |
 | `GET /api/scenes/by-id/{id}/stream`, `…/nodes/by-id/{node_id}/logs/stream`, `PATCH …/layout`, `POST …/mapping/test` | What the web UI's scene view uses: the scene, its draft, its check and its status, live (Server-Sent Events); a node's recent logs, live; node and edge positions on the canvas (layout only, never a change to the scene); an edge mapping tried on a sample event. |
+| `GET …/nodes/by-id/{node_id}/live`, `…/live/{channel}/stream` | A running node's **live channels** (plugins with `LIVE_FEED`): the list, and one channel as a stream, JSON as Server-Sent Events, images as `multipart/x-mixed-replace` for an `<img>`. Watching a channel is what makes the plugin produce it. Kept in memory only. |
+| `POST …/nodes/by-id/{node_id}/configure`, `…/describe` | Run a node's configurator again on its saved settings; ask it about uploaded files without storing anything (what an editor prefills for a picked file). |
 | `DELETE /api/scenes/by-id/{id}/spool`, `…/nodes/by-id/{node_id}/spool` | Start the queues of the scene's nodes over, or one node's: the lever for corrupted, overflowing or lagging spool files. Every queued event goes, including those handed to a plugin and not acknowledged yet (they aren't delivered again), and spool files are deleted (running queues start fresh ones). For a disabled scene, that's what its durable queues kept. Also brings back a durable queue whose file couldn't be opened. Returns `purged_events`. |
 
 Invalid requests return **422** with every problem listed in `details`.
@@ -330,7 +394,7 @@ The output is then shaped to the target node's input schema. Conversions that lo
 
 ### Status
 
-- **`GET /api/scenes/by-id/{id}/status`**: the scene's `state` (`RUNNING`, `STOPPED`, or `FAILED` with `errors`), its hop limit, and per node:
+- **`GET /api/scenes/by-id/{id}/status`**: the scene's `state` (`RUNNING`, `STOPPED`, `WAITING` while a pre-flight check runs or waits out retryable problems (`preflight`, `preflight_retry`), or `FAILED` with `errors`), `failed_update` when a running scene kept its previous graph because a change failed its checks, its hop limit, and per node:
   - the plugin's state (`LAUNCHING`, `WAITING`, `RUNNING`, `DISCONNECTED`, `UNHEALTHY`, `STOPPING`, `STOPPED`, `FAILED`), its pid, launches and last error;
   - `counters`: `emitted` (events the plugin produced), `received` (events delivered to it), `dropped`, `mapping_errors`, `restarts`;
   - the inbound `queue`: depth in events and bytes, drops by reason, time producers spent blocked (`blocked_ms`), delivery (`in_flight`, `redelivered`, `nacked`, `dead_lettered`), and disk details (`spill`, `durable`, on disk, written, refilled, whether the free-space guard is holding writes);
@@ -442,7 +506,7 @@ The manifest names the plugin's type and version, its payload schemas (fixed, or
 | `POST /api/plugins` with multipart field `file` | Upload and register a package. Responds 201; 409 if the id exists; 422 with a list of every problem if the package is invalid. |
 | `GET /api/plugins`, `GET /api/plugins/by-id/{id}` | List or get registered plugins (with `node_defaults`: what a node gets for each run-time setting it leaves out). |
 | `GET /api/plugins/by-id/{id}/launch-args-schema` | The plugin's launch-args JSON Schema. |
-| `GET …/by-id/{id}/ui/{icon\|docs}`, `…/definitions/{path}`, `…/templates/{path}` | Files the package names for editors: its icon and docs (its README), a code field's definitions (completion), a field's template. Only those files, sandboxed. |
+| `GET …/by-id/{id}/ui/{icon\|docs}`, `…/definitions/{path}`, `…/templates/{path}`, `…/graph-catalogs/{path}` | Files the package names for editors: its icon and docs (its README), a code field's definitions (completion), a field's template, a graph setting's catalog (node types and ports). Only those files, sandboxed. |
 | `POST /api/plugins/remote`, `GET/PUT …/by-id/{id}/definition`, `GET …/by-id/{id}/export` | **Remote plugin definitions**: a plugin that runs elsewhere, described here (type, payload schemas, settings) so its nodes can be placed, wired and checked; the web UI has a wizard for them. Need the admin token or loopback, not `allow_upload` (they run nothing here). |
 | `PUT /api/plugins/by-id/{id}` with multipart `file` | Upgrade. The id and type must stay the same; refused (409) if any scene node's `launch_args` would become invalid. |
 | `DELETE /api/plugins/by-id/{id}` | Deregister and remove the files. Refused (409) while scene nodes use the plugin. |
@@ -472,7 +536,7 @@ Plugins are packaged and run as described in the [plugin specification](docs/plu
 
 flwrs is in early development. The main things still missing, roughly in order:
 
-1. **More base plugins.** Common sources, transforms and sinks, so typical workflows need no custom plugin: still missing are files, databases and ML inference, among others. Today there are:
+1. **More base plugins.** Common sources, transforms and sinks, so typical workflows need no custom plugin: still missing are files, databases and general ML inference as a transform, among others. Today there are:
    - the HTTP sink ([plugins/http_sink](plugins/http_sink): a request per event);
    - the ticker ([plugins/ticker](plugins/ticker): interval or cron);
    - the script transform ([plugins/script_transform](plugins/script_transform): Lua per event, keyed state kept exactly once);
@@ -483,7 +547,8 @@ flwrs is in early development. The main things still missing, roughly in order:
    - the HTTP source ([plugins/http_source](plugins/http_source): an OpenAPI 3.1 API whose requests become typed events);
    - the WebSocket source ([plugins/ws_source](plugins/ws_source): an AsyncAPI 3.x document's channels, messages typed by their payload schemas);
    - the HTTP push sink ([plugins/http_push_sink](plugins/http_push_sink): events broadcast to subscribers over Server-Sent Events and long polling, with replay);
-   - the WebSocket push sink ([plugins/ws_push_sink](plugins/ws_push_sink): events broadcast to connected WebSocket clients, with replay).
+   - the WebSocket push sink ([plugins/ws_push_sink](plugins/ws_push_sink): events broadcast to connected WebSocket clients, with replay);
+   - the vision source, early ([plugins/cv_source](plugins/cv_source): a graph of ONNX models on a camera, video or image folder, with tracking, rules and Lua; no IP cameras yet).
 2. **Alternative storage back-ends**, such as PostgreSQL. Today scenes, nodes, edges and the plugin registry live in SQLite only (the `Database` enum in `flwrs-core` has a single variant); a shared database is also a step towards running several servers.
 3. **Running as a cluster.** The server currently runs in **single-node mode only**: one server runs every scene it has, and there's no swarming, no handover of scenes between servers, and no load balancing. Remote plugins can run on other machines, but they all connect to one hub. Running properly in a data-centre environment (in-cluster) needs scenes spread across servers, failover, and load balancing.
 4. **Profiling and optimisation.** Throughput, latency and memory are measured per plugin with `trellis bench` (each plugin's README has a *Footprint* section), so far on an Apple M2 (but needs a proper dedicated benchmark test - just playing around so far, no serious measurements yet); edge devices (an Intel NUC, a Raspberry Pi) are next. Done so far: credit handed to a source's waiting senders in order, longest-waiting first (up to 1.7× for sources whose clients outrun their credit); per-connection buffer settings for the WebSocket plugins (~130 → ~11 KiB per push-sink client); a small HTTP/2 send buffer for the server plugins (1 000 HTTP/2 SSE subscribers: ~3.7× the throughput at a fifth of the memory); trellis's own timer lateness kept out of its latency numbers. Open: batching writes to many WebSocket clients, durable queues' fixed 5 ms batching window, keyed parallelism in the script transforms, TLS handshake cost when connections churn, and the HTTP and WebSocket sources' binary sizes (18–22 MB). See `ideas/` for the designs.

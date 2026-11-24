@@ -4,10 +4,13 @@
   // knows any plugin. The graph is saved to the scene's draft like any other
   // setting; where its nodes sit is layout, saved at once beside the node.
   import { SvelteFlowProvider } from '@xyflow/svelte';
+  import { untrack } from 'svelte';
   import GraphCanvas from './GraphCanvas.svelte';
-  import { getGraphCatalog, type GraphNode, type Plugin, type SceneView, type Upload } from '../../lib/sceneView';
+  import { getDefinitions, getGraphCatalog, type GraphNode, type Plugin, type SceneView, type Upload } from '../../lib/sceneView';
   import type { GraphCatalog } from '../../lib/graphModel';
   import type { Schema } from '../../lib/schemaForm';
+  import { codeFieldScope } from '../../lib/lua/scope';
+  import type { Scope } from '../../lib/lua/types';
 
   let {
     view,
@@ -57,6 +60,31 @@
       }
     });
   });
+
+  // What the graph's code settings see (Lua completion): the definitions
+  // files their `x-flwrs-code` names, wherever they sit in the schema.
+  let definitions = $state(new Map<string, string>());
+  $effect(() => {
+    const { id, version } = plugin;
+    const paths = new Set<string>();
+    const walk = (s: unknown) => {
+      if (!s || typeof s !== 'object') return;
+      const code = (s as Schema)['x-flwrs-code'];
+      if (code?.definitions) paths.add(code.definitions);
+      Object.values(s).forEach(walk);
+    };
+    walk(schema);
+    for (const path of paths) {
+      getDefinitions(id, version, path).then((text) => {
+        if (text !== null) definitions = new Map(untrack(() => definitions)).set(path, text);
+      });
+    }
+  });
+  function codeScope(s: Schema): Scope | null {
+    const code = s['x-flwrs-code'];
+    if (!code || code.language !== 'lua') return null;
+    return codeFieldScope(code, code.definitions ? definitions.get(code.definitions) : undefined, null);
+  }
 </script>
 
 {#if error}
@@ -65,6 +93,6 @@
   <p class="muted">Loading…</p>
 {:else}
   <SvelteFlowProvider>
-    <GraphCanvas {view} {node} {schema} {field} {catalog} configuredFields={plugin.configured_fields} {uploads} {messages} {active} {running} {liveArgs} {onopensettings} {onsaved} />
+    <GraphCanvas {view} {node} {schema} {field} {catalog} configuredFields={plugin.configured_fields} {uploads} {messages} {active} {running} {liveArgs} {codeScope} {onopensettings} {onsaved} />
   </SvelteFlowProvider>
 {/if}

@@ -1968,7 +1968,7 @@ dependencies = [
 
 [[package]]
 name = "flwrs-plugin"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "flwrs-trellis"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "clap",
  "flwrs-plugin",

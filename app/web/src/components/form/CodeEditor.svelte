@@ -3,7 +3,13 @@
   // own chunk), with a textarea until then (and if loading fails). For Lua
   // with a `scope`: completion (Ctrl+Space, or as you type) and hover docs.
   // `toml` and `yaml`: highlighting only (the server config's text, documents).
-  import { onDestroy } from 'svelte';
+  // `expandable`: an icon button opens the same editor in a large dialog over
+  // the page (the editor itself moves there and back: one document, one undo
+  // history); Collapse or Esc brings it back, focused.
+  import { onDestroy, tick } from 'svelte';
+  import Maximize2 from '@lucide/svelte/icons/maximize-2';
+  import Minimize2 from '@lucide/svelte/icons/minimize-2';
+  import Modal from '../Modal.svelte';
   import type { Scope } from '../../lib/lua/types';
 
   let {
@@ -12,6 +18,9 @@
     disabled = false,
     compact = false,
     tall = false,
+    grow = false,
+    expandable = false,
+    title = 'Code',
     scope = null,
     params = null,
     onchange,
@@ -22,6 +31,12 @@
     compact?: boolean;
     /** A whole file: up to most of the window's height. */
     tall?: boolean;
+    /** Grows with its text, without a height cap: its container scrolls past it (no scroll of its own). */
+    grow?: boolean;
+    /** Offers a larger editor in a dialog. */
+    expandable?: boolean;
+    /** The expanded dialog's title. */
+    title?: string;
     /** What the code sees (Lua): read at each completion, so it may change. */
     scope?: Scope | null;
     /** The code's function parameters (Lua): given, syntax errors are marked as you type. */
@@ -30,8 +45,19 @@
   } = $props();
 
   let host: HTMLDivElement;
+  let bigHost = $state<HTMLDivElement>();
   let ready = $state(false);
-  let view: { destroy(): void; state: { doc: { toString(): string } }; dispatch(t: unknown): void } | null = null;
+  let expanded = $state(false);
+  let view: {
+    destroy(): void;
+    focus(): void;
+    requestMeasure(): void;
+    dom: HTMLElement;
+    state: { doc: { toString(): string } };
+    dispatch(t: unknown): void;
+  } | null = null;
+  /** The scroller's height cap, as a CSS variable the theme reads (so the expanded view can lift it). */
+  const maxHeight = $derived(compact ? '200px' : grow ? 'none' : tall ? '70vh' : '420px');
 
   async function load() {
     const [{ EditorView, basicSetup }, { EditorState, StateField }, { StreamLanguage }, { lua }, { hoverTooltip, showTooltip }, { linter }, complete, { checkLua }] =
@@ -57,7 +83,7 @@
         '.cm-gutters': { backgroundColor: 'var(--surface-2)', color: 'var(--text-faint)', border: 'none' },
         '.cm-activeLine, .cm-activeLineGutter': { backgroundColor: 'var(--surface-hover)' },
         '&.cm-focused': { outline: '2px solid var(--focus-ring)' },
-        '.cm-scroller': { minHeight: compact ? '44px' : '160px', maxHeight: compact ? '200px' : tall ? '70vh' : '420px' },
+        '.cm-scroller': { minHeight: 'var(--code-min-height)', maxHeight: 'var(--code-max-height)' },
         '.cm-tooltip': { backgroundColor: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: '6px' },
         '.cm-tooltip-autocomplete ul li[aria-selected]': { backgroundColor: 'var(--accent-soft)', color: 'var(--text)' },
         '.cm-completionDetail': { color: 'var(--text-muted)', fontStyle: 'normal', marginLeft: '0.75em' },
@@ -168,20 +194,113 @@
     }
   });
 
+  // Expanding moves the editor into the dialog; collapsing moves it back.
+  $effect(() => {
+    const target = expanded ? bigHost : host;
+    if (!view || !target || view.dom.parentElement === target) return;
+    target.appendChild(view.dom);
+    view.requestMeasure();
+    view.focus();
+  });
+
+  async function collapse() {
+    expanded = false;
+    await tick();
+    view?.focus();
+  }
+
   onDestroy(() => view?.destroy());
 </script>
 
-<div class="editor" bind:this={host}>
-  {#if !ready}
-    <textarea class="input fallback" rows={compact ? 2 : 8} spellcheck="false" {disabled} {value} oninput={(e) => onchange(e.currentTarget.value)}></textarea>
+<div class="wrap">
+  <div
+    class="editor"
+    class:placeholder={expanded}
+    style:--code-min-height={compact ? '44px' : '160px'}
+    style:--code-max-height={maxHeight}
+    bind:this={host}
+  >
+    {#if !ready}
+      <textarea class="input fallback" rows={compact ? 2 : 8} spellcheck="false" {disabled} {value} oninput={(e) => onchange(e.currentTarget.value)}></textarea>
+    {:else if expanded}
+      <span class="muted">Editing in the expanded view</span>
+    {/if}
+  </div>
+  {#if expandable && ready && !expanded}
+    <button class="btn ghost icon expand" type="button" aria-label="Expand the editor" title="Expand" onclick={() => (expanded = true)}>
+      <Maximize2 size={14} strokeWidth={1.75} />
+    </button>
   {/if}
 </div>
 
+{#if expanded}
+  <Modal {title} size="full" fixed onclose={collapse}>
+    <div class="big-bar">
+      <span class="muted">Changes apply to the field as you type.</span>
+      <button class="btn ghost icon" type="button" aria-label="Collapse the editor" title="Collapse" onclick={collapse}>
+        <Minimize2 size={16} strokeWidth={1.75} />
+      </button>
+    </div>
+    <div class="editor big" style:--code-min-height="100%" style:--code-max-height="none" bind:this={bigHost}></div>
+  </Modal>
+{/if}
+
 <style>
+  .wrap {
+    position: relative;
+  }
+
   .editor {
     overflow: hidden;
     border: 1px solid var(--border);
     border-radius: var(--radius);
+  }
+
+  .placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: var(--code-min-height);
+    font-size: var(--text-xs);
+  }
+
+  .expand {
+    position: absolute;
+    top: var(--space-1);
+    right: var(--space-1);
+    z-index: 1;
+    width: 26px;
+    height: 26px;
+    background: var(--surface);
+    color: var(--text-muted);
+  }
+
+  .expand:hover {
+    color: var(--text);
+  }
+
+  .big-bar {
+    display: flex;
+    flex: none;
+    align-items: center;
+    justify-content: space-between;
+    font-size: var(--text-xs);
+  }
+
+  .big {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .big :global(.cm-editor) {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .big :global(.cm-scroller) {
+    font-size: var(--text-sm);
   }
 
   .fallback {

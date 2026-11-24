@@ -127,6 +127,8 @@ On a top-level property only: `{"via": "arg" | "env" | "file", "alias"?, "file_n
 
 On a string property: `{"language": "lua", "params": [names], "definitions"?: "<file in the package>", "signature"?: "<text>"}`. The value is code the plugin runs, as the body of a function with `params`. The server checks its syntax when the node is saved (a server built without Lua accepts it with a warning). `definitions` is a LuaCATS `---@meta` file for an editor (completion, signature help), and `signature` the function's type in the same notation; `In` and `Out` there stand for the node's payload schemas.
 
+It may also sit on a property of a `$defs` entry (`#/$defs/<name>/properties/<key>`, nested properties too), for code inside a structured setting such as a graph's node settings: editors treat it the same way wherever the definition is used, and the package check reads its `definitions` file. The server doesn't check such code when a node is saved (it can't tell where in the launch args the definition is used); the plugin, or its configurator, reports the errors.
+
 ### 3.4 Presentation hints
 
 On any property, all optional: `x-flwrs-group` (a section name), `x-flwrs-order` (an integer), `x-flwrs-advanced` (collapsed by default), `x-flwrs-widget` (`duration`, `cron`, `file-path` or `code`), `x-flwrs-platforms`, `x-flwrs-template` and `x-flwrs-graph` (below). Standard keywords (`title`, `description`, `default`, `enum`, `minimum`, `format`, …) are used as they are. An unknown `x-flwrs-*` keyword is a warning at upload, and ignored.
